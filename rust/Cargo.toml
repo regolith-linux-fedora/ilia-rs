@@ -7,3 +7,4 @@ edition = "2021"
 gio = "=0.18.4"
 glib = "=0.18.5"
 gtk = "=0.18.2"
+gtk-layer-shell = { version = "=0.8.2", features = ["v0_6"] }

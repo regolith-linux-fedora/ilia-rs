@@ -26,7 +26,8 @@ display=":$display_number"
 export DISPLAY=$display GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 NO_AT_BRIDGE=1
 export GSETTINGS_BACKEND=memory HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config"
 export XDG_DATA_HOME="$tmp/data" XDG_CACHE_HOME="$tmp/cache" XDG_RUNTIME_DIR="$tmp/runtime"
-mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+export TMPDIR="$tmp/tmp"
+mkdir -p "$HOME" "$TMPDIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$tmp/schemas"
 cp "$root"/data/*.gschema.xml "$tmp/schemas/"
@@ -34,6 +35,8 @@ glib-compile-schemas "$tmp/schemas"
 export GSETTINGS_SCHEMA_DIR="$tmp/schemas"
 unset SWAYSOCK I3SOCK
 
+# The compositor pages are intentionally exercised with both WM socket
+# variables unset, matching the isolated startup contract.
 for invocation in "" "-p apps" "-p terminal" "-p notifications" "-p keybindings" "-p textlist" "-p windows" "-p tracker" "-a" "-a -p windows"; do
     : >"$tmp/out"; : >"$tmp/err"
     if [[ "$invocation" == "-p textlist" ]]; then
@@ -62,12 +65,30 @@ for invocation in "" "-p apps" "-p terminal" "-p notifications" "-p keybindings"
         exit 1
     fi
     wait "$pid"
-    if [[ -s "$tmp/out" || -s "$tmp/err" ]]; then
+    if [[ -s "$tmp/out" ]]; then
         printf 'unexpected output for invocation: %s\n' "${invocation:-<default>}" >&2
         sed 's/^/stdout: /' "$tmp/out" >&2
         sed 's/^/stderr: /' "$tmp/err" >&2
         exit 1
     fi
+    case "$invocation" in
+        "-p keybindings")
+            [[ $(wc -l <"$tmp/err") -eq 1 ]]
+            grep -Eq '^Failed to read config from Unknown: .+$' "$tmp/err"
+            ;;
+        "-p windows")
+            [[ $(wc -l <"$tmp/err") -eq 1 ]]
+            grep -Eq '^Failed to read or parse window tree from Unknown: .+$' "$tmp/err"
+            ;;
+        "-a"|"-a -p windows")
+            [[ $(wc -l <"$tmp/err") -eq 2 ]]
+            sed -n '1p' "$tmp/err" | grep -Eq '^Failed to read config from Unknown: .+$'
+            sed -n '2p' "$tmp/err" | grep -Eq '^Failed to read or parse window tree from Unknown: .+$'
+            ;;
+        *)
+            [[ ! -s "$tmp/err" ]]
+            ;;
+    esac
 done
 
 invocation="-p textlist"

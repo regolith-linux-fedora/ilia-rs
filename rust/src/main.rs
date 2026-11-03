@@ -2,8 +2,11 @@ mod application;
 mod apps;
 mod args;
 mod dialog;
+mod ipc;
+mod keybindings;
 mod pages;
 mod runner;
+mod windows;
 
 use args::Args;
 

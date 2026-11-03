@@ -5,6 +5,8 @@ use gtk::gdk;
 use gtk::prelude::*;
 
 use crate::apps::ApplicationsPage;
+use crate::keybindings::KeybindingsPage;
+use crate::windows::WindowsPage;
 
 #[derive(Clone, Copy)]
 pub struct Page {
@@ -82,10 +84,23 @@ pub fn create(
     settings: &gio::Settings,
     entry: &gtk::Entry,
     quit: Rc<dyn Fn()>,
+    wm_name: &str,
+    is_wayland: bool,
 ) -> Rc<dyn DialogPage> {
-    if page.id == "apps" {
-        Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit))
-    } else {
-        Rc::new(*page)
+    match page.id {
+        "apps" => Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit)),
+        "keybindings" => Rc::new(KeybindingsPage::new(
+            entry.clone(),
+            wm_name.to_owned(),
+            quit,
+        )),
+        "windows" => Rc::new(WindowsPage::new(
+            settings.clone(),
+            entry.clone(),
+            wm_name.to_owned(),
+            is_wayland,
+            quit,
+        )),
+        _ => Rc::new(*page),
     }
 }

@@ -20,7 +20,13 @@ const ALL_PAGE_IDS: &[&str] = &[
 
 pub type SharedSeat = Rc<RefCell<Option<gdk::Seat>>>;
 
-pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gtk::Window, ()> {
+pub fn build(
+    app: &gtk::Application,
+    args: &Args,
+    seat: SharedSeat,
+    wm_name: &str,
+    is_wayland: bool,
+) -> Result<gtk::Window, ()> {
     let focus_name = args.value("-p").unwrap_or("Apps");
     let all = args.has("-a");
     let focus = find(focus_name);
@@ -33,7 +39,11 @@ pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gt
     gdk::set_program_class("ilia");
     window.set_type_hint(gdk::WindowTypeHint::PopupMenu);
     window.set_position(gtk::WindowPosition::CenterAlways);
-    window.set_default_size(width, height);
+    if is_wayland {
+        window.set_size_request(width, height);
+    } else {
+        window.set_default_size(width, height);
+    }
 
     let grid = gtk::Grid::new();
     grid.style_context().add_class("root_box");
@@ -74,7 +84,16 @@ pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gt
         Rc::new(move || quit(&window_for_pages, &app_for_pages, &seat_for_pages));
     let pages: Vec<Rc<dyn DialogPage>> = page_specs
         .iter()
-        .map(|page| create(page, &settings, &entry, page_quit.clone()))
+        .map(|page| {
+            create(
+                page,
+                &settings,
+                &entry,
+                page_quit.clone(),
+                wm_name,
+                is_wayland,
+            )
+        })
         .collect();
     for page in &pages {
         page.initialize();
