@@ -1,0 +1,2 @@
+## Included // Sway fixture action // <Super>s ##
+bindsym $mod+s exec fixture-sway

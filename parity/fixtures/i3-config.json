@@ -1,0 +1,10 @@
+{
+  "included_configs": [
+    {
+      "variable_replaced_contents": "## Launch // Open fixture terminal // <Super>Return ##\nbindsym $mod+Return exec fixture-terminal\n"
+    },
+    {
+      "variable_replaced_contents": "## Session // Lock fixture // <Super>l ##\nbindsym $mod+l exec fixture-lock\n"
+    }
+  ]
+}

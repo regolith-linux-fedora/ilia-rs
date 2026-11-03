@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Alpha Fixture
+Comment=ordinary searchable application
+Keywords=needle;alpha;
+Exec=fixture-app alpha %U
+Icon=applications-other
+Terminal=false
+NoDisplay=false

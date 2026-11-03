@@ -1,0 +1,40 @@
+{
+  "id": 1,
+  "type": "root",
+  "urgent": false,
+  "name": "root",
+  "nodes": [
+    {
+      "id": 101,
+      "type": "con",
+      "urgent": false,
+      "name": "Editor Fixture",
+      "window_type": "normal",
+      "window_properties": {"class": "FixtureEditor", "instance": "fixtureeditor", "title": "Editor Fixture", "machine": "fixture", "window_role": ""},
+      "nodes": [],
+      "floating_nodes": []
+    },
+    {
+      "id": 202,
+      "type": "con",
+      "urgent": false,
+      "name": "Forbidden Bar",
+      "window_type": "normal",
+      "window_properties": {"class": "i3bar", "instance": "i3bar", "title": "Forbidden Bar", "machine": "fixture", "window_role": ""},
+      "nodes": [],
+      "floating_nodes": []
+    }
+  ],
+  "floating_nodes": [
+    {
+      "id": 303,
+      "type": "floating_con",
+      "urgent": false,
+      "name": "Floating Fixture",
+      "window_type": "normal",
+      "window_properties": {"class": "FixtureFloat", "instance": "fixturefloat", "title": "Floating Fixture", "machine": "fixture", "window_role": ""},
+      "nodes": [],
+      "floating_nodes": []
+    }
+  ]
+}

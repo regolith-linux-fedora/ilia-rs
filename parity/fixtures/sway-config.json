@@ -1,0 +1,3 @@
+{
+  "config": "include $FIXTURE_CONFIG/*\n"
+}

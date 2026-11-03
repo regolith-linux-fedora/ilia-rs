@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal Fixture
+Exec=fixture-app terminal
+Icon=utilities-terminal
+Terminal=true
+NoDisplay=false
