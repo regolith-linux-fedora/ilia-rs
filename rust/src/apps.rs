@@ -291,11 +291,7 @@ fn load_apps(model: &gtk::ListStore, icon_size: i32) {
             continue;
         }
         let name = desktop.name().to_string();
-        let keywords = format!(
-            "{}{}",
-            desktop.string("Comment").unwrap_or_default(),
-            desktop.string("Keywords").unwrap_or_default()
-        );
+        let keywords = search_text(&desktop);
         let iter = model.append();
         if let Some(blank) = blank.as_ref() {
             model.set(
@@ -473,9 +469,25 @@ fn load_icon(theme: &gtk::IconTheme, app: &gio::DesktopAppInfo, icon_size: i32) 
     None
 }
 
+/// The text the Applications page searches besides the app name: the
+/// generic name, the keywords and the comment, as the desktop entry gives
+/// them for the current locale. Each part is optional; they are separated by
+/// spaces so words from different parts do not run together.
+fn search_text(desktop: &gio::DesktopAppInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(generic_name) = desktop.generic_name() {
+        parts.push(generic_name.to_string());
+    }
+    parts.extend(desktop.keywords().iter().map(|keyword| keyword.to_string()));
+    if let Some(comment) = desktop.description() {
+        parts.push(comment.to_string());
+    }
+    parts.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compare_apps;
+    use super::{compare_apps, search_text};
     use std::cmp::Ordering;
     use std::collections::HashMap;
 
@@ -494,5 +506,32 @@ mod tests {
             compare_apps("alpha", "zeta", "a", "z", "", &HashMap::new()),
             Ordering::Less
         );
+    }
+
+    fn desktop_entry(lines: &str) -> gio::DesktopAppInfo {
+        let keyfile = glib::KeyFile::new();
+        keyfile
+            .load_from_data(
+                &format!("[Desktop Entry]\nType=Application\nName=Fixture\nExec=true\n{lines}"),
+                glib::KeyFileFlags::NONE,
+            )
+            .unwrap();
+        gio::DesktopAppInfo::from_keyfile(&keyfile).unwrap()
+    }
+
+    #[test]
+    fn search_text_holds_generic_name_keywords_and_comment() {
+        // Keywords count without a comment.
+        assert_eq!(
+            search_text(&desktop_entry("Keywords=Preferences;Settings;\n")),
+            "Preferences Settings"
+        );
+        assert_eq!(
+            search_text(&desktop_entry(
+                "GenericName=Web Browser\nKeywords=Internet;WWW;\nComment=Browse the web\n"
+            )),
+            "Web Browser Internet WWW Browse the web"
+        );
+        assert_eq!(search_text(&desktop_entry("")), "");
     }
 }
