@@ -375,9 +375,17 @@ fn run_search(
 
 /// The search text is bound as the `~text` parameter, so quotes in it are
 /// searched for literally instead of breaking the query.
+///
+/// A match on the file name is the file (`nfo:FileDataObject`, which has the
+/// URL); a match on the content is its document (`nie:InformationElement`,
+/// stored as the file, which has the title and MIME type). Each column is
+/// read from whichever of the two has it, so content matches are found too.
 fn search_query() -> String {
     format!(
-        "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) \
+        "SELECT DISTINCT \
+         COALESCE(nie:url(?f), nie:url(nie:isStoredAs(?f))) \
+         COALESCE(nie:title(?f), nie:title(nie:interpretedAs(?f))) \
+         COALESCE(nie:mimeType(?f), nie:mimeType(nie:interpretedAs(?f))) \
          WHERE {{ ?f fts:match ~text }} ORDER BY DESC(fts:rank(?f)) LIMIT {MAX_HITS}"
     )
 }
@@ -505,10 +513,13 @@ mod tests {
     }
 
     #[test]
-    fn search_query_binds_the_text_and_is_bounded() {
+    fn search_query_binds_the_text_is_bounded_and_reads_content_matches() {
         assert_eq!(
             search_query(),
-            "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) \
+            "SELECT DISTINCT \
+             COALESCE(nie:url(?f), nie:url(nie:isStoredAs(?f))) \
+             COALESCE(nie:title(?f), nie:title(nie:interpretedAs(?f))) \
+             COALESCE(nie:mimeType(?f), nie:mimeType(nie:interpretedAs(?f))) \
              WHERE { ?f fts:match ~text } ORDER BY DESC(fts:rank(?f)) LIMIT 1000"
         );
     }
