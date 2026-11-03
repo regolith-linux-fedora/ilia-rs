@@ -7,10 +7,11 @@ project('ilia',
 
 find_program ('glib-compile-schemas')
 # The Rust binary links these through its -sys crates; checking
-# them here keeps a missing system library a configure-time error.
+# them here keeps a missing system library a configure-time error. The
+# SPARQL library (tinysparql, formerly tracker-sparql) is not linked: the
+# Files page loads it at run time.
 dependency('gtk+-3.0')
 dependency('gtk-layer-shell-0')
-dependency('tracker-sparql-3.0')
 
 meson.add_install_script(join_paths(meson.current_source_dir(),'meson_scripts','install_data.sh'),join_paths(get_option('prefix'),get_option('datadir'),'ilia'),join_paths(meson.current_source_dir(),'data/local','','*'))
 

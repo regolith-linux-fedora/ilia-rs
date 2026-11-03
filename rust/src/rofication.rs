@@ -1,11 +1,18 @@
+use std::cmp::Ordering;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use crate::ipc::{member, Json, JsonParser};
 
 // The Vala client hardcodes the daemon path; it is never configurable.
 pub const SOCKET_PATH: &str = "/tmp/rofi_notification_daemon";
+// How long to wait on the daemon: one that accepts the connection but never
+// answers must not hang ilia.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const BUFFER_SIZE: usize = 1024 * 8;
+// The freedesktop urgency levels are low (0), normal (1) and critical (2).
+const NORMAL_URGENCY: i64 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NotificationDesc {
@@ -17,13 +24,21 @@ pub struct NotificationDesc {
     pub icon: String,
     #[allow(dead_code)]
     pub urgency: i64,
+    /// When the notification last arrived, in seconds since the epoch; zero
+    /// when the daemon did not say.
+    pub timestamp: f64,
 }
 
 impl NotificationDesc {
+    // rofication leaves out the members it has no value for, so only the id,
+    // which deleting a notification needs, is required.
     fn from_json(value: &Json) -> Result<Self, String> {
         let object = value.object()?;
         let string = |name: &str| -> Result<String, String> {
-            Ok(member(object, name)?.string()?.to_owned())
+            match object.get(name) {
+                None | Some(Json::Null) => Ok(String::new()),
+                Some(value) => Ok(value.string()?.to_owned()),
+            }
         };
         Ok(Self {
             id: int_member(member(object, "id")?)?,
@@ -31,9 +46,27 @@ impl NotificationDesc {
             body: string("body")?,
             application: string("application")?,
             icon: string("icon")?,
-            urgency: int_member(member(object, "urgency")?)?,
+            urgency: match object.get("urgency") {
+                None | Some(Json::Null) => NORMAL_URGENCY,
+                Some(value) => int_member(value)?,
+            },
+            // A float from current daemons; older ones send none or "".
+            timestamp: match object.get("timestamp") {
+                Some(Json::Number(text)) => text.parse().unwrap_or_default(),
+                _ => 0.0,
+            },
         })
     }
+}
+
+/// Newest first. The daemon lists notifications in the order they were first
+/// added, and a replaced notification keeps its id and its place but gets a
+/// new timestamp, so order by timestamp, then by id. Notifications without a
+/// timestamp come last.
+pub fn newest_first(a: &NotificationDesc, b: &NotificationDesc) -> Ordering {
+    b.timestamp
+        .total_cmp(&a.timestamp)
+        .then_with(|| b.id.cmp(&a.id))
 }
 
 // json-glib's get_int_member truncates doubles toward zero.
@@ -65,15 +98,24 @@ pub fn delete_many_request(ids: &[Option<String>]) -> String {
     format!("delm:{}\n", joined.join(","))
 }
 
+/// Decodes the daemon's list. A notification that cannot be decoded is
+/// reported and left out; it does not take the others with it.
 pub fn parse_notifications(payload: &[u8]) -> Result<Vec<NotificationDesc>, String> {
-    JsonParser::new(payload)
+    Ok(JsonParser::new(payload)
         .parse()?
         .array()?
         .iter()
-        .map(NotificationDesc::from_json)
-        .collect()
+        .filter_map(|value| match NotificationDesc::from_json(value) {
+            Ok(notification) => Some(notification),
+            Err(error) => {
+                eprintln!("Error: skipping a notification: {error}");
+                None
+            }
+        })
+        .collect())
 }
 
+#[derive(Clone, Copy)]
 pub struct RoficationClient {
     socket_path: &'static str,
 }
@@ -85,7 +127,12 @@ impl RoficationClient {
 
     // One blocking connection per command, mirroring the Vala client.
     fn open_socket(&self) -> Result<UnixStream, String> {
-        UnixStream::connect(self.socket_path).map_err(|error| io_message(&error))
+        let socket = UnixStream::connect(self.socket_path).map_err(|error| io_message(&error))?;
+        socket
+            .set_read_timeout(Some(SOCKET_TIMEOUT))
+            .and_then(|()| socket.set_write_timeout(Some(SOCKET_TIMEOUT)))
+            .map_err(|error| io_message(&error))?;
+        Ok(socket)
     }
 
     pub fn get_notifications(&self) -> Result<Vec<NotificationDesc>, String> {
@@ -140,7 +187,9 @@ fn io_message(error: &std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_many_request, delete_request, list_request, parse_notifications};
+    use super::{
+        delete_many_request, delete_request, list_request, newest_first, parse_notifications,
+    };
 
     #[test]
     fn command_framing_matches_vala_bytes() {
@@ -182,5 +231,38 @@ mod tests {
         assert_eq!(notification.urgency, 1);
         assert!(parse_notifications(b"[]").unwrap().is_empty());
         assert!(parse_notifications(b"{}").is_err());
+    }
+
+    #[test]
+    fn notifications_sort_newest_first_by_timestamp_then_id() {
+        let mut notifications = parse_notifications(
+            br#"[{"id": 1, "timestamp": 100.5}, {"id": 2, "timestamp": 300.25},
+                {"id": 3, "timestamp": 200}, {"id": 4}, {"id": 5, "timestamp": ""},
+                {"id": 6, "timestamp": 200}]"#,
+        )
+        .unwrap();
+        notifications.sort_by(newest_first);
+        let ids: Vec<i64> = notifications.iter().map(|n| n.id).collect();
+        assert_eq!(ids, [2, 6, 3, 1, 5, 4]);
+    }
+
+    #[test]
+    fn missing_members_leave_the_other_notifications_listed() {
+        let notifications = parse_notifications(
+            br#"[{"id": 1, "summary": "one", "body": "b", "application": "a", "icon": "i", "urgency": 2},
+                {"id": 2, "summary": "no icon or body", "application": "a"},
+                {"summary": "no id"},
+                {"id": 4, "summary": 4},
+                {"id": 5}]"#,
+        )
+        .unwrap();
+        let ids: Vec<i64> = notifications.iter().map(|n| n.id).collect();
+        assert_eq!(ids, [1, 2, 5]);
+        let partial = &notifications[1];
+        assert_eq!(partial.summary, "no icon or body");
+        assert_eq!(partial.body, "");
+        assert_eq!(partial.icon, "");
+        assert_eq!(partial.urgency, 1);
+        assert_eq!(notifications[2].application, "");
     }
 }

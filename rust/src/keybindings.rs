@@ -6,6 +6,7 @@ use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
+use crate::filter::matches_all_words;
 use crate::ipc;
 use crate::pages::DialogPage;
 
@@ -22,7 +23,6 @@ struct Keybinding {
 }
 
 pub struct KeybindingsPage {
-    entry: gtk::Entry,
     filter: gtk::TreeModelFilter,
     view: gtk::TreeView,
     root: gtk::Widget,
@@ -39,17 +39,14 @@ impl KeybindingsPage {
             String::static_type(),
         ]);
         let filter = gtk::TreeModelFilter::new(&model, None);
-        let entry_for_filter = entry.clone();
         filter.set_visible_func(move |tree_model, iter| {
-            let query = entry_for_filter.text().to_lowercase();
-            let query = query.trim();
-            query.is_empty()
-                || string_value(tree_model, iter, SUMMARY as i32)
-                    .to_lowercase()
-                    .contains(query)
-                || string_value(tree_model, iter, SPEC as i32)
-                    .to_lowercase()
-                    .contains(query)
+            matches_all_words(
+                entry.text().as_str(),
+                &[
+                    &string_value(tree_model, iter, SUMMARY as i32),
+                    &string_value(tree_model, iter, SPEC as i32),
+                ],
+            )
         });
 
         match ipc::get_config(&wm_name).and_then(|config| parse_config(&config)) {
@@ -89,7 +86,6 @@ impl KeybindingsPage {
         scrolled.set_vexpand(true);
 
         let page = Self {
-            entry,
             filter,
             view,
             root: scrolled.upcast(),
@@ -177,17 +173,9 @@ impl DialogPage for KeybindingsPage {
         [("enter", "Invoke Keybinding")].into_iter().collect()
     }
     fn key_event(&self, event: &gdk::EventKey) -> bool {
-        if self.navigate(event) {
-            return true;
-        }
-        if event.keyval() == gdk::keys::constants::Return
-            && self.filter.iter_first().is_none()
-            && !self.entry.text().is_empty()
-        {
-            execute(&self.wm_name, self.entry.text().as_str(), &self.quit);
-            return true;
-        }
-        false
+        // Typed text that matches no binding is nothing this page can run,
+        // so Enter then does nothing.
+        self.navigate(event)
     }
     fn get_keybinding(&self) -> char {
         'k'
@@ -228,6 +216,14 @@ pub(crate) fn navigate(
         return false;
     }
     let selection = view.selection();
+    // The arrow keys, Home/End and the mouse move the selection without
+    // updating `path`: start from the highlighted row.
+    if let Some(selected) = selection
+        .selected()
+        .and_then(|(model, iter)| model.path(&iter))
+    {
+        *path.borrow_mut() = selected;
+    }
     let is_last = selection
         .selected()
         .is_some_and(|(model, iter)| !model.iter_next(&iter));

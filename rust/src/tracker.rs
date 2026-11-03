@@ -1,18 +1,20 @@
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use gio::prelude::*;
 use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
-use ilia_tracker_sys::{Connection, Cursor};
 
 use crate::icons::load_icon_from_name;
 use crate::keybindings::navigate;
-use crate::pages::DialogPage;
+use crate::pages::{is_enter_key, DialogPage};
+use crate::sparql::{Connection, Cursor};
 
 const ICON: u32 = 0;
 const TITLE: u32 = 1;
@@ -21,6 +23,12 @@ const FILE: u32 = 2;
 const MINER_SERVICE: &str = "org.freedesktop.Tracker3.Miner.Files";
 const FALLBACK_MIME: &str = "application/octet-stream";
 const FALLBACK_ICON: &str = "text-x-generic";
+
+/// Most files listed for one search: the best ranked ones.
+const MAX_HITS: usize = 1000;
+/// A search starts once typing pauses this long, so a burst of keys costs
+/// one search.
+const SEARCH_DELAY: Duration = Duration::from_millis(150);
 
 pub struct TrackerPage {
     entry: gtk::Entry,
@@ -32,10 +40,29 @@ pub struct TrackerPage {
     icon_size: i32,
     post_launch_sleep: u64,
     quit: Rc<dyn Fn()>,
+    search: Search,
+    // For the callbacks of searches, which may outlive a key press.
+    this: Weak<TrackerPage>,
+}
+
+/// The state of the search for the current text. Searches run on worker
+/// threads, so typing never waits for the index.
+#[derive(Default)]
+struct Search {
+    // One connection for every search, opened by the first.
+    connection: Arc<Mutex<Option<Connection>>>,
+    // Waiting for typing to pause.
+    timer: RefCell<Option<glib::SourceId>>,
+    // The running search.
+    running: RefCell<Option<gio::Cancellable>>,
+    // Counts text changes: results of a search for older text are dropped.
+    generation: Cell<u64>,
+    // Enter was pressed while the search was waiting or running.
+    activate_when_ready: Cell<bool>,
 }
 
 impl TrackerPage {
-    pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Self {
+    pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Rc<Self> {
         let icon_size = settings.int("icon-size");
         // `GLib.Thread.usleep` takes an unsigned long, so a negative setting
         // wraps exactly like the C int conversion does.
@@ -85,7 +112,7 @@ impl TrackerPage {
         scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
 
-        let page = Self {
+        let page = Rc::new_cyclic(|this| Self {
             entry,
             model,
             view,
@@ -95,7 +122,9 @@ impl TrackerPage {
             icon_size,
             post_launch_sleep,
             quit,
-        };
+            search: Search::default(),
+            this: this.clone(),
+        });
         page.connect_activation();
         page.set_selection();
         page
@@ -127,22 +156,94 @@ impl TrackerPage {
         selection.select_path(&self.path.borrow());
     }
 
-    fn full_text_search(&self) {
-        let result = search(open_tracker, self.entry.text().as_str(), |hit| {
-            self.append(hit)
-        });
-        if let Err(message) = result {
-            eprint!("{}", error_line(&message));
+    /// Drops the waiting and the running search; results of the running one
+    /// are ignored if they still arrive.
+    fn cancel_search(&self) {
+        if let Some(timer) = self.search.timer.take() {
+            timer.remove();
         }
+        if let Some(running) = self.search.running.take() {
+            running.cancel();
+        }
+        self.search.generation.set(self.search.generation.get() + 1);
+        self.search.activate_when_ready.set(false);
     }
 
-    fn append(&self, hit: Hit) {
-        let icon = self.icon_for(&hit.mime);
-        let row = self.model.append();
-        self.model.set(
-            &row,
-            &[(ICON, &icon), (TITLE, &hit.title), (FILE, &hit.path)],
-        );
+    fn schedule_search(&self, text: String) {
+        let this = self.this.clone();
+        let timer = glib::timeout_add_local_once(SEARCH_DELAY, move || {
+            if let Some(page) = this.upgrade() {
+                page.search.timer.take();
+                page.start_search(text);
+            }
+        });
+        self.search.timer.replace(Some(timer));
+    }
+
+    fn start_search(&self, text: String) {
+        let generation = self.search.generation.get();
+        let cancellable = gio::Cancellable::new();
+        self.search.running.replace(Some(cancellable.clone()));
+        let connection = self.search.connection.clone();
+        let this = self.this.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let (hits, error) =
+                gio::spawn_blocking(move || search(&connection, &text, &cancellable))
+                    .await
+                    .unwrap_or_else(|_| (Vec::new(), Some("file search panicked".to_owned())));
+            let Some(page) = this.upgrade() else {
+                return;
+            };
+            if page.search.generation.get() != generation {
+                return; // Superseded by newer text.
+            }
+            page.search.running.take();
+            if let Some(message) = error {
+                eprint!("{}", error_line(&message));
+            }
+            page.show_hits(hits);
+            if page.search.activate_when_ready.take() {
+                page.open_selected();
+            }
+        });
+    }
+
+    /// Enter while the search for the current text is waiting or running:
+    /// start it at once and open the selected hit when it arrives, rather
+    /// than a row left from earlier text. False when there is nothing to
+    /// wait for.
+    fn activate_when_ready(&self) -> bool {
+        if let Some(timer) = self.search.timer.take() {
+            timer.remove();
+            self.start_search(self.entry.text().into());
+        }
+        let waiting = self.search.running.borrow().is_some();
+        self.search.activate_when_ready.set(waiting);
+        waiting
+    }
+
+    fn show_hits(&self, hits: Vec<Hit>) {
+        self.model.clear();
+        // Hits of one MIME type share their icon.
+        let mut icons = HashMap::new();
+        for hit in hits {
+            let icon = icons
+                .entry(hit.mime)
+                .or_insert_with_key(|mime| self.icon_for(mime));
+            let row = self.model.append();
+            self.model.set(
+                &row,
+                &[(ICON, &*icon), (TITLE, &hit.title), (FILE, &hit.path)],
+            );
+        }
+        self.set_selection();
+    }
+
+    fn open_selected(&self) {
+        if let Some((model, iter)) = self.view.selection().selected() {
+            let file = string_value(&model, &iter, FILE as i32);
+            execute_app(&file, self.post_launch_sleep, &self.quit);
+        }
     }
 
     // Try every themed name GIO derives for the MIME type, then the generic
@@ -166,17 +267,17 @@ impl DialogPage for TrackerPage {
         self.root.clone()
     }
     fn on_entry_changed(&self) {
-        // Vala `string.length` counts bytes, not characters.
-        if self.entry.text().len() > 2 {
-            self.model.clear();
-            self.full_text_search();
-            self.set_selection();
+        self.cancel_search();
+        let text = self.entry.text();
+        // Shorter text is not searched and leaves the list as it is. Vala
+        // `string.length` counts bytes, not characters.
+        if text.len() > 2 {
+            self.schedule_search(text.into());
         }
     }
     fn on_entry_activated(&self) {
-        if let Some(iter) = self.model.iter(&self.path.borrow()) {
-            let file = string_value(&self.model, &iter, FILE as i32);
-            execute_app(&file, self.post_launch_sleep, &self.quit);
+        if !self.activate_when_ready() {
+            self.open_selected();
         }
     }
     fn get_id(&self) -> &'static str {
@@ -198,11 +299,13 @@ impl DialogPage for TrackerPage {
         if navigate(&self.view, &self.path, event) {
             return true;
         }
-        // The dialog shell consumes Enter before pages see it, so the Vala
-        // empty-model Enter branch is unreachable; keep it as a no-op.
-        event.keyval() == gdk::keys::constants::Return
-            && self.model.iter_first().is_none()
-            && !self.entry.text().is_empty()
+        if !is_enter_key(&event.keyval()) {
+            return false;
+        }
+        // Typed text that matches no file is nothing this page can open, so
+        // Enter then does nothing.
+        self.activate_when_ready()
+            || (self.model.iter_first().is_none() && !self.entry.text().is_empty())
     }
     fn get_keybinding(&self) -> char {
         'f'
@@ -226,35 +329,56 @@ trait Rows {
     fn get_string(&self, column: i32) -> Option<&str>;
 }
 
-struct TrackerRows {
-    // Declared first so the cursor is released before its connection.
-    cursor: Cursor,
-    _connection: Connection,
-}
-
-impl Rows for TrackerRows {
+impl Rows for Cursor<'_> {
     fn next(&mut self) -> Result<bool, String> {
-        self.cursor.next().map_err(|error| error.to_string())
+        Cursor::next(self).map_err(|error| error.message().to_owned())
     }
     fn get_string(&self, column: i32) -> Option<&str> {
-        self.cursor.get_string(column)
+        Cursor::get_string(self, column)
     }
 }
 
-fn open_tracker(query: &str) -> Result<TrackerRows, String> {
-    let connection = Connection::bus_new(MINER_SERVICE, None).map_err(|error| error.to_string())?;
-    let cursor = connection.query(query).map_err(|error| error.to_string())?;
-    Ok(TrackerRows {
-        cursor,
-        _connection: connection,
-    })
+/// Searches the file index for `text`, on a worker thread. Returns the hits
+/// read, and the error that stopped the search, if any: the SPARQL library
+/// or the index may be unavailable.
+fn search(
+    connection: &Mutex<Option<Connection>>,
+    text: &str,
+    cancellable: &gio::Cancellable,
+) -> (Vec<Hit>, Option<String>) {
+    let mut connection = connection.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut hits = Vec::new();
+    let result = run_search(&mut connection, text, cancellable, |hit| hits.push(hit));
+    if result.is_err() && !cancellable.is_cancelled() {
+        // The endpoint may have gone away: connect again next time.
+        *connection = None;
+    }
+    (hits, result.err())
 }
 
-/// The SPARQL sent to Tracker; the entry text is interpolated unescaped,
-/// exactly as the Vala page does.
-fn query_string(term: &str) -> String {
+fn run_search(
+    connection: &mut Option<Connection>,
+    text: &str,
+    cancellable: &gio::Cancellable,
+    sink: impl FnMut(Hit),
+) -> Result<(), String> {
+    let message = |error: glib::Error| error.message().to_owned();
+    let connection = match connection {
+        Some(connection) => connection,
+        None => connection.insert(Connection::bus_new(MINER_SERVICE).map_err(message)?),
+    };
+    let mut cursor = connection
+        .query(&search_query(), &[("text", text)], cancellable)
+        .map_err(message)?;
+    collect_hits(&mut cursor, sink)
+}
+
+/// The search text is bound as the `~text` parameter, so quotes in it are
+/// searched for literally instead of breaking the query.
+fn search_query() -> String {
     format!(
-        "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) WHERE {{ ?f fts:match '{term}' }}"
+        "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) \
+         WHERE {{ ?f fts:match ~text }} ORDER BY DESC(fts:rank(?f)) LIMIT {MAX_HITS}"
     )
 }
 
@@ -262,14 +386,9 @@ fn error_line(message: &str) -> String {
     format!("{message}\n")
 }
 
-/// Run the query and hand each row to `sink` as it is read. The first error
-/// stops the walk; rows already delivered stay delivered.
-fn search<R: Rows>(
-    open: impl FnOnce(&str) -> Result<R, String>,
-    term: &str,
-    mut sink: impl FnMut(Hit),
-) -> Result<(), String> {
-    let mut rows = open(&query_string(term))?;
+/// Hand each row to `sink` as it is read. The first error stops the walk;
+/// rows already delivered stay delivered.
+fn collect_hits(rows: &mut impl Rows, mut sink: impl FnMut(Hit)) -> Result<(), String> {
     while rows.next()? {
         let hit = hit_from_row(rows.get_string(0), rows.get_string(1), rows.get_string(2))
             .map_err(|error| error.message().to_owned())?;
@@ -346,7 +465,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        basename, error_line, hit_from_row, query_string, search, Hit, Rows, MINER_SERVICE,
+        basename, collect_hits, error_line, hit_from_row, search_query, Hit, Rows, MINER_SERVICE,
     };
 
     struct FakeRows {
@@ -386,14 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn query_interpolates_raw_entry_text() {
+    fn search_query_binds_the_text_and_is_bounded() {
         assert_eq!(
-            query_string("regolith"),
-            "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) WHERE { ?f fts:match 'regolith' }"
-        );
-        assert_eq!(
-            query_string("it's"),
-            "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) WHERE { ?f fts:match 'it's' }"
+            search_query(),
+            "SELECT DISTINCT nie:url(?f) nie:title(?f) nie:mimeType(?f) \
+             WHERE { ?f fts:match ~text } ORDER BY DESC(fts:rank(?f)) LIMIT 1000"
         );
     }
 
@@ -431,26 +547,17 @@ mod tests {
     }
 
     #[test]
-    fn search_sends_query_and_skips_rows_without_url() {
-        let mut sent = String::new();
+    fn rows_without_url_are_skipped() {
         let mut hits = Vec::new();
-        let result = search(
-            |query| {
-                sent = query.to_owned();
-                Ok(fake(
-                    vec![
-                        [Some("file:///a/b.pdf"), None, Some("application/pdf")],
-                        [None, Some("ghost"), None],
-                        [Some("file:///c"), Some("C"), None],
-                    ],
-                    None,
-                ))
-            },
-            "abc",
-            |hit| hits.push(hit),
+        let mut rows = fake(
+            vec![
+                [Some("file:///a/b.pdf"), None, Some("application/pdf")],
+                [None, Some("ghost"), None],
+                [Some("file:///c"), Some("C"), None],
+            ],
+            None,
         );
-        assert_eq!(result, Ok(()));
-        assert_eq!(sent, query_string("abc"));
+        assert_eq!(collect_hits(&mut rows, |hit| hits.push(hit)), Ok(()));
         assert_eq!(
             hits,
             vec![
@@ -461,16 +568,8 @@ mod tests {
     }
 
     #[test]
-    fn no_miner_error_reports_message_line_without_rows() {
+    fn errors_are_reported_as_one_line() {
         let message = format!("The name {MINER_SERVICE} was not provided by any .service files");
-        let mut hits = Vec::new();
-        let result = search(
-            |_| Err::<super::TrackerRows, _>(message.clone()),
-            "fixture query",
-            |hit| hits.push(hit),
-        );
-        assert_eq!(result, Err(message.clone()));
-        assert!(hits.is_empty());
         assert_eq!(error_line(&message), format!("{message}\n"));
         assert!(error_line(&message).contains("org.freedesktop.Tracker3.Miner.Files"));
     }
@@ -478,37 +577,27 @@ mod tests {
     #[test]
     fn errors_keep_rows_collected_so_far() {
         let mut hits = Vec::new();
-        let result = search(
-            |_| {
-                Ok(fake(
-                    vec![
-                        [Some("file:///one"), None, None],
-                        [Some("file:///two"), None, None],
-                    ],
-                    Some(1),
-                ))
-            },
-            "abc",
-            |hit| hits.push(hit),
+        let mut rows = fake(
+            vec![
+                [Some("file:///one"), None, None],
+                [Some("file:///two"), None, None],
+            ],
+            Some(1),
         );
+        let result = collect_hits(&mut rows, |hit| hits.push(hit));
         assert_eq!(result, Err("cursor broke".to_owned()));
         assert_eq!(hits, vec![hit("one", "/one", "application/octet-stream")]);
 
         let mut hits = Vec::new();
-        let result = search(
-            |_| {
-                Ok(fake(
-                    vec![
-                        [Some("file:///one"), None, None],
-                        [Some("http://x/two"), None, None],
-                        [Some("file:///three"), None, None],
-                    ],
-                    None,
-                ))
-            },
-            "abc",
-            |hit| hits.push(hit),
+        let mut rows = fake(
+            vec![
+                [Some("file:///one"), None, None],
+                [Some("http://x/two"), None, None],
+                [Some("file:///three"), None, None],
+            ],
+            None,
         );
+        let result = collect_hits(&mut rows, |hit| hits.push(hit));
         assert!(result.is_err());
         assert_eq!(hits, vec![hit("one", "/one", "application/octet-stream")]);
     }

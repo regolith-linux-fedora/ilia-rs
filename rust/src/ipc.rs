@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -7,7 +8,6 @@ use std::time::Duration;
 
 const IPC_MAGIC: &[u8; 6] = b"i3-ipc";
 const HEADER_SIZE: usize = 14;
-const MAX_REPLY_SIZE: usize = 128 * 1024;
 
 pub const GET_TREE: u32 = 4;
 pub const GET_VERSION: u32 = 7;
@@ -326,7 +326,8 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 }
 
 fn request(command: u32) -> Result<Json, String> {
-    let socket_path = std::env::var("I3SOCK").map_err(|error| error.to_string())?;
+    let socket_path = socket_path(std::env::var_os("I3SOCK"), std::env::var_os("SWAYSOCK"))
+        .ok_or_else(|| "neither I3SOCK nor SWAYSOCK is set".to_owned())?;
     let mut stream = UnixStream::connect(&socket_path).map_err(|error| error.to_string())?;
     let timeout = Some(Duration::from_secs(3));
     stream
@@ -344,12 +345,38 @@ fn request(command: u32) -> Result<Json, String> {
         .write_all(&request)
         .map_err(|error| error.to_string())?;
 
-    let mut reply = vec![0; MAX_REPLY_SIZE];
-    let received = stream.read(&mut reply).map_err(|error| error.to_string())?;
-    if received <= HEADER_SIZE {
+    let payload = read_reply(&mut stream)?;
+    if payload.is_empty() {
         return Err("No Response".to_owned());
     }
-    JsonParser::new(&reply[HEADER_SIZE..received]).parse()
+    JsonParser::new(&payload).parse()
+}
+
+/// The compositor socket: `I3SOCK` when set, else `SWAYSOCK`. sway exports
+/// both to the programs it starts, but a launcher started some other way may
+/// only see `SWAYSOCK`.
+fn socket_path(i3_socket: Option<OsString>, sway_socket: Option<OsString>) -> Option<OsString> {
+    i3_socket.or(sway_socket)
+}
+
+/// Reads one reply: the fixed header, then exactly the payload length it
+/// announces. Large replies arrive in several reads, and even the header may
+/// be split.
+fn read_reply(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut header = [0u8; HEADER_SIZE];
+    reader
+        .read_exact(&mut header)
+        .map_err(|error| format!("reading the reply header failed: {error}"))?;
+    if &header[..IPC_MAGIC.len()] != IPC_MAGIC {
+        return Err("invalid reply header".to_owned());
+    }
+    // The window manager writes the length in its native byte order.
+    let length = u32::from_ne_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    let mut payload = vec![0; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|error| format!("reading the {length}-byte reply failed: {error}"))?;
+    Ok(payload)
 }
 
 #[allow(dead_code)]
@@ -639,9 +666,75 @@ pub fn get_tree() -> Result<TreeReply, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_from_reply, expand_path_vars, include_paths, version_from_reply, wildcard_matches,
-        JsonParser, TreeReply,
+        config_from_reply, expand_path_vars, include_paths, read_reply, socket_path,
+        version_from_reply, wildcard_matches, JsonParser, TreeReply, IPC_MAGIC,
     };
+    use std::io::Read;
+
+    /// Hands out at most `chunk` bytes per read, like a socket under load.
+    struct Fragmented<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.chunk.min(buffer.len()).min(self.data.len());
+            buffer[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
+    fn message(payload: &[u8]) -> Vec<u8> {
+        let mut message = IPC_MAGIC.to_vec();
+        message.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        message.extend_from_slice(&9u32.to_ne_bytes());
+        message.extend_from_slice(payload);
+        message
+    }
+
+    #[test]
+    fn reply_is_read_whole_however_it_is_fragmented() {
+        let payload = vec![b'x'; 300 * 1024];
+        let message = message(&payload);
+        for chunk in [3, 1000, 64 * 1024, message.len()] {
+            let mut reader = Fragmented {
+                data: &message,
+                chunk,
+            };
+            assert_eq!(read_reply(&mut reader).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn i3_socket_takes_precedence_over_sway_socket() {
+        let i3 = Some("/run/i3.sock".into());
+        let sway = Some("/run/sway.sock".into());
+        assert_eq!(socket_path(i3.clone(), sway.clone()), i3);
+        assert_eq!(socket_path(None, sway.clone()), sway);
+        assert_eq!(socket_path(None, None), None);
+    }
+
+    #[test]
+    fn short_or_foreign_replies_are_errors() {
+        let message = message(b"{}");
+        let mut truncated = Fragmented {
+            data: &message[..message.len() - 1],
+            chunk: 4,
+        };
+        assert!(read_reply(&mut truncated).is_err());
+        let mut header_only = Fragmented {
+            data: &message[..10],
+            chunk: 4,
+        };
+        assert!(read_reply(&mut header_only).is_err());
+        let mut foreign = Fragmented {
+            data: b"not-ipc-header-at-all",
+            chunk: 64,
+        };
+        assert!(read_reply(&mut foreign).is_err());
+    }
 
     #[test]
     fn json_parser_handles_nested_ipc_values() {

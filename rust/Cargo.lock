@@ -404,17 +404,7 @@ dependencies = [
  "glib",
  "gtk",
  "gtk-layer-shell",
- "ilia-tracker-sys",
-]
-
-[[package]]
-name = "ilia-tracker-sys"
-version = "0.1.0"
-dependencies = [
- "gio-sys",
- "glib-sys",
- "gobject-sys",
- "pkg-config",
+ "libc",
 ]
 
 [[package]]

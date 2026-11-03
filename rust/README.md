@@ -3,8 +3,11 @@
 Build from this directory with `cargo build --release --locked`.
 The binary is `target/release/ilia`. Cargo
 resolves the locked dependencies from crates.io; the only crate outside the
-gtk-rs graph is the in-tree `ilia-tracker-sys` binding, whose four Tracker SPARQL calls sit behind
-safe wrappers. Application code contains no `unsafe`.
+gtk-rs graph is `libc`, for `dlopen`. The SPARQL library (`libtinysparql-3.0.so.0`, or
+`libtracker-sparql-3.0.so.0` on older systems) is not linked: the Files page
+loads it the first time it searches, so every other page works without it.
+`sparql.rs`, which wraps its C calls in a safe API, is the only module with
+`unsafe`.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -19,10 +22,13 @@ Module map:
 - `rofication.rs`, `notifications.rs`: the rofication socket client
   (`/tmp/rofi_notification_daemon`, read-until-EOF `list`, `del:`, `delm:`)
   and the notifications page.
-- `tracker.rs`: the Files page over `ilia-tracker-sys`.
+- `sparql.rs`, `tracker.rs`: the run-time SPARQL binding and the Files page,
+  which searches on worker threads once typing pauses.
 - `terminal.rs`: the Commands page (asynchronous PATH scan, launches through
   the `systemd-run` wrapper in `runner.rs`).
-- `textlist.rs`: the TextList page (stdin drained synchronously at startup).
+- `textlist.rs`: the TextList page (stdin drained synchronously at startup,
+  filtered into a prebuilt list).
+- `filter.rs`: the every-word query matching shared by the pages.
 - `icons.rs`: the reference icon-loader order shared by the new pages.
 - `dialog.rs`, `application.rs`: the shell.
 
@@ -99,8 +105,9 @@ Against the parity harness:
   `Error: execute_keybinding failed`) cannot be produced from safe Rust. GIO
   sets an error whenever a launch fails, so the observable failure paths are
   the `<prefix>: <message>` forms, which are reproduced.
-- Text that is not valid UTF-8 (stdin lines, file names) is stored lossily,
-  since GTK string values must be UTF-8.
+- Text that is not valid UTF-8 is shown lossily, since GTK string values must
+  be UTF-8; TextList keeps the bytes of such stdin lines and prints them back
+  unchanged.
 - History overflow retains 32 entries: the oldest entry is discarded and the
   newly launched desktop ID remains last. The Applications page keeps
   its `icon-size=0` behavior: icon loading is skipped and stderr stays clean

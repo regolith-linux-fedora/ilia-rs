@@ -7,7 +7,7 @@ use std::rc::Rc;
 use glib::translate::IntoGlib;
 
 use crate::args::Args;
-use crate::pages::{create, find, DialogPage, Page, PAGES};
+use crate::pages::{create, find, is_enter_key, DialogPage, Page, PAGES};
 
 const MIN_WINDOW_WIDTH: i32 = 160;
 const MIN_WINDOW_HEIGHT: i32 = 100;
@@ -200,11 +200,11 @@ pub fn build(
                 return glib::Propagation::Stop;
             }
             if keyval == u32::from('+') {
-                change_size(window, &settings_for_key, 128);
+                change_size(window, &settings_for_key, 128, is_wayland);
                 return glib::Propagation::Stop;
             }
             if keyval == u32::from('-') {
-                change_size(window, &settings_for_key, -128);
+                change_size(window, &settings_for_key, -128, is_wayland);
                 return glib::Propagation::Stop;
             }
         } else if state.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -249,11 +249,25 @@ pub fn build(
             key,
             gdk::keys::constants::Up
                 | gdk::keys::constants::Down
-                | gdk::keys::constants::Return
                 | gdk::keys::constants::Page_Up
                 | gdk::keys::constants::Page_Down
+                | gdk::keys::constants::Home
+                | gdk::keys::constants::End
+                | gdk::keys::constants::KP_Home
+                | gdk::keys::constants::KP_End
         ) {
             pages_for_key[active_for_key.get()].show();
+            return glib::Propagation::Proceed;
+        }
+        if is_enter_key(&key) {
+            // The page may accept typed text that matches no row; otherwise
+            // the list activates its highlighted row, for Return and the
+            // keypad Enter alike.
+            let page = &pages_for_key[active_for_key.get()];
+            if page.key_event(event) {
+                return glib::Propagation::Stop;
+            }
+            page.show();
             return glib::Propagation::Proceed;
         }
         if pages_for_key[active_for_key.get()].key_event(event) {
@@ -330,10 +344,15 @@ pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
 /// Grows or shrinks the dialog by `delta` in both dimensions, ignoring the
 /// change below the minimum size or at/above the first monitor's size, and
 /// persists the accepted size.
-fn change_size(window: &gtk::Window, settings: &gio::Settings, delta: i32) {
+fn change_size(window: &gtk::Window, settings: &gio::Settings, delta: i32, is_wayland: bool) {
     let Some((width, height)) = resized(window.size(), delta, first_monitor_size(window)) else {
         return;
     };
+    if is_wayland {
+        // The Wayland window is sized by its size request, which is also
+        // its minimum: without updating it the window cannot shrink.
+        window.set_size_request(width, height);
+    }
     window.resize(width, height);
     let _ = settings.set_int("window-width", width);
     let _ = settings.set_int("window-height", height);
@@ -503,6 +522,7 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
         ("Alt -", "Decrease Dialog Size"),
         ("Alt +", "Increase Dialog Size"),
         ("↑ ↓", "Change Selected Item"),
+        ("Home End", "Select First or Last Item"),
         ("Ctrl+p Ctrl+n", "Change Selected Item (emacs style)"),
         ("Ctrl+k Ctrl+j", "Change Selected Item (vim style)"),
         ("Esc", "Exit"),

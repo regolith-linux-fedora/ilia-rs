@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -7,10 +7,11 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
+use crate::filter::matches_all_words;
 use crate::icons::{load_icon_from_info, load_icon_from_name};
 use crate::keybindings::navigate;
 use crate::pages::DialogPage;
-use crate::rofication::{RoficationClient, SOCKET_PATH};
+use crate::rofication::{newest_first, NotificationDesc, RoficationClient, SOCKET_PATH};
 
 const ICON: u32 = 0;
 const APP: u32 = 1;
@@ -28,7 +29,6 @@ struct Inner {
     view: gtk::TreeView,
     root: gtk::Widget,
     path: RefCell<gtk::TreePath>,
-    selected_notification_id: Rc<Cell<i32>>,
     client: RoficationClient,
     icon_size: i32,
     post_launch_sleep: u64,
@@ -47,9 +47,8 @@ impl RoficationPage {
         ]);
         let filter = gtk::TreeModelFilter::new(&model, None);
         filter.set_visible_func(move |tree_model, iter| {
-            let query = entry.text().to_lowercase();
             matches_query(
-                query.trim(),
+                entry.text().as_str(),
                 &string_value(tree_model, iter, DETAIL),
                 &string_value(tree_model, iter, APP),
             )
@@ -82,7 +81,6 @@ impl RoficationPage {
         view.set_activate_on_single_click(true);
 
         let post_launch_sleep = settings.int("post-launch-sleep").max(0) as u64;
-        let selected_notification_id = Rc::new(Cell::new(-1));
         let filter_for_activation = filter.clone();
         let quit_for_activation = quit.clone();
         view.connect_row_activated(move |_, row_path, _| {
@@ -93,12 +91,6 @@ impl RoficationPage {
                     post_launch_sleep,
                     &quit_for_activation,
                 );
-            }
-        });
-        let selected_for_selection = selected_notification_id.clone();
-        view.selection().connect_changed(move |selection| {
-            if let Some((tree_model, iter)) = selection.selected() {
-                selected_for_selection.set(parse_int(&string_value(&tree_model, &iter, ID)));
             }
         });
 
@@ -114,7 +106,6 @@ impl RoficationPage {
                 view,
                 root: scrolled.upcast(),
                 path: RefCell::new(gtk::TreePath::new_first()),
-                selected_notification_id,
                 client: RoficationClient::new(SOCKET_PATH),
                 icon_size,
                 post_launch_sleep,
@@ -126,9 +117,16 @@ impl RoficationPage {
 
 impl Inner {
     // The fetch blocks the calling thread until the daemon closes the
-    // connection; rows are only replaced once the fetch succeeded.
+    // connection or the socket times out; rows are only replaced once the
+    // fetch succeeded.
     fn load_notifications(&self) -> Result<(), String> {
         let notifications = self.client.get_notifications()?;
+        self.show_notifications(notifications);
+        Ok(())
+    }
+
+    fn show_notifications(&self, mut notifications: Vec<NotificationDesc>) {
+        notifications.sort_by(newest_first);
         let theme = gtk::IconTheme::default();
         self.model.clear();
 
@@ -153,34 +151,33 @@ impl Inner {
                 ],
             );
         }
-        Ok(())
     }
 
-    // Select the stored path and track the first visible notification id.
     fn set_selection(&self) {
         let selection = self.view.selection();
         selection.set_mode(gtk::SelectionMode::Single);
         selection.select_path(&self.path.borrow());
+    }
 
-        if let Some(iter) = self.filter.iter_first() {
-            self.selected_notification_id
-                .set(parse_int(&string_value(&self.filter, &iter, ID)));
-        }
+    // The id of the highlighted notification, however it got highlighted.
+    fn selected_notification_id(&self) -> Option<i32> {
+        let (model, iter) = self.view.selection().selected()?;
+        let id = parse_int(&string_value(&model, &iter, ID));
+        (id > -1).then_some(id)
     }
 
     fn delete_selected_notification(&self) {
-        let id = self.selected_notification_id.get();
-        if id > -1 {
-            match self.client.delete_notification_by_id(i64::from(id)) {
-                Ok(()) => {
-                    // The Vala reload is an unobserved async call, so its
-                    // failure is silently dropped.
-                    let _ = self.load_notifications();
-                    self.selected_notification_id.set(-1);
-                    self.set_selection();
-                }
-                Err(error) => eprintln!("Error: delete_selected_notification failed: {error}"),
+        let Some(id) = self.selected_notification_id() else {
+            return;
+        };
+        match self.client.delete_notification_by_id(i64::from(id)) {
+            Ok(()) => {
+                // The Vala reload is an unobserved async call, so its
+                // failure is silently dropped.
+                let _ = self.load_notifications();
+                self.set_selection();
             }
+            Err(error) => eprintln!("Error: delete_selected_notification failed: {error}"),
         }
     }
 
@@ -210,23 +207,21 @@ impl Inner {
 
 impl DialogPage for RoficationPage {
     fn initialize(&self) {
-        let result = self.inner.load_notifications();
-        // Vala's `load_notifications.begin()` never yields, so GTask defers
-        // its completion callback to a default-priority idle source.
+        // Read the list off the main thread, so the window appears and takes
+        // keys even while a daemon that accepted the connection is silent.
         let inner = self.inner.clone();
-        let mut result = Some(result);
-        glib::idle_add_local_full(glib::Priority::DEFAULT, move || {
-            match result.take() {
-                Some(Ok(())) => {
-                    inner
-                        .model
-                        .set_sort_column_id(gtk::SortColumn::Index(APP), gtk::SortType::Ascending);
+        let client = inner.client;
+        glib::MainContext::default().spawn_local(async move {
+            let result = gio::spawn_blocking(move || client.get_notifications())
+                .await
+                .unwrap_or_else(|_| Err("reading notifications panicked".to_owned()));
+            match result {
+                Ok(notifications) => {
+                    inner.show_notifications(notifications);
                     inner.set_selection();
                 }
-                Some(Err(error)) => eprintln!("Error: load_notifications failed: {error}"),
-                None => {}
+                Err(error) => eprintln!("Error: load_notifications failed: {error}"),
             }
-            glib::ControlFlow::Break
         });
     }
     fn get_root(&self) -> gtk::Widget {
@@ -327,11 +322,9 @@ pub fn detail_text(summary: &str, body: &str) -> String {
     }
 }
 
-// `query` is already lowercased and stripped; match detail or application.
+// Each word of the query may match the detail or the application.
 pub fn matches_query(query: &str, detail: &str, application: &str) -> bool {
-    query.is_empty()
-        || detail.to_lowercase().contains(query)
-        || application.to_lowercase().contains(query)
+    matches_all_words(query, &[detail, application])
 }
 
 fn desktop_app_info(application: &str) -> Option<gio::DesktopAppInfo> {
@@ -419,6 +412,9 @@ mod tests {
         assert!(visible("nothing").is_empty());
         // Stored text is lowercased before matching.
         assert!(matches_query("build", "", "BUILDER"));
+        // Every word must match, each in either field, in any order.
+        assert_eq!(visible("BODY  messenger"), ["Messenger"]);
+        assert_eq!(visible("builder beta"), Vec::<&str>::new());
     }
 
     #[test]

@@ -6,8 +6,9 @@ use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
+use crate::filter::matches_all_words;
 use crate::keybindings::navigate;
-use crate::pages::DialogPage;
+use crate::pages::{is_enter_key, DialogPage};
 use crate::runner::runner_app_info;
 
 const NAME: u32 = 0;
@@ -84,14 +85,16 @@ impl CommandPage {
     }
 
     // Fire-and-forget scan of every PATH directory; dialog startup never
-    // waits for it. Rows are sorted and the first one selected once the
-    // whole PATH has been walked.
+    // waits for it. The store is sorted before the scan starts, so each row
+    // lands at its final position as it arrives and the end of the scan
+    // never reorders the list under a highlight made while it ran. Once the
+    // whole PATH has been walked, the first row is selected if none is.
     fn load_commands(&self, model: gtk::ListStore) {
         let view = self.view.clone();
         let path = self.path.clone();
+        model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
         glib::MainContext::default().spawn_local(async move {
             load_commands_from_path(&model).await;
-            model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
             set_selection(&view, &path);
         });
     }
@@ -137,11 +140,16 @@ impl DialogPage for CommandPage {
         if navigate(&self.view, &self.path, event) {
             return true;
         }
-        if event.keyval() == gdk::keys::constants::Return
+        if is_enter_key(&event.keyval())
             && self.filter.iter_first().is_none()
             && !self.entry.text().is_empty()
         {
-            execute_command(self.entry.text().as_str(), self.quiet, &self.quit);
+            // No listed command matches: run the typed command line, with
+            // its arguments.
+            launch(
+                &typed_command_line(self.entry.text().as_str(), self.quiet),
+                &self.quit,
+            );
             return true;
         }
         false
@@ -165,12 +173,9 @@ fn string_value(
         .unwrap_or_default()
 }
 
-// Vala filter_func: lowercased query stripped of ASCII whitespace
-// (g_strstrip) matched as a substring of the lowercased full path.
+// Every word of the query must occur in the full path, ignoring case.
 fn matches_query(query: &str, cmd_path: &str) -> bool {
-    let query = query.to_lowercase();
-    let query = query.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
-    query.is_empty() || (!cmd_path.is_empty() && cmd_path.to_lowercase().contains(query))
+    matches_all_words(query, &[cmd_path])
 }
 
 fn set_selection(view: &gtk::TreeView, path: &RefCell<gtk::TreePath>) {
@@ -226,8 +231,8 @@ async fn load_commands_from_dir(
                 .path()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let row = model.append();
-            model.set(&row, &[(NAME, &cmd_path)]);
+            // Inserted at its sorted position, with one row-inserted signal.
+            model.insert_with_values(None, &[(NAME, &cmd_path)]);
         }
     }
 }
@@ -242,13 +247,29 @@ fn command_line(cmd_path: &str, quiet: bool) -> String {
     }
 }
 
+// A command line typed by the user, in shell syntax: -q runs it as is;
+// otherwise x-terminal-emulator runs the program and its arguments given
+// after -e. AppInfo expands % field codes as in a desktop file's Exec key,
+// so literal % signs are doubled.
+fn typed_command_line(text: &str, quiet: bool) -> String {
+    let text = text.replace('%', "%%");
+    if quiet {
+        text
+    } else {
+        format!("x-terminal-emulator -e {text}")
+    }
+}
+
+fn execute_command(cmd_path: &str, quiet: bool, quit: &Rc<dyn Fn()>) {
+    launch(&command_line(cmd_path, quiet), quit);
+}
+
 // A launch that fails surfaces as a GLib error and does not quit. The
 // Vala false-without-error branch ("Error: execute_command failed",
 // then quit) cannot occur here: gio-rs reports every failed launch as
 // an error.
-fn execute_command(cmd_path: &str, quiet: bool, quit: &Rc<dyn Fn()>) {
-    let commandline = command_line(cmd_path, quiet);
-    match gio::AppInfo::create_from_commandline(&commandline, None, gio::AppInfoCreateFlags::NONE)
+fn launch(commandline: &str, quit: &Rc<dyn Fn()>) {
+    match gio::AppInfo::create_from_commandline(commandline, None, gio::AppInfoCreateFlags::NONE)
         .and_then(|app_info| runner_app_info(&app_info))
         .and_then(|runner| runner.launch(&[], None::<&gio::AppLaunchContext>))
     {
@@ -259,7 +280,7 @@ fn execute_command(cmd_path: &str, quiet: bool, quit: &Rc<dyn Fn()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line, matches_query};
+    use super::{command_line, matches_query, typed_command_line};
     use crate::runner::runner_app_info;
     use gio::prelude::*;
     use std::os::unix::fs::PermissionsExt;
@@ -290,6 +311,19 @@ mod tests {
     }
 
     #[test]
+    fn typed_command_lines_keep_their_arguments() {
+        assert_eq!(
+            typed_command_line("tool --flag 'two words'", true),
+            "tool --flag 'two words'"
+        );
+        assert_eq!(
+            typed_command_line("tool --flag 'two words'", false),
+            "x-terminal-emulator -e tool --flag 'two words'"
+        );
+        assert_eq!(typed_command_line("printf 100%", true), "printf 100%%");
+    }
+
+    #[test]
     fn argv_shapes_go_through_the_systemd_wrapper() {
         let dir = std::env::temp_dir().join(format!("ilia-terminal-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -301,6 +335,7 @@ mod tests {
 
         let terminal = wrapped_argv(&command_line("/fixture bin/tool", false));
         let quiet = wrapped_argv(&command_line("/fixture/tool", true));
+        let typed = wrapped_argv(&typed_command_line("/fixture/tool 'two words'", false));
 
         match saved {
             Some(path) => std::env::set_var("PATH", path),
@@ -320,6 +355,10 @@ mod tests {
         assert_eq!(quiet[..4], ["systemd-run", "--user", "--scope", "--unit"]);
         assert!(quiet[4].starts_with("run_ilia_-fixture-tool"));
         assert_eq!(quiet[5..], ["/fixture/tool"]);
+        assert_eq!(
+            typed[5..],
+            ["x-terminal-emulator", "-e", "/fixture/tool", "two words"]
+        );
     }
 
     #[test]
@@ -336,6 +375,7 @@ mod tests {
             "/tmp/bin/free-command"
         ));
         assert!(!matches_query("fixture", "/tmp/bin/free-command"));
+        assert!(matches_query("COMMAND  free", "/tmp/bin/free-command"));
         assert!(!matches_query("x", ""));
     }
 }

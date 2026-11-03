@@ -80,6 +80,16 @@ pub const PAGES: &[Page] = &[
     Page { id: "tracker", name: "<u>F</u>iles", icon: "emblem-documents", key: 'f', help: "This dialog allows for searching for files based on content. Type in a text query, hit enter and select from the list of files which contain the search string to open it.", bindings: &[("enter", "Open File")] },
 ];
 
+/// The keys that act on the highlighted row: Return and the keypad Enter.
+pub fn is_enter_key(key: &gdk::keys::Key) -> bool {
+    matches!(
+        *key,
+        gdk::keys::constants::Return
+            | gdk::keys::constants::KP_Enter
+            | gdk::keys::constants::ISO_Enter
+    )
+}
+
 pub fn find(name: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.id.eq_ignore_ascii_case(name))
 }
@@ -101,14 +111,9 @@ pub fn create(
             wm_name.to_owned(),
             quit,
         )),
-        "textlist" => Rc::new(TextListPage::new(
-            settings.clone(),
-            entry.clone(),
-            args,
-            quit,
-        )),
+        "textlist" => TextListPage::new(settings.clone(), entry.clone(), args, quit),
         "notifications" => Rc::new(RoficationPage::new(settings.clone(), entry.clone(), quit)),
-        "tracker" => Rc::new(TrackerPage::new(settings.clone(), entry.clone(), quit)),
+        "tracker" => TrackerPage::new(settings.clone(), entry.clone(), quit),
         "windows" => Rc::new(WindowsPage::new(
             settings.clone(),
             entry.clone(),

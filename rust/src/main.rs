@@ -2,6 +2,7 @@ mod application;
 mod apps;
 mod args;
 mod dialog;
+mod filter;
 mod icons;
 mod ipc;
 mod keybindings;
@@ -9,10 +10,13 @@ mod notifications;
 mod pages;
 mod rofication;
 mod runner;
+mod sparql;
 mod terminal;
 mod textlist;
 mod tracker;
 mod windows;
+
+use std::ffi::OsString;
 
 use args::Args;
 
@@ -29,8 +33,17 @@ fn early_output(args: &Args) -> Option<&'static str> {
     }
 }
 
+/// Arguments need not be UTF-8 (a label taken from a file name, say), so
+/// they are decoded lossily instead of refusing to start.
+fn parse_args(raw: impl IntoIterator<Item = OsString>) -> Args {
+    Args::parse(
+        raw.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    )
+}
+
 fn main() {
-    let args = Args::parse(std::env::args());
+    let args = parse_args(std::env::args_os());
     if let Some(output) = early_output(&args) {
         print!("{output}");
         return;
@@ -40,7 +53,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{early_output, Args, HELP, VERSION};
+    use super::{early_output, parse_args, Args, HELP, VERSION};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn short_help_selects_exact_help_output() {
@@ -68,6 +83,20 @@ mod tests {
     #[test]
     fn help_takes_precedence_over_version() {
         assert_eq!(early_output(&Args::parse(["ilia", "-v", "-h"])), Some(HELP),);
+    }
+
+    #[test]
+    fn non_utf8_arguments_are_decoded_lossily() {
+        let args = parse_args([
+            OsString::from("ilia"),
+            OsString::from("-l"),
+            OsString::from_vec(b"lab\xe9l".to_vec()),
+            OsString::from("-p"),
+            OsString::from("textlist"),
+        ]);
+        assert_eq!(args.value("-l"), Some("lab\u{fffd}l"));
+        assert_eq!(args.value("-p"), Some("textlist"));
+        assert_eq!(early_output(&args), None);
     }
 
     #[test]

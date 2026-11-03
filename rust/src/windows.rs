@@ -8,6 +8,7 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
+use crate::filter::matches_all_words;
 use crate::ipc::{self, TreeReply};
 use crate::keybindings::{navigate, wm_cli};
 use crate::pages::DialogPage;
@@ -43,12 +44,10 @@ impl WindowsPage {
         let filter = gtk::TreeModelFilter::new(&model, None);
         let entry_for_filter = entry.clone();
         filter.set_visible_func(move |tree_model, iter| {
-            let query = entry_for_filter.text().to_lowercase();
-            let query = query.trim();
-            query.is_empty()
-                || string_value(tree_model, iter, TITLE as i32)
-                    .to_lowercase()
-                    .contains(query)
+            matches_all_words(
+                entry_for_filter.text().as_str(),
+                &[&string_value(tree_model, iter, TITLE as i32)],
+            )
         });
 
         match ipc::get_tree() {
