@@ -1,7 +1,9 @@
 mod application;
+mod apps;
 mod args;
 mod dialog;
 mod pages;
+mod runner;
 
 use args::Args;
 

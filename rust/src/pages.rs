@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use gtk::gdk;
 use gtk::prelude::*;
 
+use crate::apps::ApplicationsPage;
+
+#[derive(Clone, Copy)]
 pub struct Page {
     pub id: &'static str,
     pub name: &'static str,
@@ -17,11 +21,12 @@ pub trait DialogPage {
     fn get_root(&self) -> gtk::Widget;
     fn on_entry_changed(&self) {}
     fn on_entry_activated(&self) {}
+    fn get_id(&self) -> &'static str;
     fn get_name(&self) -> &'static str;
     fn get_icon_name(&self) -> &'static str;
     fn get_help(&self) -> &'static str;
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str>;
-    fn key_event(&self, _key: gdk::keys::Key) -> bool {
+    fn key_event(&self, _event: &gdk::EventKey) -> bool {
         false
     }
     fn get_keybinding(&self) -> char;
@@ -33,12 +38,18 @@ impl DialogPage for Page {
         gtk::ListBox::new().upcast()
     }
 
+    fn get_id(&self) -> &'static str {
+        self.id
+    }
+
     fn get_name(&self) -> &'static str {
         self.name
     }
+
     fn get_icon_name(&self) -> &'static str {
         self.icon
     }
+
     fn get_help(&self) -> &'static str {
         self.help
     }
@@ -64,4 +75,17 @@ pub const PAGES: &[Page] = &[
 
 pub fn find(name: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.id.eq_ignore_ascii_case(name))
+}
+
+pub fn create(
+    page: &'static Page,
+    settings: &gio::Settings,
+    entry: &gtk::Entry,
+    quit: Rc<dyn Fn()>,
+) -> Rc<dyn DialogPage> {
+    if page.id == "apps" {
+        Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit))
+    } else {
+        Rc::new(*page)
+    }
 }

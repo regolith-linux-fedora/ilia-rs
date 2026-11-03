@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::args::Args;
-use crate::pages::{find, DialogPage, Page, PAGES};
+use crate::pages::{create, find, DialogPage, Page, PAGES};
 
 const ALL_PAGE_IDS: &[&str] = &[
     "apps",
@@ -62,23 +62,32 @@ pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gt
     window.add(&grid);
 
     let selected = focus.unwrap_or(&PAGES[0]);
-    let pages: Vec<&Page> = if all {
+    let page_specs: Vec<&Page> = if all {
         ALL_PAGE_IDS.iter().filter_map(|id| find(id)).collect()
     } else {
         vec![selected]
     };
+    let app_for_pages = app.clone();
+    let window_for_pages = window.clone();
+    let seat_for_pages = seat.clone();
+    let page_quit: Rc<dyn Fn()> =
+        Rc::new(move || quit(&window_for_pages, &app_for_pages, &seat_for_pages));
+    let pages: Vec<Rc<dyn DialogPage>> = page_specs
+        .iter()
+        .map(|page| create(page, &settings, &entry, page_quit.clone()))
+        .collect();
     for page in &pages {
         page.initialize();
         let _ = page.get_keybinding();
         let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let icon = if page.id == "textlist" {
+        let icon = if page.get_id() == "textlist" {
             args.value("-i").unwrap_or(page.get_icon_name())
         } else {
             page.get_icon_name()
         };
         let image = gtk::Image::from_icon_name(Some(icon), gtk::IconSize::Button);
         let label = gtk::Label::new(None);
-        let name = if page.id == "textlist" {
+        let name = if page.get_id() == "textlist" {
             args.value("-l").unwrap_or(page.get_name())
         } else {
             page.get_name()
@@ -93,11 +102,14 @@ pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gt
         // visible. Realize the page set before choosing the requested tab so
         // a later window.show_all() preserves the selection.
         notebook.show_all();
-        if let Some(index) = pages.iter().position(|page| page.id == selected.id) {
+        if let Some(index) = pages.iter().position(|page| page.get_id() == selected.id) {
             notebook.set_current_page(Some(index as u32));
         }
     } else {
-        notebook.append_page(&help_widget(selected), Some(&gtk::Label::new(Some("Help"))));
+        notebook.append_page(
+            &help_widget(pages[0].as_ref()),
+            Some(&gtk::Label::new(Some("Help"))),
+        );
     }
 
     if selected.id == "textlist" {
@@ -181,7 +193,7 @@ pub fn build(app: &gtk::Application, args: &Args, seat: SharedSeat) -> Result<gt
         }
         let index = notebook_for_key.current_page().unwrap_or(0) as usize;
         if let Some(page) = pages_for_key.get(index) {
-            if page.key_event(key) {
+            if page.key_event(event) {
                 return glib::Propagation::Stop;
             }
         }
@@ -243,7 +255,7 @@ pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
     None
 }
 
-fn help_widget(page: &Page) -> gtk::Widget {
+fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 5);
     let help = gtk::Label::new(Some(page.get_help()));
     help.set_line_wrap(true);

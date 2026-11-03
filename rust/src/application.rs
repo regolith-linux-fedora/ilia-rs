@@ -57,9 +57,6 @@ pub fn run(args: Args) -> i32 {
                     return;
                 }
                 window.show_all();
-                while gtk::events_pending() {
-                    gtk::main_iteration();
-                }
                 match dialog::grab_inputs(&window) {
                     Some(grabbed) => *seat_for_activate.borrow_mut() = Some(grabbed),
                     None => {
