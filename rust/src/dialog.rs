@@ -174,6 +174,8 @@ pub fn build(
                 active_for_switch.set(index);
                 entry_for_switch.set_secondary_icon_name(Some(page.get_icon_name()));
                 entry_for_switch.set_sensitive(true);
+                // Filter the new page by the text already typed.
+                page.on_entry_changed();
             }
             pages_for_switch[active_for_switch.get()].show();
         });
