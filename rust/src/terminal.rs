@@ -196,24 +196,56 @@ fn set_selection(view: &gtk::TreeView, path: &RefCell<gtk::TreePath>) {
 
 async fn load_commands_from_path(model: &gtk::ListStore) {
     let paths = std::env::var_os("PATH").unwrap_or_default();
-    for dir in paths.to_string_lossy().split(':') {
+    for dir in command_dirs(&paths.to_string_lossy()) {
         let dir = gio::File::for_path(dir);
-        if dir.query_exists(None::<&gio::Cancellable>) {
-            if let Err(error) = load_commands_from_dir(model, &dir).await {
-                eprintln!("Error: list_files failed: {}", error.message());
-            }
+        if let Err(error) = load_commands_from_dir(model, &dir).await {
+            eprintln!("Error: list_files failed: {}", error.message());
         }
     }
+}
+
+/// The directories of a PATH value that the Commands page lists, each once.
+/// Entries naming the same directory are listed once, at the first: with
+/// merged /usr, /bin and /sbin are links to /usr/bin and /usr/sbin, and PATH
+/// may repeat an entry. Entries that are not existing directories are skipped.
+fn command_dirs(path_var: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = Vec::new();
+    for dir in path_var.split(':').filter(|dir| !dir.is_empty()) {
+        let Ok(canonical) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if canonical.is_dir() && seen.insert(canonical) {
+            dirs.push(dir.to_owned());
+        }
+    }
+    dirs
+}
+
+/// Whether a PATH directory entry is a command: an executable regular file,
+/// also through symbolic links. The info must be queried following links,
+/// with the standard::type and access::can-execute attributes.
+fn is_command(info: &gio::FileInfo) -> bool {
+    info.file_type() == gio::FileType::Regular
+        && info.boolean(gio::FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE.as_str())
 }
 
 async fn load_commands_from_dir(
     model: &gtk::ListStore,
     dir: &gio::File,
 ) -> Result<(), glib::Error> {
+    // Follow links: most commands are links (alternatives), and is_command()
+    // needs their targets.
+    let attributes = format!(
+        "{},{},{}",
+        gio::FILE_ATTRIBUTE_STANDARD_NAME.as_str(),
+        gio::FILE_ATTRIBUTE_STANDARD_TYPE.as_str(),
+        gio::FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE.as_str()
+    );
     let enumerator = dir
         .enumerate_children_future(
-            gio::FILE_ATTRIBUTE_STANDARD_NAME.as_str(),
-            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            &attributes,
+            gio::FileQueryInfoFlags::NONE,
             glib::Priority::DEFAULT,
         )
         .await?;
@@ -225,7 +257,9 @@ async fn load_commands_from_dir(
             return Ok(());
         }
         for info in files {
-            // No executable-bit check: every enumerated name becomes a row.
+            if !is_command(&info) {
+                continue;
+            }
             let cmd_path = dir
                 .child(info.name())
                 .path()
@@ -280,7 +314,7 @@ fn launch(commandline: &str, quit: &Rc<dyn Fn()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line, matches_query, typed_command_line};
+    use super::{command_dirs, command_line, is_command, matches_query, typed_command_line};
     use crate::runner::runner_app_info;
     use gio::prelude::*;
     use std::os::unix::fs::PermissionsExt;
@@ -377,5 +411,45 @@ mod tests {
         assert!(!matches_query("fixture", "/tmp/bin/free-command"));
         assert!(matches_query("COMMAND  free", "/tmp/bin/free-command"));
         assert!(!matches_query("x", ""));
+    }
+
+    #[test]
+    fn command_dirs_list_each_directory_once() {
+        let root = std::env::temp_dir().join(format!("ilia-command-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let usr_bin = root.join("usr/bin");
+        std::fs::create_dir_all(&usr_bin).unwrap();
+        let bin = root.join("bin");
+        std::os::unix::fs::symlink(&usr_bin, &bin).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        let missing = root.join("missing");
+        let (usr_bin, bin, file, missing) = (
+            usr_bin.to_str().unwrap().to_owned(),
+            bin.to_str().unwrap().to_owned(),
+            file.to_str().unwrap().to_owned(),
+            missing.to_str().unwrap().to_owned(),
+        );
+
+        let path_var = format!("{bin}::{usr_bin}:{missing}:{file}:{bin}");
+        let dirs = command_dirs(&path_var);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // /bin and /usr/bin are one directory, listed under the first name.
+        assert_eq!(dirs, [bin]);
+        assert!(command_dirs("").is_empty());
+    }
+
+    #[test]
+    fn only_executable_files_are_commands() {
+        let info = |file_type, executable| {
+            let info = gio::FileInfo::new();
+            info.set_file_type(file_type);
+            info.set_attribute_boolean(gio::FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE.as_str(), executable);
+            info
+        };
+        assert!(is_command(&info(gio::FileType::Regular, true)));
+        assert!(!is_command(&info(gio::FileType::Regular, false)));
+        assert!(!is_command(&info(gio::FileType::Directory, true)));
     }
 }
