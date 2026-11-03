@@ -210,14 +210,22 @@ fn add_tree(model: &gtk::ListStore, node: &TreeReply, is_wayland: bool, icon_siz
     }
 }
 
+/// Whether the windows page lists a tree node. Every window the window
+/// manager manages is listed, dialogs and utility windows included, as sway
+/// does; i3 reports each X11 window's type, and dock windows (bars) are left
+/// out.
 pub fn navigable_window(node: &TreeReply, is_wayland: bool) -> bool {
     let class = node
         .window_properties
         .as_ref()
         .and_then(|properties| properties.class.as_deref());
+    let is_listed_type = node
+        .window_type
+        .as_deref()
+        .is_some_and(|window_type| window_type != "dock")
+        || (is_wayland && node.layout.as_deref() == Some("none"));
     matches!(node.node_type.as_str(), "con" | "floating_con")
-        && (matches!(node.window_type.as_deref(), Some("normal" | "unknown"))
-            || (is_wayland && node.layout.as_deref() == Some("none")))
+        && is_listed_type
         && class != Some("i3bar")
 }
 
@@ -333,6 +341,19 @@ mod tests {
             &node("workspace", Some("normal"), None),
             true
         ));
+        // i3 lists dialogs and utility windows too, but not docks.
+        for window_type in ["dialog", "utility", "splash", "toolbar", "menu"] {
+            assert!(
+                navigable_window(&node("con", Some(window_type), None), false),
+                "{window_type}"
+            );
+        }
+        assert!(navigable_window(
+            &node("floating_con", Some("dialog"), None),
+            false
+        ));
+        assert!(!navigable_window(&node("con", Some("dock"), None), false));
+        assert!(!navigable_window(&node("con", None, None), false));
         assert_eq!(
             focus_commandline("sway", "42").as_deref(),
             Some("/usr/bin/swaymsg [con_id=\"42\"] focus")
