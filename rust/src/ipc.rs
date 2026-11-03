@@ -14,7 +14,7 @@ pub const GET_VERSION: u32 = 7;
 pub const GET_CONFIG: u32 = 9;
 
 #[derive(Clone, Debug, PartialEq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Number(String),
@@ -24,21 +24,21 @@ enum Json {
 }
 
 impl Json {
-    fn object(&self) -> Result<&BTreeMap<String, Json>, String> {
+    pub(crate) fn object(&self) -> Result<&BTreeMap<String, Json>, String> {
         match self {
             Self::Object(value) => Ok(value),
             _ => Err("expected JSON object".to_owned()),
         }
     }
 
-    fn array(&self) -> Result<&[Json], String> {
+    pub(crate) fn array(&self) -> Result<&[Json], String> {
         match self {
             Self::Array(value) => Ok(value),
             _ => Err("expected JSON array".to_owned()),
         }
     }
 
-    fn string(&self) -> Result<&str, String> {
+    pub(crate) fn string(&self) -> Result<&str, String> {
         match self {
             Self::String(value) => Ok(value),
             _ => Err("expected JSON string".to_owned()),
@@ -61,23 +61,26 @@ impl Json {
     }
 }
 
-fn member<'a>(object: &'a BTreeMap<String, Json>, name: &str) -> Result<&'a Json, String> {
+pub(crate) fn member<'a>(
+    object: &'a BTreeMap<String, Json>,
+    name: &str,
+) -> Result<&'a Json, String> {
     object
         .get(name)
         .ok_or_else(|| format!("missing JSON member: {name}"))
 }
 
-struct JsonParser<'a> {
+pub(crate) struct JsonParser<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn parse(mut self) -> Result<Json, String> {
+    pub(crate) fn parse(mut self) -> Result<Json, String> {
         self.skip_space();
         let value = self.value()?;
         self.skip_space();

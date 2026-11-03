@@ -8,3 +8,4 @@ gio = "=0.18.4"
 glib = "=0.18.5"
 gtk = "=0.18.2"
 gtk-layer-shell = { version = "=0.8.2", features = ["v0_6"] }
+ilia-tracker-sys = { version = "=0.1.0", path = "ilia-tracker-sys" }

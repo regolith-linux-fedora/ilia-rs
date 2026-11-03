@@ -1,13 +1,16 @@
 use gio::prelude::SettingsExt;
 use gtk::gdk;
 use gtk::prelude::*;
-use std::cell::RefCell;
-use std::io::Read;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+
+use glib::translate::IntoGlib;
 
 use crate::args::Args;
 use crate::pages::{create, find, DialogPage, Page, PAGES};
+
+const MIN_WINDOW_WIDTH: i32 = 160;
+const MIN_WINDOW_HEIGHT: i32 = 100;
 
 const ALL_PAGE_IDS: &[&str] = &[
     "apps",
@@ -87,6 +90,7 @@ pub fn build(
         .map(|page| {
             create(
                 page,
+                args,
                 &settings,
                 &entry,
                 page_quit.clone(),
@@ -114,8 +118,11 @@ pub fn build(
         label.set_markup(name);
         tab.pack_start(&image, false, false, 0);
         tab.pack_start(&label, false, false, 5);
+        // Notebook tab widgets are not reached by the window's show_all().
+        tab.show_all();
         notebook.append_page(&page.get_root(), Some(&tab));
     }
+    let active_page = Rc::new(Cell::new(0usize));
     if all {
         // GtkNotebook falls back to page zero when hidden pages first become
         // visible. Realize the page set before choosing the requested tab so
@@ -123,6 +130,7 @@ pub fn build(
         notebook.show_all();
         if let Some(index) = pages.iter().position(|page| page.get_id() == selected.id) {
             notebook.set_current_page(Some(index as u32));
+            active_page.set(index);
         }
     } else {
         notebook.append_page(
@@ -131,36 +139,43 @@ pub fn build(
         );
     }
 
-    if selected.id == "textlist" {
-        std::thread::spawn(|| {
-            let mut ignored = String::new();
-            let _ = std::io::stdin().read_to_string(&mut ignored);
-        });
-    }
-
     let pages_for_change = pages.clone();
-    let notebook_for_change = notebook.clone();
+    let active_for_change = active_page.clone();
     entry.connect_changed(move |_| {
-        let index = notebook_for_change.current_page().unwrap_or(0) as usize;
-        if let Some(page) = pages_for_change.get(index) {
-            page.on_entry_changed();
-        }
+        pages_for_change[active_for_change.get()].on_entry_changed();
     });
     let pages_for_activate = pages.clone();
-    let notebook_for_activate = notebook.clone();
+    let active_for_activate = active_page.clone();
     entry.connect_activate(move |_| {
-        let index = notebook_for_activate.current_page().unwrap_or(0) as usize;
-        if let Some(page) = pages_for_activate.get(index) {
-            page.on_entry_activated();
-        }
+        pages_for_activate[active_for_activate.get()].on_entry_activated();
     });
     let pages_for_switch = pages.clone();
     let entry_for_switch = entry.clone();
-    notebook.connect_switch_page(move |_, _, index| {
-        entry_for_switch.set_sensitive((index as usize) < pages_for_switch.len());
-        if let Some(page) = pages_for_switch.get(index as usize) {
-            page.show();
+    let active_for_switch = active_page.clone();
+    // Like the reference, watch page switches only once the window is shown,
+    // so building and showing the notebook is not treated as a switch.
+    let notebook_for_switch = notebook.clone();
+    let switch_connected = Cell::new(false);
+    window.connect_show(move |_| {
+        if switch_connected.replace(true) {
+            return;
         }
+        notebook_for_switch.set_current_page(Some(active_for_switch.get() as u32));
+        let pages_for_switch = pages_for_switch.clone();
+        let entry_for_switch = entry_for_switch.clone();
+        let active_for_switch = active_for_switch.clone();
+        notebook_for_switch.connect_switch_page(move |_, _, index| {
+            let index = index as usize;
+            if index == pages_for_switch.len() {
+                // The Help page: the filter has nothing to act on.
+                entry_for_switch.set_sensitive(false);
+            } else if let Some(page) = pages_for_switch.get(index) {
+                active_for_switch.set(index);
+                entry_for_switch.set_secondary_icon_name(Some(page.get_icon_name()));
+                entry_for_switch.set_sensitive(true);
+            }
+            pages_for_switch[active_for_switch.get()].show();
+        });
     });
 
     let app_for_key = app.clone();
@@ -169,8 +184,42 @@ pub fn build(
     let notebook_for_key = notebook.clone();
     let pages_for_key = pages.clone();
     let entry_for_key = entry.clone();
-    window.connect_key_press_event(move |_, event| {
+    let active_for_key = active_page.clone();
+    let settings_for_key = settings.clone();
+    window.connect_key_press_event(move |window, event| {
         let key = event.keyval();
+        let keyval = *key;
+        let state = event.state();
+        if state.contains(gdk::ModifierType::MOD1_MASK) {
+            let shortcuts: Vec<char> = pages_for_key
+                .iter()
+                .map(|page| page.get_keybinding())
+                .collect();
+            if let Some(index) = alt_switch_target(&shortcuts, keyval) {
+                notebook_for_key.set_current_page(Some(index as u32));
+                return glib::Propagation::Stop;
+            }
+            if keyval == u32::from('+') {
+                change_size(window, &settings_for_key, 128);
+                return glib::Propagation::Stop;
+            }
+            if keyval == u32::from('-') {
+                change_size(window, &settings_for_key, -128);
+                return glib::Propagation::Stop;
+            }
+        } else if state.contains(gdk::ModifierType::CONTROL_MASK) {
+            if let Some(handled) = entry_editing(
+                &entry_for_key,
+                event,
+                pages_for_key[active_for_key.get()].as_ref(),
+            ) {
+                return if handled {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                };
+            }
+        }
         if matches!(
             key,
             gdk::keys::constants::Escape
@@ -204,17 +253,11 @@ pub fn build(
                 | gdk::keys::constants::Page_Up
                 | gdk::keys::constants::Page_Down
         ) {
-            let index = notebook_for_key.current_page().unwrap_or(0) as usize;
-            if let Some(page) = pages_for_key.get(index) {
-                page.show();
-            }
+            pages_for_key[active_for_key.get()].show();
             return glib::Propagation::Proceed;
         }
-        let index = notebook_for_key.current_page().unwrap_or(0) as usize;
-        if let Some(page) = pages_for_key.get(index) {
-            if page.key_event(event) {
-                return glib::Propagation::Stop;
-            }
+        if pages_for_key[active_for_key.get()].key_event(event) {
+            return glib::Propagation::Stop;
         }
         entry_for_key.grab_focus_without_selecting();
         glib::Propagation::Proceed
@@ -257,21 +300,191 @@ fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
 
 pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
     let gdk_window = window.window()?;
-    let display = gdk_window.display();
-    let seat = display.default_seat()?;
+    // The nullable lookup: a missing display is reported, not assumed away.
+    let Some(display) = gdk::Display::default() else {
+        eprintln!("Failed to get Display");
+        return None;
+    };
+    let Some(seat) = display.default_seat() else {
+        println!("Failed to get Seat from Display");
+        return None;
+    };
     let capabilities = gdk::SeatCapabilities::KEYBOARD | gdk::SeatCapabilities::POINTER;
-    let mut wait = Duration::from_millis(1);
-    for attempt in 0..8 {
-        if seat.grab(&gdk_window, capabilities, true, None, None, None) == gdk::GrabStatus::Success
-        {
+    // Microseconds, slept with g_usleep like the reference.
+    let mut wait: u64 = 1000;
+    let mut status = gdk::GrabStatus::Failed;
+    for _ in 0..8 {
+        status = seat.grab(&gdk_window, capabilities, true, None, None, None);
+        if status == gdk::GrabStatus::Success {
             return Some(seat);
         }
-        if attempt != 7 {
-            wait *= 2;
-            std::thread::sleep(wait);
+        // The reference doubles before every sleep, failed final attempt
+        // included: 2 ms, 4 ms, ..., 256 ms.
+        wait *= 2;
+        glib::usleep(wait);
+    }
+    eprintln!("Aborting, failed to grab input: {}", status.into_glib());
+    None
+}
+
+/// Grows or shrinks the dialog by `delta` in both dimensions, ignoring the
+/// change below the minimum size or at/above the first monitor's size, and
+/// persists the accepted size.
+fn change_size(window: &gtk::Window, settings: &gio::Settings, delta: i32) {
+    let Some((width, height)) = resized(window.size(), delta, first_monitor_size(window)) else {
+        return;
+    };
+    window.resize(width, height);
+    let _ = settings.set_int("window-width", width);
+    let _ = settings.set_int("window-height", height);
+}
+
+/// The size to apply and persist after a resize request, or `None` when the
+/// request is ignored.
+fn resized(current: (i32, i32), delta: i32, monitor: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let (width, height) = (current.0 + delta, current.1 + delta);
+    size_change_allowed(width, height, monitor).then_some((width, height))
+}
+
+/// The first page whose shortcut matches the pressed key, compared like the
+/// reference: the shortcut itself or its ASCII uppercase form.
+fn alt_switch_target(shortcuts: &[char], keyval: u32) -> Option<usize> {
+    shortcuts.iter().position(|shortcut| {
+        let shortcut = *shortcut as u32;
+        shortcut == keyval || shortcut.wrapping_sub(32) == keyval
+    })
+}
+
+fn first_monitor_size(window: &gtk::Window) -> Option<(i32, i32)> {
+    let monitor = WidgetExt::display(window).monitor(0)?;
+    let geometry = monitor.geometry();
+    Some((geometry.width(), geometry.height()))
+}
+
+fn size_change_allowed(width: i32, height: i32, monitor: Option<(i32, i32)>) -> bool {
+    if width < MIN_WINDOW_WIDTH || height < MIN_WINDOW_HEIGHT {
+        return false;
+    }
+    match monitor {
+        Some((monitor_width, monitor_height)) => width < monitor_width && height < monitor_height,
+        None => true,
+    }
+}
+
+/// Ctrl+key entry editing in the reference's branch order. Returns `None`
+/// when the key is not an editing key, so the plain-key handling runs.
+fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPage) -> Option<bool> {
+    let keyval = *event.keyval();
+    let shift = event.state().contains(gdk::ModifierType::SHIFT_MASK);
+    let text = entry.text();
+    // The reference measures the text in bytes.
+    let length = text.len() as i32;
+    let key = char::from_u32(keyval)?;
+    match key {
+        'h' => {
+            let position = entry.position();
+            if position > 0 {
+                entry.set_position(position - 1);
+            }
+        }
+        'l' => {
+            let position = entry.position();
+            if position < length {
+                entry.set_position(position + 1);
+            }
+        }
+        'j' | 'n' | 'k' | 'p' => return Some(page.key_event(event)),
+        '0' => entry.set_position(0),
+        '4' if shift => entry.set_position(length),
+        'a' => entry.select_region(0, length),
+        'w' => entry.set_position(forward_word(text.as_str(), entry.position())),
+        'b' => entry.set_position(backward_word(text.as_str(), entry.position())),
+        'c' => clipboard_copy(entry),
+        'v' => clipboard_paste(entry),
+        'x' => clipboard_cut(entry),
+        _ => return None,
+    }
+    Some(true)
+}
+
+fn is_word_break(character: char) -> bool {
+    character.is_whitespace() || character.is_ascii_punctuation()
+}
+
+fn forward_word(text: &str, position: i32) -> i32 {
+    let characters: Vec<char> = text.chars().collect();
+    let mut found_break = false;
+    for (index, character) in characters.iter().enumerate().skip(position.max(0) as usize) {
+        if is_word_break(*character) {
+            found_break = true;
+        } else if found_break {
+            return index as i32;
         }
     }
-    None
+    text.len() as i32
+}
+
+fn backward_word(text: &str, position: i32) -> i32 {
+    let characters: Vec<char> = text.chars().collect();
+    let mut start = position.min(characters.len() as i32);
+    for index in (0..start).rev() {
+        if is_word_break(characters[index as usize]) {
+            break;
+        }
+        start = index;
+    }
+    let mut found_word = false;
+    for index in (0..start).rev() {
+        if !is_word_break(characters[index as usize]) {
+            found_word = true;
+        } else if found_word {
+            return index + 1;
+        }
+    }
+    0
+}
+
+fn clipboard(entry: &gtk::Entry) -> gtk::Clipboard {
+    gtk::Clipboard::for_display(&WidgetExt::display(entry), &gdk::SELECTION_CLIPBOARD)
+}
+
+fn clipboard_copy(entry: &gtk::Entry) {
+    let clipboard = clipboard(entry);
+    let text = entry.text();
+    match entry.selection_bounds() {
+        Some((start, end)) => clipboard.set_text(&slice_chars(text.as_str(), start, end)),
+        None => clipboard.set_text(text.as_str()),
+    }
+    clipboard.store();
+}
+
+fn clipboard_cut(entry: &gtk::Entry) {
+    let clipboard = clipboard(entry);
+    if let Some((start, end)) = entry.selection_bounds() {
+        clipboard.set_text(&slice_chars(entry.text().as_str(), start, end));
+        clipboard.store();
+        entry
+            .buffer()
+            .delete_text(start as u16, Some((end - start) as u16));
+    }
+}
+
+fn clipboard_paste(entry: &gtk::Entry) {
+    if let Some(text) = clipboard(entry).wait_for_text() {
+        if let Some((start, end)) = entry.selection_bounds() {
+            entry
+                .buffer()
+                .delete_text(start as u16, Some((end - start) as u16));
+        }
+        entry.emit_insert_at_cursor(text.as_str());
+    }
+}
+
+fn slice_chars(text: &str, start: i32, end: i32) -> String {
+    text.chars()
+        .skip(start.max(0) as usize)
+        .take((end - start).max(0) as usize)
+        .collect()
 }
 
 fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
@@ -310,4 +523,55 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
     bindings.connect_realize(|view| view.columns_autosize());
     root.pack_start(&bindings, false, false, 5);
     root.upcast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alt_switch_target, backward_word, forward_word, resized, size_change_allowed};
+
+    #[test]
+    fn resize_respects_minimum_and_monitor_cap() {
+        assert!(size_change_allowed(618, 588, Some((1024, 768))));
+        assert!(!size_change_allowed(159, 400, Some((1024, 768))));
+        assert!(!size_change_allowed(400, 99, Some((1024, 768))));
+        assert!(!size_change_allowed(1024, 400, Some((1024, 768))));
+        assert!(!size_change_allowed(400, 768, Some((1024, 768))));
+        assert!(size_change_allowed(5000, 5000, None));
+    }
+
+    #[test]
+    fn resize_returns_the_size_to_persist() {
+        assert_eq!(
+            resized((490, 460), 128, Some((1024, 768))),
+            Some((618, 588))
+        );
+        assert_eq!(
+            resized((490, 460), -128, Some((1024, 768))),
+            Some((362, 332))
+        );
+        assert_eq!(resized((200, 150), -128, Some((1024, 768))), None);
+        assert_eq!(resized((900, 460), 128, Some((1024, 768))), None);
+    }
+
+    #[test]
+    fn alt_switch_matches_shortcut_or_its_uppercase() {
+        let all_mode = ['a', 'c', 'n', 'k', 'w', 'f'];
+        assert_eq!(alt_switch_target(&all_mode, u32::from('w')), Some(4));
+        assert_eq!(alt_switch_target(&all_mode, u32::from('W')), Some(4));
+        assert_eq!(alt_switch_target(&all_mode, u32::from('t')), None);
+        assert_eq!(alt_switch_target(&['t'], u32::from('T')), Some(0));
+        assert_eq!(alt_switch_target(&all_mode, u32::from('+')), None);
+    }
+
+    #[test]
+    fn word_motion_uses_space_and_punctuation_breaks() {
+        assert_eq!(forward_word("alpha beta", 0), 6);
+        assert_eq!(forward_word("alpha", 2), 5);
+        assert_eq!(forward_word("a.b", 0), 2);
+        // Ctrl+b jumps to the start of the previous word, not the current one.
+        assert_eq!(backward_word("alpha beta", 10), 0);
+        assert_eq!(backward_word("one two three", 13), 4);
+        assert_eq!(backward_word("one two three", 8), 4);
+        assert_eq!(backward_word("alpha", 3), 0);
+    }
 }

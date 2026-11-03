@@ -80,10 +80,16 @@ for invocation in "" "-p apps" "-p terminal" "-p notifications" "-p keybindings"
             [[ $(wc -l <"$tmp/err") -eq 1 ]]
             grep -Eq '^Failed to read or parse window tree from Unknown: .+$' "$tmp/err"
             ;;
+        "-p notifications")
+            # No rofication daemon is running: the single list fetch fails.
+            [[ $(wc -l <"$tmp/err") -eq 1 ]]
+            grep -Eq '^Error: load_notifications failed: .+$' "$tmp/err"
+            ;;
         "-a"|"-a -p windows")
-            [[ $(wc -l <"$tmp/err") -eq 2 ]]
+            [[ $(wc -l <"$tmp/err") -eq 3 ]]
             sed -n '1p' "$tmp/err" | grep -Eq '^Failed to read config from Unknown: .+$'
             sed -n '2p' "$tmp/err" | grep -Eq '^Failed to read or parse window tree from Unknown: .+$'
+            sed -n '3p' "$tmp/err" | grep -Eq '^Error: load_notifications failed: .+$'
             ;;
         *)
             [[ ! -s "$tmp/err" ]]

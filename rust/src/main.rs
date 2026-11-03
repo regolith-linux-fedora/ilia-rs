@@ -2,10 +2,16 @@ mod application;
 mod apps;
 mod args;
 mod dialog;
+mod icons;
 mod ipc;
 mod keybindings;
+mod notifications;
 mod pages;
+mod rofication;
 mod runner;
+mod terminal;
+mod textlist;
+mod tracker;
 mod windows;
 
 use args::Args;

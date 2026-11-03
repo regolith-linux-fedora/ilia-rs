@@ -5,7 +5,12 @@ use gtk::gdk;
 use gtk::prelude::*;
 
 use crate::apps::ApplicationsPage;
+use crate::args::Args;
 use crate::keybindings::KeybindingsPage;
+use crate::notifications::RoficationPage;
+use crate::terminal::CommandPage;
+use crate::textlist::TextListPage;
+use crate::tracker::TrackerPage;
 use crate::windows::WindowsPage;
 
 #[derive(Clone, Copy)]
@@ -81,6 +86,7 @@ pub fn find(name: &str) -> Option<&'static Page> {
 
 pub fn create(
     page: &'static Page,
+    args: &Args,
     settings: &gio::Settings,
     entry: &gtk::Entry,
     quit: Rc<dyn Fn()>,
@@ -89,11 +95,20 @@ pub fn create(
 ) -> Rc<dyn DialogPage> {
     match page.id {
         "apps" => Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit)),
+        "terminal" => Rc::new(CommandPage::new(entry.clone(), args.has("-q"), quit)),
         "keybindings" => Rc::new(KeybindingsPage::new(
             entry.clone(),
             wm_name.to_owned(),
             quit,
         )),
+        "textlist" => Rc::new(TextListPage::new(
+            settings.clone(),
+            entry.clone(),
+            args,
+            quit,
+        )),
+        "notifications" => Rc::new(RoficationPage::new(settings.clone(), entry.clone(), quit)),
+        "tracker" => Rc::new(TrackerPage::new(settings.clone(), entry.clone(), quit)),
         "windows" => Rc::new(WindowsPage::new(
             settings.clone(),
             entry.clone(),

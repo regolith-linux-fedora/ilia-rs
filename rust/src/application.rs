@@ -1,5 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::path::Path;
 use std::rc::Rc;
 
 use gio::prelude::*;
@@ -115,11 +114,18 @@ fn detect_wm(has_sway_socket: bool, has_i3_socket: bool) -> &'static str {
 fn load_style(window: &gtk::Window, args: &Args) -> bool {
     let provider = gtk::CssProvider::new();
     if let Some(path) = args.value("-t") {
-        if !Path::new(path).exists() {
-            eprintln!("File '{path}' does not exist.");
+        // Resolve through GFile like the reference: a relative path is
+        // reported (and loaded) as its absolute form.
+        let file = gio::File::for_path(path);
+        if !file.query_exists(None::<&gio::Cancellable>) {
+            let shown = file
+                .path()
+                .map(|resolved| resolved.display().to_string())
+                .unwrap_or_else(|| path.to_owned());
+            eprintln!("File '{shown}' does not exist.");
             return false;
         }
-        if provider.load_from_path(path).is_err() {
+        if provider.load_from_file(&file).is_err() {
             return false;
         }
     } else if args.has("-n") {

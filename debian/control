@@ -3,6 +3,8 @@ Section: x11
 Priority: optional
 Maintainer: Ken Gilmer <kgilmer@gmail.com>
 Build-Depends: debhelper (>= 10),
+               cargo,
+               rustc,
                gettext,
                gir1.2-gee-0.8,
                intltool,
@@ -17,9 +19,7 @@ Build-Depends: debhelper (>= 10),
                libgirepository1.0-dev,
                gobject-introspection,
                meson,
-               po-debconf, 
-               valac-0.56-vapi,
-               valac-bin
+               po-debconf
 Standards-Version: 4.1.2
 Homepage: https://github.com/regolith-linux/ilia
 
