@@ -30,6 +30,8 @@ Module map:
   filtered into a prebuilt list).
 - `filter.rs`: the every-word query matching shared by the pages.
 - `icons.rs`: the reference icon-loader order shared by the new pages.
+- `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
+  open (gnome-flashback's input-source D-Bus service on X11).
 - `dialog.rs`, `application.rs`: the shell.
 
 ## Meson cutover

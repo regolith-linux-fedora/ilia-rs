@@ -7,6 +7,7 @@ use std::rc::Rc;
 use glib::translate::IntoGlib;
 
 use crate::args::Args;
+use crate::input_sources::InputSourceSwitcher;
 use crate::pages::{create, find, is_enter_key, DialogPage, Page, PAGES};
 
 const MIN_WINDOW_WIDTH: i32 = 160;
@@ -178,6 +179,15 @@ pub fn build(
         });
     });
 
+    // The desktop's layout-switch shortcuts. On X11 ilia's keyboard grab
+    // keeps them from the desktop, so ilia switches the layout itself.
+    let layout_switcher = InputSourceSwitcher::from_settings(
+        gdk::Keymap::for_display(&WidgetExt::display(&window)).as_ref(),
+    );
+    // Super was pressed as part of a layout-switch shortcut: exit if it is
+    // released on its own.
+    let exit_on_super_release = Rc::new(Cell::new(false));
+
     let app_for_key = app.clone();
     let window_for_key = window.clone();
     let seat_for_key = seat.clone();
@@ -186,10 +196,24 @@ pub fn build(
     let entry_for_key = entry.clone();
     let active_for_key = active_page.clone();
     let settings_for_key = settings.clone();
+    let super_release_for_key = exit_on_super_release.clone();
     window.connect_key_press_event(move |window, event| {
         let key = event.keyval();
         let keyval = *key;
         let state = event.state();
+        if let Some(switcher) = layout_switcher.as_ref().filter(|_| !is_wayland) {
+            let base_keyval = keyval_in_first_layout(window, event);
+            if let Some(direction) = switcher.match_key(keyval, base_keyval, state) {
+                super_release_for_key.set(false);
+                InputSourceSwitcher::switch_source(direction);
+                return glib::Propagation::Stop;
+            }
+            if super_release_for_key.get() && !event.is_modifier() {
+                // Super did not start a layout switch after all.
+                quit(&window_for_key, &app_for_key, &seat_for_key);
+                return glib::Propagation::Stop;
+            }
+        }
         if state.contains(gdk::ModifierType::MOD1_MASK) {
             let shortcuts: Vec<char> = pages_for_key
                 .iter()
@@ -219,6 +243,17 @@ pub fn build(
                     glib::Propagation::Proceed
                 };
             }
+        }
+        if is_super_key(&key)
+            && layout_switcher
+                .as_ref()
+                .is_some_and(|switcher| switcher.super_starts_shortcut(state))
+        {
+            // Super completes the modifiers of a layout-switch shortcut: do
+            // not exit yet. On Wayland the compositor takes the rest of the
+            // shortcut and ilia never sees it.
+            super_release_for_key.set(!is_wayland);
+            return glib::Propagation::Stop;
         }
         if matches!(
             key,
@@ -276,6 +311,15 @@ pub fn build(
         entry_for_key.grab_focus_without_selecting();
         glib::Propagation::Proceed
     });
+    let app_for_release = app.clone();
+    let window_for_release = window.clone();
+    let seat_for_release = seat.clone();
+    window.connect_key_release_event(move |_, event| {
+        if exit_on_super_release.get() && is_super_key(&event.keyval()) {
+            quit(&window_for_release, &app_for_release, &seat_for_release);
+        }
+        glib::Propagation::Proceed
+    });
     let app_for_focus = app.clone();
     let window_for_focus = window.clone();
     let seat_for_focus = seat.clone();
@@ -301,6 +345,22 @@ pub fn build(
         }
     });
     Ok(window)
+}
+
+fn is_super_key(key: &gdk::keys::Key) -> bool {
+    matches!(
+        *key,
+        gdk::keys::constants::Super_L | gdk::keys::constants::Super_R
+    )
+}
+
+/// The key of a key event as it is in the first layout.
+fn keyval_in_first_layout(window: &gtk::Window, event: &gdk::EventKey) -> u32 {
+    gdk::Keymap::for_display(&WidgetExt::display(window))
+        .and_then(|keymap| {
+            keymap.translate_keyboard_state(u32::from(event.hardware_keycode()), event.state(), 0)
+        })
+        .map_or(*event.keyval(), |(keyval, ..)| keyval)
 }
 
 fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {

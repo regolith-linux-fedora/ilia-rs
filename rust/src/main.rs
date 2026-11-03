@@ -4,6 +4,7 @@ mod args;
 mod dialog;
 mod filter;
 mod icons;
+mod input_sources;
 mod ipc;
 mod keybindings;
 mod notifications;
