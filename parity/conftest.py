@@ -80,6 +80,13 @@ def isolated_env(tmp_path, display):
     # and MIME databases available through the isolated data root.
     (data / "icons").symlink_to("/usr/share/icons", target_is_directory=True)
     (data / "mime").symlink_to("/usr/share/mime", target_is_directory=True)
+    # GdkPixbuf 2.44 loads images through glycin, whose loader configuration
+    # is found through XDG_DATA_DIRS as well; glycin runs its loaders under bwrap, found through PATH.
+    glycin = Path("/usr/share/glycin-loaders")
+    if glycin.is_dir():
+        (data / "glycin-loaders").symlink_to(glycin, target_is_directory=True)
+        if Path("/usr/bin/bwrap").exists():
+            (bindir / "bwrap").symlink_to("/usr/bin/bwrap")
 
     bus_tmp = Path(os.environ.get("TMPDIR", tmp_path))
     bus_config = tmp_path / "session-bus.conf"

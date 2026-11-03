@@ -93,7 +93,7 @@ TMP = Path(os.environ["SMOKE_TMP"])
 BINARY = os.environ["SMOKE_BINARY"]
 FIXTURES = SOURCE / "parity/fixtures"
 XDOTOOL = "/usr/bin/xdotool"
-ATSPI = "/usr/local/libexec/ilia-atspi-snapshot.py"
+ATSPI = os.environ.get("ILIA_ATSPI_SNAPSHOT", str(SOURCE / "rust/atspi-snapshot.py"))
 SOCKET = Path("/tmp/rofi_notification_daemon")
 sys.path.insert(0, str(SOURCE))
 from parity.fakes.executables import install_terminal_fakes  # noqa: E402
@@ -143,6 +143,13 @@ def case_env(name, backend="memory", atspi=False):
     dirs["runtime"].chmod(0o700)
     (dirs["data"] / "icons").symlink_to("/usr/share/icons", target_is_directory=True)
     (dirs["data"] / "mime").symlink_to("/usr/share/mime", target_is_directory=True)
+    # GdkPixbuf 2.44 loads images through glycin, whose loader configuration
+    # is found through XDG_DATA_DIRS as well; glycin runs its loaders under
+    # bwrap, found through PATH.
+    if Path("/usr/share/glycin-loaders").is_dir():
+        (dirs["data"] / "glycin-loaders").symlink_to("/usr/share/glycin-loaders", target_is_directory=True)
+        if Path("/usr/bin/bwrap").exists():
+            (dirs["bin"] / "bwrap").symlink_to("/usr/bin/bwrap")
     env = dict(os.environ)
     for key in ("I3SOCK", "SWAYSOCK", "GTK_MODULES", "SMOKE_SOURCE", "SMOKE_TMP", "SMOKE_BINARY"):
         env.pop(key, None)
