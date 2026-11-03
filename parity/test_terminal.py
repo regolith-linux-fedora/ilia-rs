@@ -44,17 +44,22 @@ def test_terminal_wrapper(isolated_env, run_ilia, tmp_path):
     assert lines[1] == f"terminal:-e {bindir}/fixture-command"
 
 
-def test_terminal_unmatched_enter_is_noop(isolated_env, run_ilia, tmp_path):
+def test_terminal_unmatched_enter_runs_typed_command(isolated_env, run_ilia, tmp_path):
+    # Enter on a command line that matches no listed command runs it as
+    # typed, arguments included (with -q, without a terminal).
     env, bindir = isolated_env
     log = install_terminal_fakes(bindir, tmp_path)
     app = run_ilia(env, "-p", "terminal", "-q")
     app.type("free-command hello")
     app.key("Return")
-    time.sleep(0.2)
-    assert app.proc.poll() is None
-    assert not log.exists()
-    app.key("Escape")
     code, stdout, _ = app.finish()
     assert code == 0
     assert stdout == ""
-    assert not log.exists()
+    for _ in range(100):
+        if log.exists() and "free:" in log.read_text():
+            break
+        time.sleep(0.02)
+    lines = log.read_text().splitlines()
+    assert lines[0].startswith("systemd:--user --scope --unit run_ilia_")
+    assert lines[0].endswith(" free-command hello")
+    assert lines[1] == "free:hello"

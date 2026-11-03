@@ -282,16 +282,20 @@ def case_terminal_wrapper():
 
 
 def case_terminal_unmatched():
+    # Enter on a command line that matches no listed command runs it as typed.
     env, base, bindir = case_env("terminal-unmatched")
     log = install_terminal_fakes(bindir, base)
     app = Ilia(env, "-p", "terminal", "-q")
     app.type("free-command hello")
     app.key("Return")
-    time.sleep(0.3)
-    check(app.running(), "unmatched Enter quit the dialog")
-    check(not log.exists(), f"unmatched Enter executed something: {log_text(log)!r}")
-    expect_clean_escape(app, "unmatched Enter")
-    check(not log.exists(), f"transcript appeared: {log_text(log)!r}")
+    code, _, stderr = app.finish()
+    check(code == 0, f"exit status {code}; stderr={stderr!r}")
+    lines = wait_for(lambda: "free:" in log_text(log) and log_text(log), 2,
+                     "typed command transcript").splitlines()
+    check(len(lines) == 2, f"transcript {lines!r}")
+    check(lines[0].startswith("systemd:--user --scope --unit run_ilia_"), f"wrapper line {lines[0]!r}")
+    check(lines[0].endswith(" free-command hello"), f"wrapper target {lines[0]!r}")
+    check(lines[1] == "free:hello", f"command line {lines[1]!r}")
 
 
 # --- textlist -------------------------------------------------------------
@@ -324,13 +328,9 @@ def case_textlist_label_icon():
 
 
 def case_textlist_unmatched():
-    env, _, _ = case_env("textlist-unmatched")
-    app = Ilia(env, "-p", "textlist", "-n", stdin=(FIXTURES / "textlist-items.txt").read_text())
-    app.type("unmatched free text")
-    app.key("Return")
-    time.sleep(0.3)
-    check(app.running(), "unmatched Enter quit the dialog")
-    expect_clean_escape(app, "unmatched Enter")
+    # Enter on text that matches no row prints the typed text.
+    textlist_select("textlist-unmatched", ["-n"], (FIXTURES / "textlist-items.txt").read_text(),
+                    "unmatched free text", "unmatched free text\n")
 
 
 # --- notifications --------------------------------------------------------

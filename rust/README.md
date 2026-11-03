@@ -65,8 +65,9 @@ Tracker miner exists), and private `HOME`/`TMPDIR`/`XDG_*` dirs with a
 compiled schema copy. Each case starts a fresh `ilia` with a private `bin`
 dir as its whole `PATH` and the `parity.fakes`, and prints one
 `ok: <case>` line: terminal quiet and `x-terminal-emulator -e` launches
-(wrapper-before-target transcripts) and the unmatched-Enter no-op; textlist
-selection, filtered selection, `-l`/`-i`, and unmatched Enter; notifications
+(wrapper-before-target transcripts) and running an unmatched typed command;
+textlist selection, filtered selection, `-l`/`-i`, and printing unmatched
+typed text; notifications
 single delete (`list`, `del:11`, `list`) and both filtered multi-deletes
 against the fake daemon on `/tmp/rofi_notification_daemon` (removed at
 teardown); Tracker no-miner; stylesheet modes (`-t` missing file, `-t` file,

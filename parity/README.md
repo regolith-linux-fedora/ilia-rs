@@ -1,7 +1,7 @@
 # Ilia black-box parity suite
 
 Run from the repository root with `python3 -m pytest parity/ -v`. The suite
-drives the built Vala executable (`build/src/ilia`, or `ILIA_BINARY`) under a
+drives the built executable (`build/src/ilia`, or `ILIA_BINARY`) under a
 private Xvfb display. Each test receives isolated HOME, both XDG data roots,
 GSettings-memory, PATH, runtime directory, and D-Bus state. The private D-Bus
 configuration deliberately has no service directories, so Tracker cannot be
@@ -15,12 +15,12 @@ the oracle. The fixed fixtures live under `parity/fixtures/`: desktop entries,
 the i3 config reply, the sway base config and include partial, the complete WM
 tree, the textlist input, and the rofication notification list.
 
-Unmatched Enter is deliberately pinned as a no-op in both TextList and
-Terminal: after a bounded settling interval it has emitted or executed
-nothing and the UI is still running; Escape then exits successfully. The
-settling interval prevents a delayed launch from racing the no-op assertion.
-The corresponding free-text branches in the page classes are unreachable
-through the current dialog event routing.
+The suite was written against ilia 0.18.0 (Vala) and is kept as the
+behaviour contract of the Rust port. Where the port has since fixed a bug on
+purpose, the case expects the fixed behaviour: Enter on text that matches no
+row prints it (TextList) or runs it (Terminal), and the notification fixture
+carries rofication `timestamp` fields because the page lists the newest
+notification first.
 
 The suite records existing behavior, including `ilia version 0.12`, native
 little-endian i3 framing, the single-read IPC client, the fixed rofication

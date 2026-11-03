@@ -20,17 +20,16 @@ def test_textlist_selection(isolated_env, run_ilia, query, expected):
     assert "No page loaded" not in stderr
 
 
-def test_textlist_unmatched_enter_is_noop(isolated_env, run_ilia):
+def test_textlist_unmatched_enter_prints_typed_text(isolated_env, run_ilia):
+    # Enter on text that matches no row accepts the typed text, as
+    # dmenu-style launchers do.
     env, _ = isolated_env
     app = run_ilia(env, "-p", "textlist", "-n", stdin=ITEMS)
     app.type("unmatched free text")
     app.key("Return")
-    time.sleep(0.25)
-    assert app.proc.poll() is None
-    app.key("Escape")
     code, stdout, _ = app.finish()
     assert code == 0
-    assert stdout == ""
+    assert stdout == "unmatched free text\n"
 
 
 def test_textlist_label_and_icon_arguments(isolated_env, run_ilia):
