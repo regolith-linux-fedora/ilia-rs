@@ -549,14 +549,21 @@ fn clipboard_cut(entry: &gtk::Entry) {
 }
 
 fn clipboard_paste(entry: &gtk::Entry) {
-    if let Some(text) = clipboard(entry).wait_for_text() {
+    // Don't wait for the text: wait_for_text() runs a nested main loop until
+    // the clipboard owner answers, and an owner that hangs keeps ilia running
+    // for up to two minutes, even after its window closed.
+    let entry = entry.clone();
+    clipboard(&entry).request_text(move |_, text| {
+        let Some(text) = text else {
+            return;
+        };
         if let Some((start, end)) = entry.selection_bounds() {
             entry
                 .buffer()
                 .delete_text(start as u16, Some((end - start) as u16));
         }
-        entry.emit_insert_at_cursor(text.as_str());
-    }
+        entry.emit_insert_at_cursor(text);
+    });
 }
 
 fn slice_chars(text: &str, start: i32, end: i32) -> String {
