@@ -154,6 +154,12 @@ impl Inner {
     }
 
     fn set_selection(&self) {
+        // After deleting the last row, highlight the new last one.
+        let rows = self.filter.iter_n_children(None);
+        let index = self.path.borrow().indices().first().copied().unwrap_or(0);
+        if let Some(last) = clamped_row(index, rows) {
+            *self.path.borrow_mut() = gtk::TreePath::from_indicesv(&[last]);
+        }
         let selection = self.view.selection();
         selection.set_mode(gtk::SelectionMode::Single);
         selection.select_path(&self.path.borrow());
@@ -375,9 +381,16 @@ fn execute_app_from_selection(
     }
 }
 
+/// The row to highlight instead of `index` when it points past the last of
+/// `rows` rows, as after the last row was deleted. `None` keeps `index`; an
+/// empty list keeps it too.
+fn clamped_row(index: i32, rows: i32) -> Option<i32> {
+    (rows > 0 && index >= rows).then_some(rows - 1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{detail_text, matches_query, parse_int};
+    use super::{clamped_row, detail_text, matches_query, parse_int};
 
     #[test]
     fn detail_text_covers_every_branch() {
@@ -423,5 +436,15 @@ mod tests {
         assert_eq!(parse_int("-4"), -4);
         assert_eq!(parse_int(""), 0);
         assert_eq!(parse_int("4294967307"), 11);
+    }
+
+    #[test]
+    fn deleting_the_last_row_highlights_the_new_last_row() {
+        assert_eq!(clamped_row(3, 3), Some(2));
+        assert_eq!(clamped_row(5, 3), Some(2));
+        assert_eq!(clamped_row(2, 3), None);
+        assert_eq!(clamped_row(0, 1), None);
+        assert_eq!(clamped_row(0, 0), None);
+        assert_eq!(clamped_row(1, 0), None);
     }
 }
