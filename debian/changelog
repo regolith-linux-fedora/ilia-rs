@@ -1,3 +1,10 @@
+ilia (0.18.0+rs1) resolute; urgency=medium
+
+  * Rust port of ilia 0.18.0 (ilia-rs). See README.md for the status and
+    the differences from upstream ilia.
+
+ -- rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>  Tue, 03 Nov 2026 12:00:00 +0000
+
 ilia (0.18.0) jammy; urgency=medium
 
   [ Jesse Hallett ]
