@@ -379,7 +379,7 @@ fn keyval_in_first_layout(window: &gtk::Window, event: &gdk::EventKey) -> u32 {
         .map_or(*event.keyval(), |(keyval, ..)| keyval)
 }
 
-fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
+pub fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
     if let Some(seat) = seat.borrow_mut().take() {
         seat.ungrab();
     }

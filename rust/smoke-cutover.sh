@@ -79,6 +79,8 @@ done
 read -r bus_address <"$tmp/bus-address"
 [[ "$bus_address" == unix:* ]]
 export DBUS_SESSION_BUS_ADDRESS=$bus_address
+# ilia watches the system bus for a suspend; the private bus stands in for it.
+export DBUS_SYSTEM_BUS_ADDRESS=$bus_address
 
 cat >"$tmp/driver.py" <<'PY'
 import json

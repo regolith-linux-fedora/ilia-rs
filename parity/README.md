@@ -3,7 +3,8 @@
 Run from the repository root with `python3 -m pytest parity/ -v`. The suite
 drives the built executable (`build/src/ilia`, or `ILIA_BINARY`) under a
 private Xvfb display. Each test receives isolated HOME, both XDG data roots,
-GSettings-memory, PATH, runtime directory, and D-Bus state. The private D-Bus
+GSettings-memory, PATH, runtime directory, and D-Bus state; the private bus
+also stands in for the system bus, where ilia watches for a suspend. The private D-Bus
 configuration deliberately has no service directories, so Tracker cannot be
 activated behind the test's back. No network or host desktop service is used.
 

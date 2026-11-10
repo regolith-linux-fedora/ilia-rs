@@ -5,6 +5,10 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -z "${ILIA_SMOKE_DBUS:-}" ]]; then
     exec dbus-run-session -- env ILIA_SMOKE_DBUS=1 "$0" "$@"
 fi
 
+# ilia watches the system bus for a suspend: use the private bus instead of
+# the host's, which a container may not have.
+export DBUS_SYSTEM_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 binary="$root/rust/target/release/ilia"
 tmp=$(mktemp -d)

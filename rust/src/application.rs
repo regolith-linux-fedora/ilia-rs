@@ -33,6 +33,9 @@ const DEFAULT_CSS: &str = r#"                .root_box {
                 }
             "#;
 
+/// A D-Bus connection kept for as long as the application runs.
+type SharedConnection = Rc<RefCell<Option<gio::DBusConnection>>>;
+
 pub fn run(args: Args) -> i32 {
     let wm_name = detect_wm(
         std::env::var_os("SWAYSOCK").is_some(),
@@ -46,6 +49,10 @@ pub fn run(args: Args) -> i32 {
     let seat = Rc::new(RefCell::new(None::<gtk::gdk::Seat>));
     let status_for_activate = exit_status.clone();
     let seat_for_activate = seat.clone();
+    // The system bus connection that watches for a suspend. Its signal
+    // subscription ends when the connection is freed, so the application
+    // keeps it.
+    let system_bus: SharedConnection = Rc::new(RefCell::new(None));
     app.connect_activate(move |app| {
         let is_wayland = is_wayland_display();
         match dialog::build(app, &args, seat_for_activate.clone(), wm_name, is_wayland) {
@@ -66,6 +73,7 @@ pub fn run(args: Args) -> i32 {
                     app.quit();
                     return;
                 }
+                close_on_sleep_or_lock(app, &window, &seat_for_activate, &system_bus);
                 window.show_all();
                 if !is_wayland {
                     match dialog::grab_inputs(&window) {
@@ -92,6 +100,73 @@ pub fn run(args: Args) -> i32 {
     });
     app.run_with_args(&["ilia"]);
     exit_status.get()
+}
+
+/// Closes the dialog when the system is about to suspend or the screen gets
+/// locked. On X11 ilia grabs the keyboard and pointer, and while it does the
+/// screen locker cannot lock.
+fn close_on_sleep_or_lock(
+    app: &gtk::Application,
+    window: &gtk::Window,
+    seat: &dialog::SharedSeat,
+    system_bus: &SharedConnection,
+) {
+    let (app_for_signal, window, seat) = (app.clone(), window.clone(), seat.clone());
+    let on_signal = move |_: &gio::DBusConnection,
+                          _: &str,
+                          _: &str,
+                          interface: &str,
+                          signal: &str,
+                          parameters: &glib::Variant| {
+        if is_sleep_or_lock_signal(interface, signal, parameters) {
+            dialog::quit(&window, &app_for_signal, &seat);
+        }
+    };
+
+    if let Some(session_bus) = app.dbus_connection() {
+        session_bus.signal_subscribe(
+            Some("org.gnome.ScreenSaver"),
+            Some("org.gnome.ScreenSaver"),
+            Some("ActiveChanged"),
+            Some("/org/gnome/ScreenSaver"),
+            None,
+            gio::DBusSignalFlags::NONE,
+            on_signal.clone(),
+        );
+    }
+
+    let system_bus = system_bus.clone();
+    gio::bus_get(
+        gio::BusType::System,
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(bus) => {
+                bus.signal_subscribe(
+                    Some("org.freedesktop.login1"),
+                    Some("org.freedesktop.login1.Manager"),
+                    Some("PrepareForSleep"),
+                    Some("/org/freedesktop/login1"),
+                    None,
+                    gio::DBusSignalFlags::NONE,
+                    on_signal,
+                );
+                system_bus.replace(Some(bus));
+            }
+            Err(error) => eprintln!("Cannot watch for suspend: {}", error.message()),
+        },
+    );
+}
+
+/// True for the D-Bus signals that announce a suspend or a screen lock:
+/// logind's `PrepareForSleep(true)` and the screensaver's
+/// `ActiveChanged(true)`.
+fn is_sleep_or_lock_signal(interface: &str, signal: &str, parameters: &glib::Variant) -> bool {
+    let is_sleep = interface == "org.freedesktop.login1.Manager" && signal == "PrepareForSleep";
+    let is_lock = interface == "org.gnome.ScreenSaver" && signal == "ActiveChanged";
+    (is_sleep || is_lock)
+        && parameters
+            .get::<(bool,)>()
+            .is_some_and(|(starting,)| starting)
 }
 
 /// Whether GDK connected to a Wayland compositor. Asking GDK rather than the
@@ -155,7 +230,47 @@ fn load_style(window: &gtk::Window, args: &Args) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_wm;
+    use super::{detect_wm, is_sleep_or_lock_signal};
+    use glib::prelude::ToVariant;
+
+    #[test]
+    fn suspend_and_lock_signals_close_the_dialog() {
+        let starting = (true,).to_variant();
+        let ending = (false,).to_variant();
+        let sleep = "org.freedesktop.login1.Manager";
+        let lock = "org.gnome.ScreenSaver";
+        assert!(is_sleep_or_lock_signal(sleep, "PrepareForSleep", &starting));
+        assert!(is_sleep_or_lock_signal(lock, "ActiveChanged", &starting));
+        // Resume and unlock.
+        assert!(!is_sleep_or_lock_signal(sleep, "PrepareForSleep", &ending));
+        assert!(!is_sleep_or_lock_signal(lock, "ActiveChanged", &ending));
+        // Other signals, and unexpected arguments.
+        assert!(!is_sleep_or_lock_signal(
+            sleep,
+            "PrepareForShutdown",
+            &starting
+        ));
+        assert!(!is_sleep_or_lock_signal(
+            lock,
+            "WakeUpScreen",
+            &().to_variant()
+        ));
+        assert!(!is_sleep_or_lock_signal(
+            sleep,
+            "PrepareForSleep",
+            &("true",).to_variant()
+        ));
+        assert!(!is_sleep_or_lock_signal(
+            sleep,
+            "PrepareForSleep",
+            &().to_variant()
+        ));
+        assert!(!is_sleep_or_lock_signal(
+            sleep,
+            "PrepareForSleep",
+            &true.to_variant()
+        ));
+    }
 
     #[test]
     fn wm_detection_prefers_sway_then_i3() {

@@ -125,6 +125,9 @@ def isolated_env(tmp_path, display):
         "XDG_CACHE_HOME": str(cache),
         "XDG_RUNTIME_DIR": str(runtime),
         "DBUS_SESSION_BUS_ADDRESS": address,
+        # ilia watches the system bus for a suspend; the private bus stands in
+        # for it, so no host service is reached.
+        "DBUS_SYSTEM_BUS_ADDRESS": address,
         "PATH": str(bindir),
     })
     env.pop("I3SOCK", None)
