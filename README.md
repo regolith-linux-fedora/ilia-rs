@@ -13,15 +13,21 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
 - **A specific moment in time.** The port reproduces ilia as of
   [regolith-linux/ilia@d982583](https://github.com/regolith-linux/ilia/commit/d982583f94dfe846b4a26d8ce53c231a16fa0167)
   (version 0.18.0, November 2025): a black-box parity suite (`parity/`)
-  written against that Vala build passes against the Rust binary. On top of
-  that it carries the bug fixes listed below.
+  written against that Vala build, and updated wherever the port has since
+  changed behaviour on purpose, passes against the Rust binary. On top of
+  that it carries the bug fixes listed below, which include all of ilia
+  0.19.0. It prints `ilia version 0.19`, like ilia; the package version is
+  `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
-  Some are already in this port (fixed here independently, or ported), and
-  some still need porting: #143, #146, #149 and #150 among the merged ones,
-  and the open #158–#161 (running a keybinding from the keybindings page).
-  See [Differences from upstream](#differences-from-upstream). That list
-  was made on 2026-11-03 against upstream `main` at `a799dc1` and may not be
-  complete.
+  Most of the smaller ones are in this port (fixed here independently, or
+  ported), but some large ones still need porting: running a keybinding
+  from the keybindings page (#158–#161), the keys the window manager binds
+  (#170), window-manager and desktop keys while ilia is open (#171),
+  matching and ranking (#169), launching desktop entries per the Desktop
+  Entry spec (#168), and faster apps start-up (#162). See
+  [Differences from upstream](#differences-from-upstream). That list was
+  made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
+  running both builds side by side under i3 and sway.
 - **Very deep testing is needed** before anyone considers this port as a
   replacement for the Vala ilia.
 - **No deep code reviews yet.** The port has not yet been reviewed in depth
@@ -64,10 +70,16 @@ Then seven upstream fixes ported one commit each (#147, #148, #151, #152,
 probes run outside the original build image, and a commit that updates the
 tests for the behaviour step 6 changed on purpose.
 
+A second batch (November 2026) ported, one commit each: #165 with the rest
+of the dialog chrome, the Ctrl+$ fix of #171 with Unicode word motion, #150,
+#149, the rest of #138, #141, #143, #166, and #146 with the removal of the
+Vala-era packaging files. Each commit updates the parity suite where it
+asserted the old behaviour.
+
 ## Differences from upstream
 
-Compared with regolith-linux/ilia `main` at `a799dc1` (2026-11-02), merged
-pull requests #125–#157:
+Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
+pull requests #125–#171:
 
 **Already in the port** (fixed independently in steps 6–7, or by design):
 #125 icons loaded on the main thread and no icon work with `icon-size=0`;
@@ -75,37 +87,63 @@ pull requests #125–#157:
 #128 multi-word filter; #129 Home/End; #130 tinysparql or tracker-sparql
 loaded at run time; #131 `Terminal=true` apps in a terminal; #132 newest
 notification first; #133 layout switch while open (most-recently-used
-order); #134 large text lists; #135 Ctrl+n/p from the highlighted row;
-#136 keypad Enter; #137 Delete removes the highlighted notification; #138
-silent rofication daemon; #139 Wayland detected from the GDK display; #140
-Alt+minus on Wayland; #141 `SWAYSOCK`; #142 file search off the UI thread;
+order); #135 Ctrl+n/p from the highlighted row; #136 keypad Enter; #137
+Delete removes the highlighted notification; #139 Wayland detected from the
+GDK display; #140 Alt+minus on Wayland; #142 file search off the UI thread;
 #153 entry positions counted in characters; #154 transparent icon
-placeholder; #155 right Super closes.
+placeholder; #155 right Super closes; #167 no GTK criticals for native
+Wayland windows.
 
 **Ported in this repository** (one commit each, with a unit test or a
-headless check): #145 entry text applied to the switched page; #147 dialog
-windows listed on i3; #148 files found by content; #151 apps searched by
-generic name, keywords and comment; #152 new last notification highlighted
-after deleting the last one; #156 each command listed once, only
-executables; #157 paste without blocking on the clipboard owner.
+headless check against the Vala build): #138 a "Could not load
+notifications" row when the rofication daemon is missing or silent (the
+port already read the list off the main thread with a timeout); #141 the
+sway socket read from `SWAYSOCK` (an earlier version of this README listed
+#141 as already in the port, but a stale `I3SOCK` still won over
+`SWAYSOCK` under sway); #143 close before a suspend or a screen lock;
+#145 entry text applied to the switched page; #146 version string 0.19;
+#147 dialog windows listed on i3; #148 files found by content; #149 the
+Windows page keeps its icon column; #150 the first match highlighted for
+new text after arrow keys; #151 apps searched by generic name, keywords and
+comment; #152 new last notification highlighted after deleting the last
+one; #156 each command listed once, only executables; #157 paste without
+blocking on the clipboard owner; #165 no page icon in the entry after a
+tab switch, and the app-grid icon on the Applications tab; #166 stay open
+on sway when the seat's last keyboard goes away.
+
+**Partly ported:**
+
+- #134: large text lists filter without blocking, but stdin is still read
+  to the end before the window opens, so a slow producer delays it.
+- #171: only its Ctrl+$ fix (see below).
 
 **Not yet ported** (open items):
 
-- #143: close before a suspend or screen lock on X11, so the locker can
-  grab the keyboard (logind `PrepareForSleep`, `org.gnome.ScreenSaver`
-  `ActiveChanged`).
-- #149: Windows page keeps its icon column (fixed renderer size, generic
-  icon for windows without one).
-- #150: highlight the first match whenever the filter text changes, also
-  after arrow-key moves, on every list page.
-- #146: version string. The port prints `ilia version 0.12`, as 0.18.0
-  did; upstream now prints 0.19.
-- Open upstream PRs #158–#161 (keybindings page): run the chosen binding
-  over IPC with quotes intact, run a clicked row on X11, read config files
-  in order each on its own lines, and send the command the window manager
-  holds for the binding. The port still has the 0.18.0 behaviour, and
-  `parity/test_keybindings.py` asserts it, so those tests need updating
-  when these fixes are ported.
+- #158–#161 (keybindings page): run the chosen binding over IPC with quotes
+  intact, run a clicked row on X11, read config files in order each on its
+  own lines, and send the command the window manager holds for the binding.
+  The port still runs `i3-msg`/`swaymsg`, and `parity/test_keybindings.py`
+  accepts that, so those tests need updating when these fixes are ported.
+- #162: read the desktop files during GTK start-up and decode icons off the
+  main thread (the apps page opens about 20–30 % later than ilia's).
+- #168: launch desktop entries per the Desktop Entry spec (field codes,
+  `Path`, D-Bus activation) when `systemd-run` wraps the launch.
+- #169: rank name matches first, ignore accents, optional fuzzy matching,
+  hidden apps (Ctrl+Delete), `match-fields`.
+- #170: the keybindings page shows the keys the window manager binds.
+- #171: window-manager and desktop keys work while ilia is open.
+- Open upstream PRs that will likely land: #164 (notification actions),
+  #172 (calculator page) and #173 (desktop-entry actions).
+
+**Dialog details brought in line with ilia** (port bugs, no upstream pull
+request): tab icons are flat buttons that switch the page; the Help tab's
+heading has the `help_heading` style class and its list fixed row heights;
+the Commands and TextList help texts say what Enter does when no row
+matches; the list has the focus when the window opens; `-a -p textlist`
+reports the unknown page; Ctrl+$ moves to the end of the entry (the key
+arrives as `dollar`, never as Shift+4; ilia fixed this in #171); Ctrl+w and
+Ctrl+b stop at Unicode punctuation and symbols, as `g_unichar_ispunct`
+does.
 
 **In the port but not (known to be) upstream:** text-list lines that are not
 valid UTF-8 print back byte-exact; one notification missing a field no
@@ -173,10 +211,10 @@ dpkg-buildpackage -b -us -uc
 builds `ilia_<version>_<arch>.deb` with the same payload as the Vala package
 (the binary, the GSettings schema, and the `data/local` and `doc` copies).
 cargo needs network access during the build unless the crates were vendored
-as above. `debian/control` still lists Vala-era dependencies that the Rust
-binary does not use (for example the package depends on `libgee-0.8-2`).
-`flake.nix` and `nix/` are left from the Vala project and have not been
-updated for the Rust build.
+as above (or `CARGO_HOME` already holds them and `CARGO_NET_OFFLINE=true` is
+set). `debian/control` lists only what the Rust build and binary use; the
+Vala project's Nix flake, AutoVala, uncrustify and gettext files were
+removed.
 
 ## Usage
 
