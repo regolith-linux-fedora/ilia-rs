@@ -225,7 +225,7 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn get_icon_name(&self) -> &'static str {
-        "system-run"
+        "view-app-grid-symbolic"
     }
 
     fn get_help(&self) -> &'static str {

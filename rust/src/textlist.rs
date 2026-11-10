@@ -288,7 +288,7 @@ impl DialogPage for TextListPage {
         DEFAULT_ICON
     }
     fn get_help(&self) -> &'static str {
-        "This dialog presents a filterable list of items to select from."
+        "This dialog presents a filterable list of items to select from. If no item matches, enter returns the typed text."
     }
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
         [("enter", "Select Item")].into_iter().collect()

@@ -131,7 +131,7 @@ impl DialogPage for CommandPage {
         "utilities-terminal"
     }
     fn get_help(&self) -> &'static str {
-        "This dialog allows for the executing commands on the user path. Initially all commands are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it."
+        "This dialog allows for the executing commands on the user path. Initially all commands are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it. If no item matches, enter runs the typed command line, including any arguments."
     }
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
         [("enter", "Execute Command")].into_iter().collect()

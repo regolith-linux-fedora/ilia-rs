@@ -33,7 +33,8 @@ pub fn build(
 ) -> Result<gtk::Window, ()> {
     let focus_name = args.value("-p").unwrap_or("Apps");
     let all = args.has("-a");
-    let focus = find(focus_name);
+    // With -a only the general pages are loaded: textlist cannot be chosen.
+    let focus = find(focus_name).filter(|page| !all || ALL_PAGE_IDS.contains(&page.id));
 
     let settings = gio::Settings::new("org.regolith-linux.ilia");
     let width = settings.int("window-width");
@@ -109,7 +110,18 @@ pub fn build(
         } else {
             page.get_icon_name()
         };
-        let image = gtk::Image::from_icon_name(Some(icon), gtk::IconSize::Button);
+        // The icon is a button that shows its page, as the label does; it
+        // never takes the keyboard focus.
+        let button = gtk::Button::new();
+        button.set_can_focus(false);
+        button.set_relief(gtk::ReliefStyle::None);
+        button.add(&gtk::Image::from_icon_name(
+            Some(icon),
+            gtk::IconSize::Button,
+        ));
+        let notebook_for_button = notebook.clone();
+        let page_index = notebook.n_pages();
+        button.connect_clicked(move |_| notebook_for_button.set_current_page(Some(page_index)));
         let label = gtk::Label::new(None);
         let name = if page.get_id() == "textlist" {
             args.value("-l").unwrap_or(page.get_name())
@@ -117,7 +129,7 @@ pub fn build(
             page.get_name()
         };
         label.set_markup(name);
-        tab.pack_start(&image, false, false, 0);
+        tab.pack_start(&button, false, false, 0);
         tab.pack_start(&label, false, false, 5);
         // Notebook tab widgets are not reached by the window's show_all().
         tab.show_all();
@@ -172,7 +184,6 @@ pub fn build(
                 entry_for_switch.set_sensitive(false);
             } else if let Some(page) = pages_for_switch.get(index) {
                 active_for_switch.set(index);
-                entry_for_switch.set_secondary_icon_name(Some(page.get_icon_name()));
                 entry_for_switch.set_sensitive(true);
                 // Filter the new page by the text already typed.
                 page.on_entry_changed();
@@ -346,6 +357,8 @@ pub fn build(
             glib::Propagation::Stop
         }
     });
+    // The list has the focus at first, as after every page switch.
+    pages[active_page.get()].show();
     Ok(window)
 }
 
@@ -580,7 +593,9 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
     let help = gtk::Label::new(Some(page.get_help()));
     help.set_line_wrap(true);
     root.pack_start(&help, false, false, 5);
-    root.pack_start(&gtk::Label::new(Some("Keybindings")), false, false, 5);
+    let heading = gtk::Label::new(Some("Keybindings"));
+    heading.style_context().add_class("help_heading");
+    root.pack_start(&heading, false, false, 5);
 
     let model = gtk::ListStore::new(&[glib::Type::STRING, glib::Type::STRING]);
     for (key, action) in page.get_keybindings() {
@@ -602,11 +617,14 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
 
     let bindings = gtk::TreeView::with_model(&model);
     bindings.set_headers_visible(false);
+    bindings.set_fixed_height_mode(true);
     bindings.set_enable_search(false);
     for (column_index, title) in [(0, "Key"), (1, "Function")] {
         let renderer = gtk::CellRendererText::new();
         let column =
             gtk::TreeViewColumn::with_attributes(title, &renderer, &[("text", column_index)]);
+        // A fixed-height list needs fixed-size columns.
+        column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
         bindings.append_column(&column);
     }
     bindings.connect_realize(|view| view.columns_autosize());
