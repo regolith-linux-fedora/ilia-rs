@@ -325,9 +325,12 @@ fn hex_value(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn request(command: u32) -> Result<Json, String> {
-    let socket_path = socket_path(std::env::var_os("I3SOCK"), std::env::var_os("SWAYSOCK"))
-        .ok_or_else(|| "neither I3SOCK nor SWAYSOCK is set".to_owned())?;
+fn request(wm_name: &str, command: u32) -> Result<Json, String> {
+    let socket_path = socket_path(
+        wm_name,
+        std::env::var_os("I3SOCK"),
+        std::env::var_os("SWAYSOCK"),
+    )?;
     let mut stream = UnixStream::connect(&socket_path).map_err(|error| error.to_string())?;
     let timeout = Some(Duration::from_secs(3));
     stream
@@ -352,11 +355,20 @@ fn request(command: u32) -> Result<Json, String> {
     JsonParser::new(&payload).parse()
 }
 
-/// The compositor socket: `I3SOCK` when set, else `SWAYSOCK`. sway exports
-/// both to the programs it starts, but a launcher started some other way may
-/// only see `SWAYSOCK`.
-fn socket_path(i3_socket: Option<OsString>, sway_socket: Option<OsString>) -> Option<OsString> {
-    i3_socket.or(sway_socket)
+/// The window manager's IPC socket: `SWAYSOCK` for sway, which is how sway
+/// was detected, else `I3SOCK`. sway sets `I3SOCK` too, but only for the
+/// programs it starts, so a stale `I3SOCK` must not win under sway.
+fn socket_path(
+    wm_name: &str,
+    i3_socket: Option<OsString>,
+    sway_socket: Option<OsString>,
+) -> Result<OsString, String> {
+    let socket = if wm_name == "sway" {
+        sway_socket
+    } else {
+        i3_socket
+    };
+    socket.ok_or_else(|| format!("No IPC socket for window manager {wm_name}"))
 }
 
 /// Reads one reply: the fixed header, then exactly the payload length it
@@ -390,8 +402,8 @@ pub struct VersionReply {
 }
 
 #[allow(dead_code)]
-pub fn get_version() -> Result<VersionReply, String> {
-    version_from_reply(request(GET_VERSION)?)
+pub fn get_version(wm_name: &str) -> Result<VersionReply, String> {
+    version_from_reply(request(wm_name, GET_VERSION)?)
 }
 
 fn version_from_reply(reply: Json) -> Result<VersionReply, String> {
@@ -408,7 +420,7 @@ fn version_from_reply(reply: Json) -> Result<VersionReply, String> {
 }
 
 pub fn get_config(wm_name: &str) -> Result<String, String> {
-    config_from_reply(request(GET_CONFIG)?, wm_name)
+    config_from_reply(request(wm_name, GET_CONFIG)?, wm_name)
 }
 
 fn config_from_reply(reply: Json, wm_name: &str) -> Result<String, String> {
@@ -659,8 +671,8 @@ impl TreeReply {
     }
 }
 
-pub fn get_tree() -> Result<TreeReply, String> {
-    TreeReply::from_json(&request(GET_TREE)?)
+pub fn get_tree(wm_name: &str) -> Result<TreeReply, String> {
+    TreeReply::from_json(&request(wm_name, GET_TREE)?)
 }
 
 #[cfg(test)]
@@ -708,12 +720,23 @@ mod tests {
     }
 
     #[test]
-    fn i3_socket_takes_precedence_over_sway_socket() {
-        let i3 = Some("/run/i3.sock".into());
-        let sway = Some("/run/sway.sock".into());
-        assert_eq!(socket_path(i3.clone(), sway.clone()), i3);
-        assert_eq!(socket_path(None, sway.clone()), sway);
-        assert_eq!(socket_path(None, None), None);
+    fn socket_comes_from_the_detected_window_manager() {
+        let i3 = || Some("/run/i3.sock".into());
+        let sway = || Some("/run/sway.sock".into());
+        // Under sway a stale I3SOCK does not win over SWAYSOCK.
+        assert_eq!(socket_path("sway", i3(), sway()), Ok(sway().unwrap()));
+        assert_eq!(socket_path("sway", None, sway()), Ok(sway().unwrap()));
+        assert_eq!(socket_path("i3", i3(), sway()), Ok(i3().unwrap()));
+        assert_eq!(socket_path("i3", i3(), None), Ok(i3().unwrap()));
+        // No socket for the window manager is an error, not a guess.
+        assert_eq!(
+            socket_path("sway", i3(), None),
+            Err("No IPC socket for window manager sway".to_owned())
+        );
+        assert_eq!(
+            socket_path("Unknown", None, None),
+            Err("No IPC socket for window manager Unknown".to_owned())
+        );
     }
 
     #[test]

@@ -65,7 +65,13 @@ def test_sway_config_and_includes_are_walked(isolated_env, run_ilia, tmp_path):
     transcript = tmp_path / "sway-ipc.jsonl"
     includes = tmp_path / "partials"
     shutil.copytree(ROOT / "parity/fixtures/sway-partials", includes)
-    env.update({"I3SOCK": str(socket_path), "SWAYSOCK": str(socket_path), "FIXTURE_CONFIG": str(includes)})
+    # sway is reached through SWAYSOCK; an I3SOCK left from another session
+    # must not be used instead.
+    env.update({
+        "I3SOCK": str(tmp_path / "stale-i3.sock"),
+        "SWAYSOCK": str(socket_path),
+        "FIXTURE_CONFIG": str(includes),
+    })
     reply = json.loads((ROOT / "parity/fixtures/sway-config.json").read_text())
     with I3Server(socket_path, {9: reply}, transcript) as server:
         app = run_ilia(env, "-p", "keybindings")

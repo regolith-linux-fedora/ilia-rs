@@ -24,9 +24,9 @@ notification first.
 
 The suite records existing behavior, including `ilia version 0.12`, native
 little-endian i3 framing, the single-read IPC client, the fixed rofication
-socket path, and `systemd-run` wrapping. Sway mode still needs `I3SOCK` for the
-IPC transport because the current client reads that variable even when
-`SWAYSOCK` selects sway behavior.
+socket path, and `systemd-run` wrapping. Sway mode reaches the fake window
+manager through `SWAYSOCK` alone; its `I3SOCK` names a socket that does not
+exist, as a stale variable from another session would (upstream #141).
 
 This harness chooses the deterministic absent-binary behavior for the absolute
 `/usr/bin/i3-msg` and `/usr/bin/swaymsg` paths rather than modifying system

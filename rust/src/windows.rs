@@ -51,7 +51,7 @@ impl WindowsPage {
             )
         });
 
-        match ipc::get_tree() {
+        match ipc::get_tree(&wm_name) {
             Ok(tree) => add_tree(&model, &tree, is_wayland, icon_size),
             Err(error) => {
                 eprintln!("Failed to read or parse window tree from {wm_name}: {error}")
