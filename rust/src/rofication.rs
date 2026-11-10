@@ -176,8 +176,12 @@ impl RoficationClient {
 }
 
 /// The OS error text the way GIO reports it, without Rust's
-/// `(os error N)` suffix.
+/// `(os error N)` suffix. A daemon that does not answer in time is
+/// reported in GIO's words, not as EAGAIN.
 fn io_message(error: &std::io::Error) -> String {
+    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+        return "Socket I/O timed out".to_owned();
+    }
     let text = error.to_string();
     match text.rfind(" (os error ") {
         Some(index) if text.ends_with(')') => text[..index].to_owned(),
@@ -188,8 +192,23 @@ fn io_message(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_many_request, delete_request, list_request, newest_first, parse_notifications,
+        delete_many_request, delete_request, io_message, list_request, newest_first,
+        parse_notifications,
     };
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn io_errors_read_like_gio() {
+        let missing = Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(io_message(&missing), "No such file or directory");
+        // A read timeout on a blocking socket is EAGAIN.
+        let silent = Error::from_raw_os_error(libc::EAGAIN);
+        assert_eq!(io_message(&silent), "Socket I/O timed out");
+        assert_eq!(
+            io_message(&Error::from(ErrorKind::TimedOut)),
+            "Socket I/O timed out"
+        );
+    }
 
     #[test]
     fn command_framing_matches_vala_bytes() {

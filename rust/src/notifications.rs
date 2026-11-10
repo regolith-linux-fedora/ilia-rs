@@ -153,6 +153,24 @@ impl Inner {
         }
     }
 
+    /// Says in the list why it is empty. The row is no notification (its id
+    /// is -1), so Delete ignores it.
+    fn show_load_error(&self, error: &str) {
+        self.model.clear();
+        let icon = gtk::IconTheme::default()
+            .and_then(|theme| load_icon_from_name(&theme, "dialog-error", self.icon_size));
+        let row = self.model.append();
+        self.model.set(
+            &row,
+            &[
+                (ICON, &icon),
+                (DETAIL, &load_error_text(error)),
+                (ID, &"-1"),
+            ],
+        );
+        self.set_selection();
+    }
+
     fn set_selection(&self) {
         // After deleting the last row, highlight the new last one.
         let rows = self.filter.iter_n_children(None);
@@ -226,7 +244,10 @@ impl DialogPage for RoficationPage {
                     inner.show_notifications(notifications);
                     inner.set_selection();
                 }
-                Err(error) => eprintln!("Error: load_notifications failed: {error}"),
+                Err(error) => {
+                    eprintln!("Error: load_notifications failed: {error}");
+                    inner.show_load_error(&error);
+                }
             }
         });
     }
@@ -322,6 +343,11 @@ fn parse_int(text: &str) -> i32 {
     }) as i32
 }
 
+/// The text of the row shown when the list cannot be read.
+fn load_error_text(error: &str) -> String {
+    format!("Could not load notifications\n{error}")
+}
+
 pub fn detail_text(summary: &str, body: &str) -> String {
     match (summary.is_empty(), body.is_empty()) {
         (false, false) => format!("{summary}\n{body}"),
@@ -393,7 +419,17 @@ fn clamped_row(index: i32, rows: i32) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamped_row, detail_text, matches_query, parse_int};
+    use super::{clamped_row, detail_text, load_error_text, matches_query, parse_int};
+
+    #[test]
+    fn load_error_row_names_the_failure() {
+        assert_eq!(
+            load_error_text("Socket I/O timed out"),
+            "Could not load notifications\nSocket I/O timed out"
+        );
+        // The row's id is not a notification id, so Delete leaves it alone.
+        assert_eq!(parse_int("-1"), -1);
+    }
 
     #[test]
     fn detail_text_covers_every_branch() {
