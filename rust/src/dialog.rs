@@ -337,7 +337,14 @@ pub fn build(
     let app_for_focus = app.clone();
     let window_for_focus = window.clone();
     let seat_for_focus = seat.clone();
-    window.connect_focus_out_event(move |_, _| {
+    window.connect_focus_out_event(move |window, _| {
+        // Removing the seat's last keyboard (one wtype run, a virtual or
+        // Bluetooth keyboard going away) also takes the keyboard focus on
+        // Wayland, though it went nowhere; the next keyboard to appear
+        // focuses ilia again.
+        if is_wayland && !seat_has_keyboard(window) {
+            return glib::Propagation::Proceed;
+        }
         quit(&window_for_focus, &app_for_focus, &seat_for_focus);
         glib::Propagation::Proceed
     });
@@ -368,6 +375,12 @@ fn is_super_key(key: &gdk::keys::Key) -> bool {
         *key,
         gdk::keys::constants::Super_L | gdk::keys::constants::Super_R
     )
+}
+
+fn seat_has_keyboard(window: &gtk::Window) -> bool {
+    WidgetExt::display(window)
+        .default_seat()
+        .is_some_and(|seat| !seat.slaves(gdk::SeatCapabilities::KEYBOARD).is_empty())
 }
 
 /// The key of a key event as it is in the first layout.
