@@ -5,6 +5,7 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use gtk_layer_shell::LayerShell;
 
+use crate::apps;
 use crate::args::Args;
 use crate::dialog;
 
@@ -37,6 +38,18 @@ const DEFAULT_CSS: &str = r#"                .root_box {
 type SharedConnection = Rc<RefCell<Option<gio::DBusConnection>>>;
 
 pub fn run(args: Args) -> i32 {
+    if opens_apps_page(&args) {
+        // Start reading the desktop files now, on a worker thread, so that it
+        // overlaps with GTK's start-up. GTK sets the locale only while it
+        // starts, so set it first: GLib translates the desktop files' Name
+        // and Keywords as it reads them.
+        // SAFETY: no other thread is running yet, and the argument is a valid
+        // C string.
+        unsafe {
+            libc::setlocale(libc::LC_ALL, c"".as_ptr());
+        }
+        apps::prefetch_apps();
+    }
     let wm_name = detect_wm(
         std::env::var_os("SWAYSOCK").is_some(),
         std::env::var_os("I3SOCK").is_some(),
@@ -100,6 +113,16 @@ pub fn run(args: Args) -> i32 {
     });
     app.run_with_args(&["ilia"]);
     exit_status.get()
+}
+
+/// Whether the dialog shows the Applications page: always with `-a`, and
+/// with `-p apps` or no `-p` at all.
+fn opens_apps_page(args: &Args) -> bool {
+    args.has("-a")
+        || args
+            .value("-p")
+            .unwrap_or("apps")
+            .eq_ignore_ascii_case("apps")
 }
 
 /// Closes the dialog when the system is about to suspend or the screen gets
@@ -230,8 +253,20 @@ fn load_style(window: &gtk::Window, args: &Args) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_wm, is_sleep_or_lock_signal};
+    use super::{detect_wm, is_sleep_or_lock_signal, opens_apps_page};
+    use crate::args::Args;
     use glib::prelude::ToVariant;
+
+    #[test]
+    fn desktop_files_are_read_early_only_for_the_applications_page() {
+        let opens = |args: &[&str]| opens_apps_page(&Args::parse(args.iter().copied()));
+        assert!(opens(&["ilia"]));
+        assert!(opens(&["ilia", "-p", "apps"]));
+        assert!(opens(&["ilia", "-p", "Apps"]));
+        assert!(opens(&["ilia", "-a", "-p", "windows"]));
+        assert!(!opens(&["ilia", "-p", "textlist"]));
+        assert!(!opens(&["ilia", "-p", "keybindings"]));
+    }
 
     #[test]
     fn suspend_and_lock_signals_close_the_dialog() {

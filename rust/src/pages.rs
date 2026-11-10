@@ -117,7 +117,7 @@ pub fn create(
     is_wayland: bool,
 ) -> Rc<dyn DialogPage> {
     match page.id {
-        "apps" => Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit)),
+        "apps" => ApplicationsPage::new(settings.clone(), entry.clone(), quit),
         "terminal" => Rc::new(CommandPage::new(entry.clone(), args.has("-q"), quit)),
         "keybindings" => Rc::new(KeybindingsPage::new(
             entry.clone(),

@@ -23,8 +23,8 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   ported), but some large ones still need porting: running a keybinding
   from the keybindings page (#158–#161), the keys the window manager binds
   (#170), window-manager and desktop keys while ilia is open (#171),
-  matching and ranking (#169), launching desktop entries per the Desktop
-  Entry spec (#168), and faster apps start-up (#162). See
+  matching and ranking (#169), and launching desktop entries per the
+  Desktop Entry spec (#168). See
   [Differences from upstream](#differences-from-upstream). That list was
   made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
   running both builds side by side under i3 and sway.
@@ -107,7 +107,10 @@ Windows page keeps its icon column; #150 the first match highlighted for
 new text after arrow keys; #151 apps searched by generic name, keywords and
 comment; #152 new last notification highlighted after deleting the last
 one; #156 each command listed once, only executables; #157 paste without
-blocking on the clipboard owner; #165 no page icon in the entry after a
+blocking on the clipboard owner; #162 the desktop files read on a worker
+thread during GTK start-up, icons decoded off the main thread with the
+visible rows first, and Enter pressed before the list arrives acting once
+it has; #165 no page icon in the entry after a
 tab switch, and the app-grid icon on the Applications tab; #166 stay open
 on sway when the seat's last keyboard goes away.
 
@@ -124,8 +127,6 @@ on sway when the seat's last keyboard goes away.
   own lines, and send the command the window manager holds for the binding.
   The port still runs `i3-msg`/`swaymsg`, and `parity/test_keybindings.py`
   accepts that, so those tests need updating when these fixes are ported.
-- #162: read the desktop files during GTK start-up and decode icons off the
-  main thread (the apps page opens about 20–30 % later than ilia's).
 - #168: launch desktop entries per the Desktop Entry spec (field codes,
   `Path`, D-Bus activation) when `systemd-run` wraps the launch.
 - #169: rank name matches first, ignore accents, optional fuzzy matching,
