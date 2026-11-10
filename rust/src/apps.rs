@@ -500,11 +500,15 @@ mod tests {
         );
     }
 
+    // GLib rejects an entry whose Exec program is not on PATH, and another
+    // test swaps PATH while it runs: name the program by its absolute path.
     fn desktop_entry(lines: &str) -> gio::DesktopAppInfo {
         let keyfile = glib::KeyFile::new();
         keyfile
             .load_from_data(
-                &format!("[Desktop Entry]\nType=Application\nName=Fixture\nExec=true\n{lines}"),
+                &format!(
+                    "[Desktop Entry]\nType=Application\nName=Fixture\nExec=/usr/bin/true\n{lines}"
+                ),
                 glib::KeyFileFlags::NONE,
             )
             .unwrap();
