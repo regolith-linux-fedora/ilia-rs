@@ -8,7 +8,7 @@ use gtk::prelude::*;
 
 use crate::filter::matches_all_words;
 use crate::keybindings::navigate;
-use crate::pages::{is_enter_key, DialogPage};
+use crate::pages::{is_enter_key, select_first_row, DialogPage};
 use crate::runner::runner_app_info;
 
 const NAME: u32 = 0;
@@ -88,7 +88,7 @@ impl CommandPage {
     // waits for it. The store is sorted before the scan starts, so each row
     // lands at its final position as it arrives and the end of the scan
     // never reorders the list under a highlight made while it ran. Once the
-    // whole PATH has been walked, the first row is selected if none is.
+    // whole PATH has been walked, the first row is highlighted.
     fn load_commands(&self, model: gtk::ListStore) {
         let view = self.view.clone();
         let path = self.path.clone();
@@ -178,20 +178,10 @@ fn matches_query(query: &str, cmd_path: &str) -> bool {
     matches_all_words(query, &[cmd_path])
 }
 
+/// Highlights the first row: the best match for the text typed.
 fn set_selection(view: &gtk::TreeView, path: &RefCell<gtk::TreePath>) {
-    let selection = view.selection();
-    let (selected, _) = selection.selected_rows();
-    if let Some(selected) = selected.first() {
-        view.scroll_to_cell(
-            Some(selected),
-            None::<&gtk::TreeViewColumn>,
-            false,
-            0.0,
-            0.0,
-        );
-        return;
-    }
-    selection.select_path(&path.borrow());
+    view.selection().set_mode(gtk::SelectionMode::Single);
+    *path.borrow_mut() = select_first_row(view);
 }
 
 async fn load_commands_from_path(model: &gtk::ListStore) {

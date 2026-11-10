@@ -12,7 +12,7 @@ use crate::args::Args;
 use crate::filter::{contains_all_words, query_words};
 use crate::icons::load_icon_from_name;
 use crate::keybindings::navigate;
-use crate::pages::{is_enter_key, DialogPage};
+use crate::pages::{is_enter_key, select_first_row, DialogPage};
 
 const DEFAULT_ICON: &str = "utilities-terminal";
 const FALLBACK_ICON: &str = "applications-other";
@@ -183,16 +183,10 @@ impl TextListPage {
         });
     }
 
+    /// Highlights the first row: the best match for the text typed.
     fn set_selection(&self) {
-        let selection = self.view.selection();
-        let (selected, _) = selection.selected_rows();
-        if let Some(path) = selected.first() {
-            self.view
-                .scroll_to_cell(Some(path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
-            return;
-        }
-        selection.set_mode(gtk::SelectionMode::Single);
-        selection.select_path(&self.path.borrow());
+        self.view.selection().set_mode(gtk::SelectionMode::Single);
+        *self.path.borrow_mut() = select_first_row(&self.view);
     }
 
     /// The index of the line shown at `path`.
@@ -212,30 +206,23 @@ impl TextListPage {
         model.path(&iter)
     }
 
-    /// Shows the lines matching the current text. The rows are built before
-    /// the view gets them, so a large result costs one model change instead
-    /// of a signal per row. A highlighted line that still matches stays
-    /// highlighted.
+    /// Shows the lines matching the current text, with the first match
+    /// highlighted. The rows are built before the view gets them, so a large
+    /// result costs one model change instead of a signal per row.
     fn refilter(&self) {
         if let Some(timer) = self.pending.take() {
             timer.remove();
         }
         let words = query_words(self.entry.text().as_str());
         if words != self.shown.borrow().words {
-            let highlighted = self.selected_path().and_then(|path| self.line_index(&path));
             let shown = self.shown.borrow().filtered(&self.lines, words);
             let rows = if shown.words.is_empty() {
                 self.all_rows.clone()
             } else {
                 rows_store(shown.lines.iter().map(|index| &self.lines[*index as usize]))
             };
-            let position = highlighted.and_then(|line| shown.lines.binary_search(&line).ok());
             *self.shown.borrow_mut() = shown;
             self.view.set_model(Some(&rows));
-            if let Some(position) = position {
-                let path = gtk::TreePath::from_indicesv(&[position as i32]);
-                self.view.selection().select_path(&path);
-            }
         }
         self.set_selection();
     }

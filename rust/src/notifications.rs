@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use crate::filter::matches_all_words;
 use crate::icons::{load_icon_from_info, load_icon_from_name};
 use crate::keybindings::navigate;
-use crate::pages::DialogPage;
+use crate::pages::{select_first_row, DialogPage};
 use crate::rofication::{newest_first, NotificationDesc, RoficationClient, SOCKET_PATH};
 
 const ICON: u32 = 0;
@@ -235,6 +235,9 @@ impl DialogPage for RoficationPage {
     }
     fn on_entry_changed(&self) {
         self.inner.filter.refilter();
+        // A new text highlights its first match, wherever the arrow keys
+        // left the highlight.
+        *self.inner.path.borrow_mut() = select_first_row(&self.inner.view);
         self.inner.set_selection();
     }
     fn on_entry_activated(&self) {

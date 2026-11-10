@@ -11,7 +11,7 @@ use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk::prelude::*;
 
 use crate::filter::matches_all_words;
-use crate::pages::DialogPage;
+use crate::pages::{select_first_row, DialogPage};
 use crate::runner::runner_app_info;
 
 const ICON: u32 = 0;
@@ -136,18 +136,10 @@ impl ApplicationsPage {
         });
     }
 
+    /// Highlights the first row: the best match for the text typed.
     fn set_selection(&self) {
-        let selection = self.view.selection();
-        let (paths, _) = selection.selected_rows();
-        if let Some(path) = paths.first() {
-            self.view
-                .scroll_to_cell(Some(path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
-            return;
-        }
-        let first = gtk::TreePath::new_first();
-        if self.filter.iter(&first).is_some() {
-            selection.select_path(&first);
-        }
+        self.view.selection().set_mode(gtk::SelectionMode::Single);
+        select_first_row(&self.view);
     }
 
     fn execute_selected(&self) {

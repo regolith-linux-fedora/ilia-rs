@@ -90,6 +90,19 @@ pub fn is_enter_key(key: &gdk::keys::Key) -> bool {
     )
 }
 
+/// Highlights the first row of `view`, the best match for a new filter
+/// text, and returns its path. The arrow keys and Ctrl+n/p move the view's
+/// cursor: a refilter keeps that row highlighted when it still matches, or
+/// moves the highlight to a neighbouring row when it does not.
+pub fn select_first_row(view: &gtk::TreeView) -> gtk::TreePath {
+    let first = gtk::TreePath::new_first();
+    if view.model().and_then(|model| model.iter_first()).is_some() {
+        // Also selects the row and scrolls to it.
+        view.set_cursor(&first, None::<&gtk::TreeViewColumn>, false);
+    }
+    first
+}
+
 pub fn find(name: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.id.eq_ignore_ascii_case(name))
 }

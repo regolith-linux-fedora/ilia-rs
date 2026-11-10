@@ -13,7 +13,7 @@ use gtk::prelude::*;
 
 use crate::icons::load_icon_from_name;
 use crate::keybindings::navigate;
-use crate::pages::{is_enter_key, DialogPage};
+use crate::pages::{is_enter_key, select_first_row, DialogPage};
 use crate::sparql::{Connection, Cursor};
 
 const ICON: u32 = 0;
@@ -144,16 +144,10 @@ impl TrackerPage {
         });
     }
 
+    /// Highlights the first row: the best match for the text searched.
     fn set_selection(&self) {
-        let selection = self.view.selection();
-        let (selected, _) = selection.selected_rows();
-        if let Some(path) = selected.first() {
-            self.view
-                .scroll_to_cell(Some(path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
-            return;
-        }
-        selection.set_mode(gtk::SelectionMode::Single);
-        selection.select_path(&self.path.borrow());
+        self.view.selection().set_mode(gtk::SelectionMode::Single);
+        *self.path.borrow_mut() = select_first_row(&self.view);
     }
 
     /// Drops the waiting and the running search; results of the running one

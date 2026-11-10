@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use crate::filter::matches_all_words;
 use crate::ipc::{self, TreeReply};
 use crate::keybindings::{navigate, wm_cli};
-use crate::pages::DialogPage;
+use crate::pages::{select_first_row, DialogPage};
 
 const ICON: u32 = 0;
 const TITLE: u32 = 1;
@@ -113,15 +113,10 @@ impl WindowsPage {
         });
     }
 
+    /// Highlights the first row: the best match for the text typed.
     fn set_selection(&self) {
-        let selection = self.view.selection();
-        let (selected, _) = selection.selected_rows();
-        if let Some(path) = selected.first() {
-            self.view
-                .scroll_to_cell(Some(path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
-            return;
-        }
-        selection.select_path(&self.path.borrow());
+        self.view.selection().set_mode(gtk::SelectionMode::Single);
+        *self.path.borrow_mut() = select_first_row(&self.view);
     }
 
     fn focus_selected(&self) {
