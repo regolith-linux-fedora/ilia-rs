@@ -23,7 +23,7 @@ row prints it (TextList) or runs it (Terminal), and the notification fixture
 carries rofication `timestamp` fields because the page lists the newest
 notification first.
 
-The suite records existing behavior, including `ilia version 0.12`, native
+The suite records existing behavior, including `ilia version 0.19`, native
 little-endian i3 framing, the single-read IPC client, the fixed rofication
 socket path, and `systemd-run` wrapping. Sway mode reaches the fake window
 manager through `SWAYSOCK` alone; its `I3SOCK` names a socket that does not

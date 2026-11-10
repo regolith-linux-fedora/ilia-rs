@@ -1,5 +1,5 @@
 project('ilia',
-  version: '0.12',
+  version: '0.19',
   default_options: [
     'buildtype=release',
     'b_ndebug=if-release'
@@ -22,12 +22,3 @@ meson.add_install_script('meson_scripts/install_schemas.sh')
 
 subdir('src')
 subdir('test')
-
-uncrustify = find_program('uncrustify', required : false)
-if uncrustify.found()
-    run_target('fixstyle',
-        command : [
-            'meson_scripts/uncrustify.sh',
-        ],
-    )
-endif # uncrustify

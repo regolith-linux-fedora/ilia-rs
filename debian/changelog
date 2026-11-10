@@ -1,3 +1,24 @@
+ilia (0.19.0+rs1) resolute; urgency=medium
+
+  * Version string 0.19, as ilia 0.19 prints it (ports #146).
+  * fix(filter): show no page icon in the entry after a tab switch (ports
+    #165), with the rest of the dialog chrome as in ilia.
+  * fix(keys): Ctrl+$ goes to the end, Unicode punctuation ends words.
+  * fix(filter): highlight the first match for new text after arrow keys
+    (ports #150).
+  * fix(windows): keep the icon column when a window has no icon (ports
+    #149).
+  * fix(notifications): say in the list why it is empty (ports #138).
+  * fix(ipc): read the sway socket from SWAYSOCK (ports #141).
+  * fix(x11): close before a suspend so the screen locker can lock (ports
+    #143).
+  * fix(wayland): stay open when the seat's last keyboard goes away (ports
+    #166).
+  * Drop the Vala-era dependencies (libgee) and build files (flake.nix,
+    nix/, ilia.avprj, uncrustify, po/).
+
+ -- rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>  Mon, 09 Nov 2026 12:00:00 +0000
+
 ilia (0.18.0+rs1) resolute; urgency=medium
 
   * Rust port of ilia 0.18.0 (ilia-rs). See README.md for the status and

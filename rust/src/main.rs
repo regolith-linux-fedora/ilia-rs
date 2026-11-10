@@ -22,7 +22,7 @@ use std::ffi::OsString;
 use args::Args;
 
 const HELP: &str = "Usage: ilia [-t stylesheet] [-n] [-a] [-p page]\n\n\t-t: specify path to custom stylesheet.\n\n\t-n: no custom styles\n\n\t-a: load all pages\n\npages:\n\t'apps' - launch desktop applications (default)\n\t'terminal' - launch a terminal command\n\t\t-q: quiet execution\n\t'notifications' - launch notifications manager\n\t'keybindings' - launch keybindings viewer\n\t'textlist' - select an item from a specified list\n\t\t-l: page label\n\t\t-i: page/item icon\n\t\t-n: no icon\n\t'windows' - navigate to a window\n\t'tracker' - search for files by content\n";
-const VERSION: &str = "ilia version 0.12\n";
+const VERSION: &str = "ilia version 0.19\n";
 
 fn early_output(args: &Args) -> Option<&'static str> {
     if args.has("-h") || args.has("--help") {

@@ -32,7 +32,7 @@ def test_help_contract():
 
 def test_version_contract():
     result = subprocess.run([str(BINARY), "-v"], text=True, capture_output=True, timeout=5)
-    assert (result.returncode, result.stdout, result.stderr) == (0, "ilia version 0.12\n", "")
+    assert (result.returncode, result.stdout, result.stderr) == (0, "ilia version 0.19\n", "")
 
 
 def test_unknown_page_contract(isolated_env):
