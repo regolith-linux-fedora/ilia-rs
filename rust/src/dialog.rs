@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use glib::translate::IntoGlib;
+use glib::Unichar;
 
 use crate::args::Args;
 use crate::input_sources::InputSourceSwitcher;
@@ -469,10 +470,9 @@ fn size_change_allowed(width: i32, height: i32, monitor: Option<(i32, i32)>) -> 
 /// when the key is not an editing key, so the plain-key handling runs.
 fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPage) -> Option<bool> {
     let keyval = *event.keyval();
-    let shift = event.state().contains(gdk::ModifierType::SHIFT_MASK);
     let text = entry.text();
-    // The reference measures the text in bytes.
-    let length = text.len() as i32;
+    // Entry positions count characters.
+    let length = text.chars().count() as i32;
     let key = char::from_u32(keyval)?;
     match key {
         'h' => {
@@ -489,8 +489,9 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
         }
         'j' | 'n' | 'k' | 'p' => return Some(page.key_event(event)),
         '0' => entry.set_position(0),
-        '4' if shift => entry.set_position(length),
-        'a' => entry.select_region(0, length),
+        // Ctrl+$, whichever keys type the dollar sign.
+        '$' => entry.set_position(-1),
+        'a' => entry.select_region(0, -1),
         'w' => entry.set_position(forward_word(text.as_str(), entry.position())),
         'b' => entry.set_position(backward_word(text.as_str(), entry.position())),
         'c' => clipboard_copy(entry),
@@ -501,8 +502,10 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
     Some(true)
 }
 
+/// Words end at white space, punctuation and symbols, Unicode ones
+/// included: GLib's `g_unichar_ispunct`, as the reference uses.
 fn is_word_break(character: char) -> bool {
-    character.is_whitespace() || character.is_ascii_punctuation()
+    character.is_whitespace() || character.is_punctuation()
 }
 
 fn forward_word(text: &str, position: i32) -> i32 {
@@ -515,7 +518,7 @@ fn forward_word(text: &str, position: i32) -> i32 {
             return index as i32;
         }
     }
-    text.len() as i32
+    characters.len() as i32
 }
 
 fn backward_word(text: &str, position: i32) -> i32 {
@@ -680,5 +683,19 @@ mod tests {
         assert_eq!(backward_word("one two three", 13), 4);
         assert_eq!(backward_word("one two three", 8), 4);
         assert_eq!(backward_word("alpha", 3), 0);
+    }
+
+    #[test]
+    fn word_motion_counts_characters_and_breaks_at_unicode_punctuation() {
+        // Inverted question mark and guillemets are punctuation, the euro
+        // sign a symbol; GLib breaks words at both.
+        assert_eq!(forward_word("café¿uno dos", 0), 5);
+        assert_eq!(forward_word("«hola» adiós", 1), 7);
+        assert_eq!(forward_word("1€ más", 0), 3);
+        assert_eq!(backward_word("café¿uno dos", 8), 0);
+        assert_eq!(backward_word("café¿uno dos", 12), 5);
+        // The end of the text is a character position, not a byte offset.
+        assert_eq!(forward_word("añejo", 1), 5);
+        assert_eq!(forward_word("über", 0), 4);
     }
 }
