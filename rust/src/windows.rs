@@ -9,6 +9,7 @@ use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
 use crate::filter::matches_all_words;
+use crate::icons::load_icon_from_name;
 use crate::ipc::{self, TreeReply};
 use crate::keybindings::{navigate, wm_cli};
 use crate::pages::{select_first_row, DialogPage};
@@ -63,7 +64,12 @@ impl WindowsPage {
         view.set_fixed_height_mode(true);
         view.set_enable_search(false);
         view.selection().set_mode(gtk::SelectionMode::Single);
+        // With a fixed height GTK sizes the column from one row: a fixed
+        // size keeps every icon shown when that row has none.
         let icon_renderer = gtk::CellRendererPixbuf::new();
+        if icon_size > 0 {
+            icon_renderer.set_fixed_size(icon_size, icon_size);
+        }
         let icon_column =
             gtk::TreeViewColumn::with_attributes("App", &icon_renderer, &[("pixbuf", ICON as i32)]);
         icon_column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
@@ -191,7 +197,13 @@ fn add_tree(model: &gtk::ListStore, node: &TreeReply, is_wayland: bool, icon_siz
             .as_ref()
             .and_then(|properties| properties.instance.as_deref())
             .or(node.app_id.as_deref());
-        if let Some(icon) = load_icon_from_app_name(icon_name, icon_size) {
+        let icon = load_icon_from_app_name(icon_name, icon_size).or_else(|| {
+            // The app has no icon, or it cannot be loaded.
+            gtk::IconTheme::default().and_then(|theme| {
+                load_icon_from_name(&theme, "application-x-executable", icon_size)
+            })
+        });
+        if let Some(icon) = icon {
             model.set(&row, &[(ICON, &icon), (TITLE, &node.name), (ID, &node.id)]);
         } else {
             model.set(&row, &[(TITLE, &node.name), (ID, &node.id)]);
