@@ -23,8 +23,8 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   ported), but some large ones still need porting: running a keybinding
   from the keybindings page (#158–#161), the keys the window manager binds
   (#170), window-manager and desktop keys while ilia is open (#171),
-  matching and ranking (#169), launching desktop entries per the Desktop
-  Entry spec (#168), and faster apps start-up (#162). See
+  launching desktop entries per the Desktop Entry spec (#168), and faster
+  apps start-up (#162). See
   [Differences from upstream](#differences-from-upstream). That list was
   made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
   running both builds side by side under i3 and sway.
@@ -76,6 +76,10 @@ of the dialog chrome, the Ctrl+$ fix of #171 with Unicode word motion, #150,
 Vala-era packaging files. Each commit updates the parity suite where it
 asserted the old behaviour.
 
+Then #169 (matching and ranking) in one commit, together with the rest of
+#134 (standard input read while the window is open) and the additions
+listed under "In the port but not (known to be) upstream".
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -95,26 +99,29 @@ placeholder; #155 right Super closes; #167 no GTK criticals for native
 Wayland windows.
 
 **Ported in this repository** (one commit each, with a unit test or a
-headless check against the Vala build): #138 a "Could not load
-notifications" row when the rofication daemon is missing or silent (the
-port already read the list off the main thread with a timeout); #141 the
-sway socket read from `SWAYSOCK` (an earlier version of this README listed
-#141 as already in the port, but a stale `I3SOCK` still won over
-`SWAYSOCK` under sway); #143 close before a suspend or a screen lock;
-#145 entry text applied to the switched page; #146 version string 0.19;
-#147 dialog windows listed on i3; #148 files found by content; #149 the
-Windows page keeps its icon column; #150 the first match highlighted for
-new text after arrow keys; #151 apps searched by generic name, keywords and
-comment; #152 new last notification highlighted after deleting the last
-one; #156 each command listed once, only executables; #157 paste without
-blocking on the clipboard owner; #165 no page icon in the entry after a
-tab switch, and the app-grid icon on the Applications tab; #166 stay open
-on sway when the seat's last keyboard goes away.
+headless check against the Vala build): #134 large text lists filter
+without blocking, and standard input is read in the background, so complete
+lines join the list while the producer is still writing; #138 a "Could not
+load notifications" row when the rofication daemon is missing or silent
+(the port already read the list off the main thread with a timeout); #141
+the sway socket read from `SWAYSOCK` (an earlier version of this README
+listed #141 as already in the port, but a stale `I3SOCK` still won over
+`SWAYSOCK` under sway); #143 close before a suspend or a screen lock; #145
+entry text applied to the switched page; #146 version string 0.19; #147
+dialog windows listed on i3; #148 files found by content; #149 the Windows
+page keeps its icon column; #150 the first match highlighted for new text
+after arrow keys; #151 apps searched by generic name, keywords and comment;
+#152 new last notification highlighted after deleting the last one; #156
+each command listed once, only executables; #157 paste without blocking on
+the clipboard owner; #165 no page icon in the entry after a tab switch, and
+the app-grid icon on the Applications tab; #166 stay open on sway when the
+seat's last keyboard goes away; #169 name matches ranked first in seven
+groups, accents, marks and case folded on every filtering page, opt-in
+subsequence matching (`fuzzy-matching`), `match-fields`, and `hidden-apps`
+with Ctrl+Delete.
 
 **Partly ported:**
 
-- #134: large text lists filter without blocking, but stdin is still read
-  to the end before the window opens, so a slow producer delays it.
 - #171: only its Ctrl+$ fix (see below).
 
 **Not yet ported** (open items):
@@ -128,8 +135,6 @@ on sway when the seat's last keyboard goes away.
   main thread (the apps page opens about 20–30 % later than ilia's).
 - #168: launch desktop entries per the Desktop Entry spec (field codes,
   `Path`, D-Bus activation) when `systemd-run` wraps the launch.
-- #169: rank name matches first, ignore accents, optional fuzzy matching,
-  hidden apps (Ctrl+Delete), `match-fields`.
 - #170: the keybindings page shows the keys the window manager binds.
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
@@ -150,7 +155,12 @@ valid UTF-8 print back byte-exact; one notification missing a field no
 longer empties the list; a non-UTF-8 argument no longer aborts; a broken
 `-t` stylesheet is reported and the default style is used; the Commands
 list stays sorted while PATH is scanned. Files shows up to 1000 results
-(upstream: 100).
+(upstream: 100). With #169: changes to `fuzzy-matching`, `match-fields` and
+`hidden-apps` apply while the launcher runs (upstream reads them at
+start-up), keeping the highlighted row when the list is rebuilt; a
+`hidden-apps` entry starting with `!` lists again what it matches, the last
+fitting entry deciding; Ctrl+z undoes this run's Ctrl+Delete hides, latest
+first.
 
 ## Build
 
@@ -272,6 +282,16 @@ Ilia supports the following configuration via gsettings under the namespace `org
 - window-width: width of window in pixels
 - window-height: height of window in pixels
 - icon-size: size of icons in pixels or 0 to disable icons
+- fuzzy-matching: also list rows whose main text holds the characters of
+  each typed word in order, after the other matches (default `false`)
+- match-fields: application fields searched besides the name, any of
+  `generic-name`, `keywords` and `comment` (default: all three)
+- hidden-apps: desktop ids, or patterns with `*` and `?`, of applications
+  never listed; an entry starting with `!` lists again what it matches.
+  Ctrl+Delete on the Applications page adds the highlighted app, Ctrl+z
+  takes it out again (default `[]`)
+
+Changes to these three keys apply while ilia runs.
 
 #### Example: Resetting screen width
 

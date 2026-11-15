@@ -470,6 +470,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_folds_both_fields_and_never_matches_by_subsequence() {
+        // Accents, marks, case and compatibility forms are folded away in
+        // the query, the detail and the application name alike.
+        assert!(matches_query("cafe", "Build ready\nCAFÉ served", "Builder"));
+        assert!(matches_query("CAFÉ", "cafe", ""));
+        assert!(matches_query("STRASSE", "", "Straße Maps"));
+        assert!(matches_query("file", "ﬁle saved", ""));
+        // Each word in either field, folded.
+        assert!(matches_query("pret strasse", "Café prêt", "Straße Maps"));
+        // Notifications never match by subsequence.
+        assert!(!matches_query("cfe", "Café", "Builder"));
+    }
+
+    #[test]
     fn id_parsing_follows_int_parse() {
         assert_eq!(parse_int("11"), 11);
         assert_eq!(parse_int("-4"), -4);

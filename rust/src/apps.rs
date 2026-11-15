@@ -10,15 +10,20 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk::prelude::*;
 
-use crate::filter::matches_all_words;
-use crate::pages::{select_first_row, DialogPage};
+use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
+use crate::pages::{
+    rebuild_keeping_selection, select_first_row, select_row_near, DialogPage, FUZZY_MATCHING,
+};
 use crate::runner::runner_app_info;
 
 const ICON: u32 = 0;
 const NAME: u32 = 1;
-const KEYWORDS: u32 = 2;
-const APP_INFO: u32 = 3;
+const APP_INFO: u32 = 2;
+// The index of the row's app in the page's `AppList`.
+const INDEX: u32 = 3;
 const HISTORY_MAX_LEN: usize = 32;
+const HIDDEN_APPS: &str = "hidden-apps";
+const MATCH_FIELDS: &str = "match-fields";
 
 pub struct ApplicationsPage {
     entry: gtk::Entry,
@@ -28,7 +33,10 @@ pub struct ApplicationsPage {
     root: gtk::Widget,
     settings: gio::Settings,
     launch_history: Rc<RefCell<Vec<String>>>,
-    launch_counts: Rc<HashMap<String, usize>>,
+    apps: Rc<AppList>,
+    // The desktop ids this run's Ctrl+Delete hides appended to
+    // `hidden-apps`, latest last, less those Ctrl+z has reversed.
+    hides: RefCell<Vec<String>>,
     post_launch_sleep: u64,
     quit: Rc<dyn Fn()>,
 }
@@ -40,35 +48,32 @@ impl ApplicationsPage {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let mut counts = HashMap::new();
+        let mut launch_counts = HashMap::new();
         for id in &launch_history {
-            *counts.entry(id.clone()).or_insert(0) += 1;
+            *launch_counts.entry(id.clone()).or_insert(0) += 1;
         }
-        let launch_counts = Rc::new(counts);
         let icon_size = settings.int("icon-size");
         let post_launch_sleep = settings.int("post-launch-sleep").max(0) as u64;
 
         let model = gtk::ListStore::new(&[
             Pixbuf::static_type(),
             String::static_type(),
-            String::static_type(),
             gio::DesktopAppInfo::static_type(),
+            u32::static_type(),
         ]);
+        // Hidden apps get rows too, which the filter leaves out: one that
+        // stops being hidden while the launcher runs comes back as it was.
+        let apps = Rc::new(AppList::new(
+            load_apps(&model, icon_size, &launch_counts),
+            AppSettings::read(&settings),
+        ));
         let filter = gtk::TreeModelFilter::new(&model, None);
-        let entry_for_filter = entry.clone();
+        let apps_for_filter = apps.clone();
         filter.set_visible_func(move |tree_model, iter| {
-            // Each word may match the name or the keywords.
-            matches_all_words(
-                entry_for_filter.text().as_str(),
-                &[
-                    &string_value(tree_model, iter, NAME as i32),
-                    &string_value(tree_model, iter, KEYWORDS as i32),
-                ],
-            )
+            apps_for_filter.is_listed(index_value(tree_model, iter))
         });
 
-        load_apps(&model, icon_size);
-        install_sort(&model, &entry, &launch_counts);
+        install_sort(&model, &apps);
         model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
 
         let view = gtk::TreeView::with_model(&filter);
@@ -105,11 +110,13 @@ impl ApplicationsPage {
             root: scrolled.upcast(),
             settings,
             launch_history: Rc::new(RefCell::new(launch_history)),
-            launch_counts,
+            apps,
+            hides: RefCell::default(),
             post_launch_sleep,
             quit,
         };
         page.connect_activation();
+        page.follow_settings();
         page.set_selection();
         if icon_size > 0 {
             load_icons_in_background(&page.model, icon_size);
@@ -191,6 +198,124 @@ impl ApplicationsPage {
         }
         true
     }
+
+    /// Applies changes another program makes to `fuzzy-matching`,
+    /// `match-fields` and `hidden-apps` while the launcher runs: the rows are
+    /// matched, grouped and sorted again for the same filter text, keeping
+    /// the highlighted app (see [`rebuild_keeping_selection`]).
+    fn follow_settings(&self) {
+        for key in [FUZZY_MATCHING, MATCH_FIELDS, HIDDEN_APPS] {
+            let (apps, model, filter, view) = (
+                self.apps.clone(),
+                self.model.clone(),
+                self.filter.clone(),
+                self.view.clone(),
+            );
+            self.settings
+                .connect_changed(Some(key), move |settings, _| {
+                    // The page's own Ctrl+Delete and Ctrl+z writes are applied
+                    // already.
+                    let settings = AppSettings::read(settings);
+                    if apps.settings() != settings {
+                        rebuild_keeping_selection(&view, &filter, || {
+                            apps.apply_settings(settings);
+                            install_sort(&model, &apps);
+                            filter.refilter();
+                        });
+                    }
+                });
+        }
+    }
+
+    /// The `hidden-apps` setting as stored now.
+    fn stored_hidden(&self) -> Vec<String> {
+        self.settings
+            .strv(HIDDEN_APPS)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Applies the `hidden-apps` entries `hidden` to the rows, then stores
+    /// them; whether they were stored. Applied before it is written, the
+    /// change notification for the write finds nothing new to apply.
+    fn store_hidden(&self, hidden: Vec<String>, id: &str) -> bool {
+        self.apps.apply_settings(AppSettings {
+            hidden: hidden.clone(),
+            ..self.apps.settings()
+        });
+        let stored = match self.settings.set_strv(HIDDEN_APPS, hidden) {
+            Ok(()) => {
+                gio::Settings::sync();
+                true
+            }
+            Err(error) => {
+                eprintln!("Failed to change whether {id} is hidden: {error}");
+                false
+            }
+        };
+        self.filter.refilter();
+        stored
+    }
+
+    /// Hides the highlighted app: appends its plain desktop id to the
+    /// `hidden-apps` setting as stored now, after every entry already there,
+    /// and removes its row. The row taking its place is highlighted, or the
+    /// new last row when it was the last.
+    fn hide_selected(&self) {
+        let Some((model, iter)) = self.view.selection().selected() else {
+            return;
+        };
+        let Some(path) = model.path(&iter) else {
+            return;
+        };
+        let id = self.apps.id(index_value(&model, &iter));
+
+        let mut hidden = self.stored_hidden();
+        let appended = append_last(&mut hidden, &id);
+        if self.store_hidden(hidden, &id) && appended {
+            self.hides.borrow_mut().push(id);
+        }
+        select_row_near(&self.view, path.indices().first().copied().unwrap_or(0));
+    }
+
+    /// Reverses the latest hide of this run that Ctrl+z has not reversed
+    /// yet: deletes the last entry equal to the id it appended from the
+    /// `hidden-apps` setting as stored now, every other entry staying where
+    /// it is. When the app is then listed, its row is highlighted; otherwise
+    /// the highlight stays where it is (see [`rebuild_keeping_selection`]).
+    /// When another program has taken the id out, that hide is reversed
+    /// without changing anything.
+    fn undo_hide(&self) {
+        let Some(id) = self.hides.borrow_mut().pop() else {
+            return;
+        };
+        let mut hidden = self.stored_hidden();
+        if !remove_last(&mut hidden, &id) {
+            return;
+        }
+        rebuild_keeping_selection(&self.view, &self.filter, || {
+            self.store_hidden(hidden, &id);
+        });
+        let restored = self
+            .apps
+            .index_of(&id)
+            .and_then(|index| self.listed_path(index));
+        if let Some(path) = restored {
+            self.view
+                .set_cursor(&path, None::<&gtk::TreeViewColumn>, false);
+        }
+    }
+
+    /// The path of the row listing the app with the index `index`, or
+    /// `None` when it is not listed.
+    fn listed_path(&self, index: usize) -> Option<gtk::TreePath> {
+        (0..self.filter.iter_n_children(None)).find_map(|row| {
+            let iter = self.filter.iter_nth_child(None, row)?;
+            (index_value(&self.filter, &iter) == index)
+                .then(|| gtk::TreePath::from_indicesv(&[row]))
+        })
+    }
 }
 
 impl DialogPage for ApplicationsPage {
@@ -199,7 +324,8 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn on_entry_changed(&self) {
-        install_sort(&self.model, &self.entry, &self.launch_counts);
+        self.apps.rank(self.entry.text().as_str());
+        install_sort(&self.model, &self.apps);
         self.filter.refilter();
         self.set_selection();
     }
@@ -225,10 +351,30 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
-        [("enter", "Launch Application")].into_iter().collect()
+        [
+            ("enter", "Launch Application"),
+            ("ctrl+delete", "Hide Application"),
+            ("ctrl+z", "Undo Hide"),
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn key_event(&self, event: &gdk::EventKey) -> bool {
+        if event.keyval() == gdk::keys::constants::Delete
+            && event.state().contains(gdk::ModifierType::CONTROL_MASK)
+        {
+            // Taken with no row highlighted too: on this page Ctrl+Delete
+            // never edits the filter text.
+            self.hide_selected();
+            return true;
+        }
+        if event.keyval() == gdk::keys::constants::z
+            && event.state().contains(gdk::ModifierType::CONTROL_MASK)
+        {
+            self.undo_hide();
+            return true;
+        }
         self.navigate(event)
     }
 
@@ -241,15 +387,11 @@ impl DialogPage for ApplicationsPage {
     }
 }
 
-fn string_value(
-    model: &impl glib::IsA<gtk::TreeModel>,
-    iter: &gtk::TreeIter,
-    column: i32,
-) -> String {
+fn index_value(model: &impl glib::IsA<gtk::TreeModel>, iter: &gtk::TreeIter) -> usize {
     model
-        .value(iter, column)
-        .get::<String>()
-        .unwrap_or_default()
+        .value(iter, INDEX as i32)
+        .get::<u32>()
+        .unwrap_or_default() as usize
 }
 
 fn app_value(
@@ -262,7 +404,15 @@ fn app_value(
         .ok()
 }
 
-fn load_apps(model: &gtk::ListStore, icon_size: i32) {
+/// Adds a row to `model` for each app to show, hidden ones included, and
+/// returns the apps by the INDEX of their rows. There is one app per desktop
+/// id: GIO takes each id from the first directory of the Desktop Entry
+/// search order that has it, `XDG_DATA_HOME` and then `XDG_DATA_DIRS`.
+fn load_apps(
+    model: &gtk::ListStore,
+    icon_size: i32,
+    launch_counts: &HashMap<String, usize>,
+) -> Vec<App> {
     let blank = if icon_size > 0 {
         Pixbuf::new(Colorspace::Rgb, true, 8, icon_size, icon_size).map(|pixbuf| {
             pixbuf.fill(0);
@@ -272,6 +422,7 @@ fn load_apps(model: &gtk::ListStore, icon_size: i32) {
         None
     };
 
+    let mut apps = Vec::new();
     for app in gio::AppInfo::all() {
         let Some(id) = app.id() else {
             continue;
@@ -283,70 +434,382 @@ fn load_apps(model: &gtk::ListStore, icon_size: i32) {
             continue;
         }
         let name = desktop.name().to_string();
-        let keywords = search_text(&desktop);
-        let iter = model.append();
+        let index = apps.len() as u32;
+        let mut values: Vec<(u32, &dyn ToValue)> =
+            vec![(NAME, &name), (APP_INFO, &desktop), (INDEX, &index)];
         if let Some(blank) = blank.as_ref() {
-            model.set(
-                &iter,
-                &[
-                    (ICON, blank),
-                    (NAME, &name),
-                    (KEYWORDS, &keywords),
-                    (APP_INFO, &desktop),
-                ],
-            );
-        } else {
-            model.set(
-                &iter,
-                &[(NAME, &name), (KEYWORDS, &keywords), (APP_INFO, &desktop)],
-            );
+            values.push((ICON, blank));
         }
+        model.insert_with_values(None, &values);
+        let all = AppText::new(&desktop, MatchFields::ALL);
+        apps.push(App {
+            launches: launch_counts.get(id.as_str()).copied().unwrap_or_default(),
+            lowercase_name: name.to_lowercase(),
+            text: all.clone(),
+            all,
+            id: id.into(),
+        });
     }
+    apps
 }
 
-fn install_sort(
-    model: &gtk::ListStore,
-    entry: &gtk::Entry,
-    launch_counts: &Rc<HashMap<String, usize>>,
-) {
-    let entry = entry.clone();
-    let launch_counts = launch_counts.clone();
+fn install_sort(model: &gtk::ListStore, apps: &Rc<AppList>) {
+    let apps = apps.clone();
     model.set_sort_func(gtk::SortColumn::Index(NAME), move |model, a, b| {
-        let query = entry.text().to_lowercase();
-        let a_name = string_value(model, a, NAME as i32).to_lowercase();
-        let b_name = string_value(model, b, NAME as i32).to_lowercase();
-        let a_id = app_value(model, a)
-            .and_then(|app| app.id())
-            .map(|id| id.to_string())
-            .unwrap_or_default();
-        let b_id = app_value(model, b)
-            .and_then(|app| app.id())
-            .map(|id| id.to_string())
-            .unwrap_or_default();
-        compare_apps(&a_name, &b_name, &a_id, &b_id, &query, &launch_counts)
+        apps.compare(index_value(model, a), index_value(model, b))
     });
 }
 
-fn compare_apps(
-    a_name: &str,
-    b_name: &str,
-    a_id: &str,
-    b_id: &str,
-    query: &str,
-    launch_counts: &HashMap<String, usize>,
-) -> Ordering {
-    if query.len() > 1 {
-        let a_prefix = a_name.starts_with(query);
-        let b_prefix = b_name.starts_with(query);
-        match (a_prefix, b_prefix) {
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            _ => {}
+/// Whether the `hidden-apps` entries `hidden` hide the desktop id `id`. An
+/// entry is an id or a pattern; one starting with `!` makes what the rest of
+/// it fits visible again. The last entry that fits decides.
+fn is_hidden(id: &str, hidden: &[String]) -> bool {
+    hidden
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.strip_prefix('!') {
+            Some(pattern) => fits_pattern(pattern, id).then_some(false),
+            None => fits_pattern(entry, id).then_some(true),
+        })
+        .unwrap_or(false)
+}
+
+/// Appends `id` to `hidden`, after every entry, unless it is the last entry
+/// already; whether it was appended. Placed last, the plain id decides over
+/// any earlier `!` entry.
+fn append_last(hidden: &mut Vec<String>, id: &str) -> bool {
+    if hidden.last().map(String::as_str) == Some(id) {
+        return false;
+    }
+    hidden.push(id.to_owned());
+    true
+}
+
+/// Deletes the last entry of `hidden` equal to `id`, leaving the others in
+/// their order; whether there was one.
+fn remove_last(hidden: &mut Vec<String>, id: &str) -> bool {
+    match hidden.iter().rposition(|entry| entry == id) {
+        Some(position) => {
+            hidden.remove(position);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether `text` fits `pattern`, in which `*` stands for any run of
+/// characters, `?` for exactly one character, and every other character for
+/// itself.
+fn fits_pattern(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    // The position of the last `*` passed, and where the text its run
+    // covers ends.
+    let mut star = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&character) if character == '?' || character == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            // Let the last `*` cover one more character, or fail.
+            _ => {
+                let Some((star_p, star_t)) = star else {
+                    return false;
+                };
+                star = Some((star_p, star_t + 1));
+                p = star_p + 1;
+                t = star_t + 1;
+            }
         }
     }
-    let a_count = launch_counts.get(a_id).copied().unwrap_or_default();
-    let b_count = launch_counts.get(b_id).copied().unwrap_or_default();
-    b_count.cmp(&a_count).then_with(|| a_name.cmp(b_name))
+    pattern[p..].iter().all(|&character| character == '*')
+}
+
+/// The app fields the filter searches besides the name, which it always
+/// searches: the `match-fields` setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MatchFields {
+    generic_name: bool,
+    keywords: bool,
+    comment: bool,
+}
+
+impl MatchFields {
+    const ALL: Self = Self {
+        generic_name: true,
+        keywords: true,
+        comment: true,
+    };
+
+    /// The fields `names` names; other names are ignored.
+    fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut fields = Self::default();
+        for name in names {
+            match name {
+                "generic-name" => fields.generic_name = true,
+                "keywords" => fields.keywords = true,
+                "comment" => fields.comment = true,
+                _ => {}
+            }
+        }
+        fields
+    }
+}
+
+/// An app's text as the filter compares it: folded, and empty for the
+/// fields the filter does not search.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AppText {
+    name: String,
+    generic_name: String,
+    // Separated by spaces, which no filter word holds: a word matches within
+    // one keyword.
+    keywords: String,
+    comment: String,
+}
+
+impl AppText {
+    fn new(desktop: &gio::DesktopAppInfo, fields: MatchFields) -> Self {
+        let fold =
+            |text: Option<glib::GString>| text.map_or_else(String::new, |text| fold_text(&text));
+        Self {
+            name: fold_text(&desktop.name()),
+            generic_name: fold(desktop.generic_name().filter(|_| fields.generic_name)),
+            keywords: if fields.keywords {
+                fold_text(&desktop.keywords().join(" "))
+            } else {
+                String::new()
+            },
+            comment: fold(desktop.description().filter(|_| fields.comment)),
+        }
+    }
+
+    /// The same text with only the fields `fields` searched.
+    fn only(&self, fields: MatchFields) -> Self {
+        let field = |text: &String, searched: bool| {
+            if searched {
+                text.clone()
+            } else {
+                String::new()
+            }
+        };
+        Self {
+            name: self.name.clone(),
+            generic_name: field(&self.generic_name, fields.generic_name),
+            keywords: field(&self.keywords, fields.keywords),
+            comment: field(&self.comment, fields.comment),
+        }
+    }
+
+    /// The group the app is listed in for the filter `words`, or `None` when
+    /// it does not match. `words` is not empty. Subsequences of the name
+    /// count only when `subsequence` is set.
+    fn tier(&self, words: &[String], subsequence: bool) -> Option<AppTier> {
+        let name = self.name.as_str();
+        let query = words.join(" ");
+        let tier = if name == query {
+            AppTier::Exact
+        } else if name.starts_with(&query) {
+            AppTier::Prefix
+        } else if words.iter().all(|word| begins_word(name, word)) {
+            AppTier::WordStarts
+        } else if words_in_fields(words, &[name]) {
+            AppTier::InName
+        } else if words_in_fields(words, &[name, &self.generic_name]) {
+            AppTier::InGenericName
+        } else if words_in_fields(
+            words,
+            &[name, &self.generic_name, &self.keywords, &self.comment],
+        ) {
+            AppTier::InOtherFields
+        } else if subsequence {
+            return summed_span(words, &[name]).map(AppTier::Subsequence);
+        } else {
+            return None;
+        };
+        Some(tier)
+    }
+}
+
+/// Whether `word` begins a word of `text`, a longest run of letters and
+/// digits.
+fn begins_word(text: &str, word: &str) -> bool {
+    text.split(|character: char| !character.is_alphanumeric())
+        .any(|text_word| text_word.starts_with(word))
+}
+
+/// The groups the apps matching a filter are listed in, best first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AppTier {
+    /// The name is the filter.
+    Exact,
+    /// The name begins with the filter.
+    Prefix,
+    /// Every word begins a word of the name.
+    WordStarts,
+    /// Every word occurs in the name.
+    InName,
+    /// Every word occurs in the name or the generic name.
+    InGenericName,
+    /// Some word needs the keywords or the comment.
+    InOtherFields,
+    /// Every word is a subsequence of the name; the summed span.
+    Subsequence(usize),
+}
+
+/// An app on the page.
+#[derive(Debug)]
+struct App {
+    id: String,
+    launches: usize,
+    // The order of an unfiltered list.
+    lowercase_name: String,
+    // Every field, folded.
+    all: AppText,
+    // The fields `match-fields` lets the filter search.
+    text: AppText,
+}
+
+/// The settings that decide which apps are listed and how they match.
+#[derive(Clone, Debug, PartialEq)]
+struct AppSettings {
+    subsequence: bool,
+    fields: MatchFields,
+    hidden: Vec<String>,
+}
+
+impl AppSettings {
+    fn read(settings: &gio::Settings) -> Self {
+        Self {
+            subsequence: settings.boolean(FUZZY_MATCHING),
+            fields: MatchFields::from_names(
+                settings.strv(MATCH_FIELDS).iter().map(|name| name.as_str()),
+            ),
+            hidden: settings
+                .strv(HIDDEN_APPS)
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+}
+
+/// The apps on the page, by the INDEX of their rows, which of them are
+/// hidden, and the group of each one for the filter text.
+struct AppList {
+    apps: RefCell<Vec<App>>,
+    settings: RefCell<AppSettings>,
+    hidden: RefCell<Vec<bool>>,
+    // The words of the filter text, `None` while it is empty.
+    words: RefCell<Option<Vec<String>>>,
+    // `None` while the filter text is empty.
+    tiers: RefCell<Option<Vec<Option<AppTier>>>>,
+}
+
+impl AppList {
+    fn new(apps: Vec<App>, settings: AppSettings) -> Self {
+        let list = Self {
+            hidden: RefCell::new(vec![false; apps.len()]),
+            apps: RefCell::new(apps),
+            settings: RefCell::new(settings.clone()),
+            words: RefCell::default(),
+            tiers: RefCell::default(),
+        };
+        list.update(&settings, true);
+        list
+    }
+
+    fn id(&self, index: usize) -> String {
+        self.apps.borrow()[index].id.clone()
+    }
+
+    /// The index of the app with the desktop id `id`.
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.apps.borrow().iter().position(|app| app.id == id)
+    }
+
+    fn settings(&self) -> AppSettings {
+        self.settings.borrow().clone()
+    }
+
+    /// Takes new settings; whether they differ from those applied. The apps
+    /// are then grouped again for the same filter text.
+    fn apply_settings(&self, settings: AppSettings) -> bool {
+        let old = self.settings.replace(settings.clone());
+        if old == settings {
+            return false;
+        }
+        self.update(&settings, old.fields != settings.fields);
+        self.regroup();
+        true
+    }
+
+    fn update(&self, settings: &AppSettings, fields_changed: bool) {
+        let apps = &mut *self.apps.borrow_mut();
+        if fields_changed {
+            for app in apps.iter_mut() {
+                app.text = app.all.only(settings.fields);
+            }
+        }
+        *self.hidden.borrow_mut() = apps
+            .iter()
+            .map(|app| is_hidden(&app.id, &settings.hidden))
+            .collect();
+    }
+
+    /// Groups the apps for the filter text `text`. Text of white space alone
+    /// has no words and lists the apps as an empty filter does.
+    fn rank(&self, text: &str) {
+        let words = query_words(text);
+        self.words.replace((!words.is_empty()).then_some(words));
+        self.regroup();
+    }
+
+    fn regroup(&self) {
+        let subsequence = self.settings.borrow().subsequence;
+        let tiers = self.words.borrow().as_ref().map(|words| {
+            self.apps
+                .borrow()
+                .iter()
+                .map(|app| app.text.tier(words, subsequence))
+                .collect()
+        });
+        self.tiers.replace(tiers);
+    }
+
+    fn is_listed(&self, index: usize) -> bool {
+        !self.hidden.borrow().get(index).copied().unwrap_or(true)
+            && self
+                .tiers
+                .borrow()
+                .as_ref()
+                .is_none_or(|tiers| tiers[index].is_some())
+    }
+
+    /// The order of two apps: without a filter, launches first, then the
+    /// name; with one, the group, launches, the folded name, and the desktop
+    /// id.
+    fn compare(&self, a: usize, b: usize) -> Ordering {
+        let apps = self.apps.borrow();
+        let (app_a, app_b) = (&apps[a], &apps[b]);
+        match self.tiers.borrow().as_ref() {
+            None => app_b
+                .launches
+                .cmp(&app_a.launches)
+                .then_with(|| app_a.lowercase_name.cmp(&app_b.lowercase_name)),
+            Some(tiers) => tiers[a]
+                .cmp(&tiers[b])
+                .then(app_b.launches.cmp(&app_a.launches))
+                .then_with(|| app_a.text.name.cmp(&app_b.text.name))
+                .then_with(|| app_a.id.cmp(&app_b.id)),
+        }
+    }
 }
 
 fn execute_app(
@@ -461,44 +924,19 @@ fn load_icon(theme: &gtk::IconTheme, app: &gio::DesktopAppInfo, icon_size: i32) 
     None
 }
 
-/// The text the Applications page searches besides the app name: the
-/// generic name, the keywords and the comment, as the desktop entry gives
-/// them for the current locale. Each part is optional; they are separated by
-/// spaces so words from different parts do not run together.
-fn search_text(desktop: &gio::DesktopAppInfo) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(generic_name) = desktop.generic_name() {
-        parts.push(generic_name.to_string());
-    }
-    parts.extend(desktop.keywords().iter().map(|keyword| keyword.to_string()));
-    if let Some(comment) = desktop.description() {
-        parts.push(comment.to_string());
-    }
-    parts.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{compare_apps, search_text};
-    use std::cmp::Ordering;
-    use std::collections::HashMap;
+    use super::{
+        append_last, fits_pattern, is_hidden, remove_last, App, AppList, AppSettings, AppText,
+        AppTier, MatchFields,
+    };
+    use crate::filter::{fold_text, query_words};
 
-    #[test]
-    fn app_sort_prefers_prefix_then_history_then_name() {
-        let counts = HashMap::from([("popular.desktop".to_owned(), 2)]);
-        assert_eq!(
-            compare_apps("alpha", "my alpha", "a", "popular.desktop", "al", &counts),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_apps("zeta", "alpha", "popular.desktop", "a", "", &counts),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_apps("alpha", "zeta", "a", "z", "", &HashMap::new()),
-            Ordering::Less
-        );
-    }
+    const ALL_FIELDS: MatchFields = MatchFields {
+        generic_name: true,
+        keywords: true,
+        comment: true,
+    };
 
     fn desktop_entry(lines: &str) -> gio::DesktopAppInfo {
         let keyfile = glib::KeyFile::new();
@@ -511,19 +949,440 @@ mod tests {
         gio::DesktopAppInfo::from_keyfile(&keyfile).unwrap()
     }
 
+    // An app's text, folded as the page folds it.
+    fn text(name: &str, generic_name: &str, keywords: &str, comment: &str) -> AppText {
+        AppText {
+            name: fold_text(name),
+            generic_name: fold_text(generic_name),
+            keywords: fold_text(keywords),
+            comment: fold_text(comment),
+        }
+    }
+
+    fn named(name: &str) -> AppText {
+        text(name, "", "", "")
+    }
+
+    fn tier(text: &AppText, query: &str, subsequence: bool) -> Option<AppTier> {
+        text.tier(&query_words(query), subsequence)
+    }
+
+    fn app(id: &str, launches: usize, text: AppText) -> App {
+        App {
+            id: id.to_owned(),
+            launches,
+            lowercase_name: text.name.clone(),
+            all: text.clone(),
+            text,
+        }
+    }
+
+    fn settings(subsequence: bool, hidden: &[&str]) -> AppSettings {
+        AppSettings {
+            subsequence,
+            fields: ALL_FIELDS,
+            hidden: hidden.iter().map(|entry| entry.to_string()).collect(),
+        }
+    }
+
+    // The ids of the apps `list` lists, in order.
+    fn rows(list: &AppList) -> Vec<String> {
+        let count = list.apps.borrow().len();
+        let mut rows: Vec<usize> = (0..count).filter(|&index| list.is_listed(index)).collect();
+        rows.sort_by(|&a, &b| list.compare(a, b));
+        rows.into_iter().map(|index| list.id(index)).collect()
+    }
+
+    // The ids of the apps listed for `query`, in order.
+    fn listed(apps: Vec<App>, query: &str, subsequence: bool) -> Vec<String> {
+        let list = AppList::new(apps, settings(subsequence, &[]));
+        list.rank(query);
+        rows(&list)
+    }
+
     #[test]
-    fn search_text_holds_generic_name_keywords_and_comment() {
-        // Keywords count without a comment.
+    fn match_fields_ignore_unknown_names() {
         assert_eq!(
-            search_text(&desktop_entry("Keywords=Preferences;Settings;\n")),
-            "Preferences Settings"
+            MatchFields::from_names(["generic-name", "keywords", "comment"]),
+            ALL_FIELDS
         );
         assert_eq!(
-            search_text(&desktop_entry(
-                "GenericName=Web Browser\nKeywords=Internet;WWW;\nComment=Browse the web\n"
-            )),
-            "Web Browser Internet WWW Browse the web"
+            MatchFields::from_names(["name", "Comment", "comment", "comment"]),
+            MatchFields {
+                comment: true,
+                ..MatchFields::default()
+            }
         );
-        assert_eq!(search_text(&desktop_entry("")), "");
+        assert_eq!(MatchFields::from_names([]), MatchFields::default());
+    }
+
+    #[test]
+    fn app_text_is_folded_and_leaves_out_fields_not_searched() {
+        let desktop = desktop_entry(
+            "GenericName=Web Browser\nKeywords=Internet;WWW;\nComment=Browse the Café\n",
+        );
+        assert_eq!(
+            AppText::new(&desktop, ALL_FIELDS),
+            AppText {
+                name: "fixture".to_owned(),
+                generic_name: "web browser".to_owned(),
+                keywords: "internet www".to_owned(),
+                comment: "browse the cafe".to_owned(),
+            }
+        );
+        assert_eq!(
+            AppText::new(
+                &desktop,
+                MatchFields {
+                    keywords: true,
+                    ..MatchFields::default()
+                }
+            ),
+            AppText {
+                name: "fixture".to_owned(),
+                keywords: "internet www".to_owned(),
+                ..AppText::default()
+            }
+        );
+        assert_eq!(
+            AppText::new(&desktop, MatchFields::default()),
+            named("Fixture")
+        );
+        assert_eq!(
+            AppText::new(&desktop_entry(""), ALL_FIELDS),
+            named("Fixture")
+        );
+    }
+
+    #[test]
+    fn tiers_go_from_the_name_to_the_other_fields() {
+        let code = |text: AppText| tier(&text, "code", false);
+        assert_eq!(code(named("Code")), Some(AppTier::Exact));
+        assert_eq!(code(named("Codec Tool")), Some(AppTier::Prefix));
+        assert_eq!(code(named("Visual Studio Code")), Some(AppTier::WordStarts));
+        assert_eq!(code(named("Barcode Reader")), Some(AppTier::InName));
+        assert_eq!(
+            code(text("Text Editor", "Source code editor", "", "")),
+            Some(AppTier::InGenericName)
+        );
+        assert_eq!(
+            code(text("Firefox", "", "code browser", "")),
+            Some(AppTier::InOtherFields)
+        );
+        assert_eq!(
+            code(text("Editor", "", "", "Edit code")),
+            Some(AppTier::InOtherFields)
+        );
+        assert_eq!(code(named("Firefox")), None);
+        // Fields the filter does not search are empty.
+        assert_eq!(code(text("Editor", "", "", "")), None);
+    }
+
+    #[test]
+    fn tiers_compare_the_folded_words_joined_by_single_spaces() {
+        let zeta_dock = |text: AppText| tier(&text, "  Zeta\t dock ", false);
+        assert_eq!(zeta_dock(named("Zeta Dock")), Some(AppTier::Exact));
+        assert_eq!(zeta_dock(named("Zeta Dockyard")), Some(AppTier::Prefix));
+        assert_eq!(zeta_dock(named("Dock-Zeta")), Some(AppTier::WordStarts));
+        assert_eq!(zeta_dock(named("Azeta Bdock")), Some(AppTier::InName));
+        assert_eq!(
+            zeta_dock(text("Zeta Station", "Dock Utilities", "", "")),
+            Some(AppTier::InGenericName)
+        );
+        assert_eq!(
+            zeta_dock(text("A Utility", "Zeta", "", "Dock")),
+            Some(AppTier::InOtherFields)
+        );
+        assert_eq!(zeta_dock(named("Zeta Only")), None);
+        assert_eq!(tier(&named("Café"), "CAFE", false), Some(AppTier::Exact));
+        assert_eq!(
+            tier(&named("Straße Planer"), "strasse", false),
+            Some(AppTier::Prefix)
+        );
+        assert_eq!(tier(&named("C"), "c", false), Some(AppTier::Exact));
+    }
+
+    #[test]
+    fn name_words_are_runs_of_letters_and_digits() {
+        assert_eq!(
+            tier(&named("Tool-λ7"), "λ7", false),
+            Some(AppTier::WordStarts)
+        );
+        assert_eq!(
+            tier(&named("Tool_λ7"), "λ7", false),
+            Some(AppTier::WordStarts)
+        );
+        assert_eq!(tier(&named("Tool9λ7"), "λ7", false), Some(AppTier::InName));
+        assert_eq!(tier(&named("Toolaλ7"), "λ7", false), Some(AppTier::InName));
+    }
+
+    #[test]
+    fn subsequences_match_the_name_alone() {
+        let firefox = text("Firefox", "Browser", "fancy fox", "Fast fox");
+        assert_eq!(tier(&firefox, "ffx", true), Some(AppTier::Subsequence(7)));
+        assert_eq!(tier(&firefox, "ffx", false), None);
+        assert_eq!(
+            tier(&text("Plain App", "", "fancy fox", ""), "ffx", true),
+            None
+        );
+        assert_eq!(
+            tier(&named("Z Qzx Vyz"), "qx vz", true),
+            Some(AppTier::Subsequence(3 + 3))
+        );
+        // Every word must be a subsequence of the name: other fields do not
+        // complete it.
+        assert_eq!(tier(&text("Axb", "", "", "cd"), "ab cd", true), None);
+        // A match by the word rule, in any field, comes first.
+        assert_eq!(
+            tier(&text("Z Utility", "", "", "qx"), "qx", true),
+            Some(AppTier::InOtherFields)
+        );
+    }
+
+    #[test]
+    fn white_space_alone_lists_apps_as_an_empty_filter_does() {
+        // The unfiltered order compares the names lowercased, not folded.
+        let unfolded = |id: &str, name: &str| App {
+            lowercase_name: name.to_lowercase(),
+            ..app(id, 0, named(name))
+        };
+        let apps = || {
+            vec![
+                unfolded("zeta.desktop", "Zeta"),
+                unfolded("eclair.desktop", "Éclair"),
+                unfolded("b.desktop", "Same"),
+                unfolded("a.desktop", "Same"),
+            ]
+        };
+        // Unfiltered: the lowercase name, in which "é" sorts after "z".
+        assert_eq!(
+            listed(apps(), "", false),
+            ["b.desktop", "a.desktop", "zeta.desktop", "eclair.desktop"]
+        );
+        // Typed white space has no words: the same rows, in the same order.
+        assert_eq!(
+            listed(apps(), " \t", false),
+            ["b.desktop", "a.desktop", "zeta.desktop", "eclair.desktop"]
+        );
+    }
+
+    #[test]
+    fn hidden_apps_come_back_and_settings_regroup_live() {
+        let list = AppList::new(
+            vec![
+                app("alpha.desktop", 3, named("Probe Alpha")),
+                app("beta.desktop", 0, text("Probe Beta", "", "needle", "")),
+                app("fafx.desktop", 0, named("Fafx")),
+            ],
+            settings(false, &["alpha.desktop"]),
+        );
+        assert_eq!(rows(&list), ["fafx.desktop", "beta.desktop"]);
+        // The same settings change nothing.
+        assert!(!list.apply_settings(settings(false, &["alpha.desktop"])));
+        // No longer hidden: back with its launches, first.
+        assert!(list.apply_settings(settings(false, &["alpha.desktop", "!alpha.desktop"])));
+        assert_eq!(
+            rows(&list),
+            ["alpha.desktop", "fafx.desktop", "beta.desktop"]
+        );
+        list.rank("ffx");
+        assert!(rows(&list).is_empty());
+        assert!(list.apply_settings(settings(true, &[])));
+        assert_eq!(rows(&list), ["fafx.desktop"]);
+        list.rank("needle");
+        assert_eq!(rows(&list), ["beta.desktop"]);
+        assert!(list.apply_settings(AppSettings {
+            fields: MatchFields::default(),
+            ..settings(true, &[])
+        }));
+        assert!(rows(&list).is_empty());
+        assert!(list.apply_settings(AppSettings {
+            fields: MatchFields::from_names(["keywords"]),
+            ..settings(true, &[])
+        }));
+        assert_eq!(rows(&list), ["beta.desktop"]);
+    }
+
+    #[test]
+    fn the_last_fitting_hidden_entry_decides() {
+        let hidden = |entries: &[&str]| -> Vec<String> {
+            entries.iter().map(|entry| entry.to_string()).collect()
+        };
+        assert!(is_hidden("vendor-a.desktop", &hidden(&["vendor-*"])));
+        assert!(!is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["vendor-*", "!vendor-a.desktop"])
+        ));
+        assert!(is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["vendor-*", "!vendor-a.desktop", "vendor-a.desktop"])
+        ));
+        assert!(is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["!vendor-a.desktop", "vendor-*"])
+        ));
+        assert!(!is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["*", "!vendor-?.desktop"])
+        ));
+        assert!(is_hidden(
+            "vendor-b.desktop",
+            &hidden(&["*", "!vendor-a.desktop"])
+        ));
+        // Entries that fit nothing decide nothing; `!` alone fits no id.
+        assert!(is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["vendor-a.desktop", "!other.desktop", "!"])
+        ));
+        assert!(!is_hidden(
+            "vendor-a.desktop",
+            &hidden(&["!vendor-a.desktop"])
+        ));
+        // The `!` is only special in front.
+        assert!(!is_hidden("vendor-a.desktop", &hidden(&["vendor-!*"])));
+    }
+
+    #[test]
+    fn hiding_appends_the_plain_id_after_every_entry() {
+        let mut hidden: Vec<String> = ["vendor-*", "!vendor-a.desktop", "other.desktop"]
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        assert!(!is_hidden("vendor-a.desktop", &hidden));
+        assert!(append_last(&mut hidden, "vendor-a.desktop"));
+        assert_eq!(
+            hidden,
+            [
+                "vendor-*",
+                "!vendor-a.desktop",
+                "other.desktop",
+                "vendor-a.desktop"
+            ]
+        );
+        // Last, the plain id overrides the earlier exception.
+        assert!(is_hidden("vendor-a.desktop", &hidden));
+        // Already the last entry (another program put it there): not again.
+        assert!(!append_last(&mut hidden, "vendor-a.desktop"));
+        assert_eq!(hidden.len(), 4);
+        // Undoing the hide gives back the list as it was.
+        assert!(remove_last(&mut hidden, "vendor-a.desktop"));
+        assert_eq!(hidden, ["vendor-*", "!vendor-a.desktop", "other.desktop"]);
+        let mut empty = Vec::new();
+        assert!(append_last(&mut empty, "a.desktop"));
+        assert_eq!(empty, ["a.desktop"]);
+    }
+
+    #[test]
+    fn undoing_a_hide_deletes_only_the_last_equal_entry() {
+        let mut hidden: Vec<String> = ["a.desktop", "x.desktop", "b*", "x.desktop", "!c"]
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        assert!(remove_last(&mut hidden, "x.desktop"));
+        assert_eq!(hidden, ["a.desktop", "x.desktop", "b*", "!c"]);
+        assert!(remove_last(&mut hidden, "x.desktop"));
+        assert_eq!(hidden, ["a.desktop", "b*", "!c"]);
+        // Patterns are not ids: only an equal entry is deleted.
+        assert!(!remove_last(&mut hidden, "b.desktop"));
+        assert!(!remove_last(&mut hidden, "x.desktop"));
+        assert_eq!(hidden, ["a.desktop", "b*", "!c"]);
+    }
+
+    #[test]
+    fn unfiltered_apps_go_by_launches_then_name() {
+        let apps = vec![
+            app("zeta.desktop", 0, named("Zeta")),
+            app("alpha.desktop", 0, named("Alpha")),
+            app("popular.desktop", 2, named("Popular")),
+        ];
+        assert_eq!(
+            listed(apps, " ", false),
+            ["popular.desktop", "alpha.desktop", "zeta.desktop"]
+        );
+    }
+
+    #[test]
+    fn filtered_apps_go_by_tier_launches_folded_name_and_id() {
+        let apps = || {
+            vec![
+                app(
+                    "firefox.desktop",
+                    10,
+                    text("Firefox", "", "code;browser", ""),
+                ),
+                app("barcode.desktop", 0, named("Barcode Reader")),
+                app("codec.desktop", 3, named("Codec Tool")),
+                app("code.desktop", 0, named("Code")),
+                app("z-codex.desktop", 1, named("Codex")),
+                app("a-codex.desktop", 1, named("Codex")),
+                app("codeé.desktop", 1, named("Codeé")),
+            ]
+        };
+        assert_eq!(
+            listed(apps(), "code", false),
+            [
+                "code.desktop",
+                "codec.desktop",
+                "codeé.desktop",
+                "a-codex.desktop",
+                "z-codex.desktop",
+                "barcode.desktop",
+                "firefox.desktop",
+            ]
+        );
+        // A one-character filter is grouped too.
+        assert_eq!(listed(apps(), "c", false)[0], "codec.desktop");
+    }
+
+    #[test]
+    fn subsequence_matches_come_last_by_shorter_span() {
+        let apps = vec![
+            app("firefox.desktop", 10, named("Firefox")),
+            app("fafax.desktop", 5, named("Fafax Browser")),
+            app("ffax.desktop", 0, named("Ffax Tool")),
+            app("plain.desktop", 0, text("Plain", "", "", "ffx")),
+            app("other.desktop", 0, named("Other")),
+        ];
+        assert_eq!(
+            listed(apps, "ffx", true),
+            [
+                "plain.desktop",
+                "ffax.desktop",
+                "fafax.desktop",
+                "firefox.desktop"
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_entries_are_ids_or_patterns() {
+        assert!(fits_pattern(
+            "org.example.App.desktop",
+            "org.example.App.desktop"
+        ));
+        assert!(!fits_pattern(
+            "org.example.app.desktop",
+            "org.example.App.desktop"
+        ));
+        assert!(fits_pattern("snap-*", "snap-one.desktop"));
+        assert!(!fits_pattern("snap-*", "my-snap-one.desktop"));
+        assert!(!fits_pattern("*.desktop", "a.desktop.bak"));
+        assert!(fits_pattern("a*.desktop", "a.desktop"));
+        assert!(fits_pattern("*", ""));
+        assert!(fits_pattern("a?.desktop", "a1.desktop"));
+        assert!(!fits_pattern("a?.desktop", "a.desktop"));
+        assert!(!fits_pattern("a?.desktop", "abc.desktop"));
+        // `?` stands for one character, not one byte.
+        assert!(fits_pattern("caf?.desktop", "café.desktop"));
+        assert!(fits_pattern("*a*b?", "xxaybz"));
+        assert!(!fits_pattern("*a*b?", "xxayb"));
+        // Other characters stand for themselves.
+        assert!(fits_pattern("[a]+.desktop", "[a]+.desktop"));
+        assert!(!fits_pattern("[a]+.desktop", "a.desktop"));
+        assert!(is_hidden(
+            "vendor-tool.desktop",
+            &["other.desktop".to_owned(), "vendor-*".to_owned()]
+        ));
+        assert!(!is_hidden("vendor-tool.desktop", &[]));
     }
 }

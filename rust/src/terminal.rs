@@ -6,7 +6,7 @@ use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
-use crate::filter::matches_all_words;
+use crate::filter::fold_text;
 use crate::keybindings::navigate;
 use crate::pages::{is_enter_key, select_first_row, DialogPage};
 use crate::runner::runner_app_info;
@@ -173,9 +173,11 @@ fn string_value(
         .unwrap_or_default()
 }
 
-// Every word of the query must occur in the full path, ignoring case.
+// The whole query, trimmed, must occur in the full path as one piece,
+// ignoring case: a command line typed with its arguments lists no command
+// whose path merely holds each word somewhere.
 fn matches_query(query: &str, cmd_path: &str) -> bool {
-    matches_all_words(query, &[cmd_path])
+    fold_text(cmd_path).contains(&fold_text(query.trim()))
 }
 
 /// Highlights the first row: the best match for the text typed.
@@ -399,7 +401,12 @@ mod tests {
             "/tmp/bin/free-command"
         ));
         assert!(!matches_query("fixture", "/tmp/bin/free-command"));
-        assert!(matches_query("COMMAND  free", "/tmp/bin/free-command"));
+        assert!(matches_query("bin/FREE-", "/tmp/bin/free-command"));
+        assert!(!matches_query("COMMAND  free", "/tmp/bin/free-command"));
+        assert!(!matches_query("free command", "/tmp/bin/free-command"));
+        assert!(!matches_query("frcmd", "/tmp/bin/free-command"));
+        assert!(matches_query(" two  words ", "/tmp/bin/two  words"));
+        assert!(!matches_query("two words", "/tmp/bin/two  words"));
         assert!(!matches_query("x", ""));
     }
 

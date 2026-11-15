@@ -1,11 +1,14 @@
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
 use crate::apps::ApplicationsPage;
 use crate::args::Args;
+use crate::filter::{match_fields, query_words, Match};
 use crate::keybindings::KeybindingsPage;
 use crate::notifications::RoficationPage;
 use crate::terminal::CommandPage;
@@ -71,7 +74,7 @@ impl DialogPage for Page {
 }
 
 pub const PAGES: &[Page] = &[
-    Page { id: "apps", name: "<u>A</u>pplications", icon: "view-app-grid-symbolic", key: 'a', help: "This dialog allows for the launching of desktop applications. Initially all desktop apps are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it.", bindings: &[("enter", "Launch Application")] },
+    Page { id: "apps", name: "<u>A</u>pplications", icon: "view-app-grid-symbolic", key: 'a', help: "This dialog allows for the launching of desktop applications. Initially all desktop apps are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it.", bindings: &[("enter", "Launch Application"), ("ctrl+delete", "Hide Application"), ("ctrl+z", "Undo Hide")] },
     Page { id: "terminal", name: "<u>C</u>ommands", icon: "utilities-terminal", key: 'c', help: "This dialog allows for the executing commands on the user path. Initially all commands are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it. If no item matches, enter runs the typed command line, including any arguments.", bindings: &[("enter", "Execute Command")] },
     Page { id: "notifications", name: "<u>N</u>otifications", icon: "mail-message-new", key: 'n', help: "This dialog manages desktop notifications. Initially all desktop apps are presented. The user may filter the list in the top text box.", bindings: &[("del", "Delete Notification"), ("shift del", "Delete All Notifications")] },
     Page { id: "keybindings", name: "<u>K</u>eybindings", icon: "input-keyboard", key: 'k', help: "This dialog allows for viewing desktop keybindings. Initially all keybindings are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will perform the keybinding action.", bindings: &[("enter", "Invoke Keybinding")] },
@@ -103,6 +106,159 @@ pub fn select_first_row(view: &gtk::TreeView) -> gtk::TreePath {
     first
 }
 
+/// Highlights the row at `position` of `view`, or its last row when it has
+/// no row there, and returns its path; with no rows, nothing is highlighted.
+pub fn select_row_near(view: &gtk::TreeView, position: i32) -> Option<gtk::TreePath> {
+    let selection = view.selection();
+    selection.set_mode(gtk::SelectionMode::Single);
+    let rows = view.model().map_or(0, |model| model.iter_n_children(None));
+    if rows == 0 {
+        selection.unselect_all();
+        return None;
+    }
+    let path = gtk::TreePath::from_indicesv(&[position.clamp(0, rows - 1)]);
+    view.set_cursor(&path, None::<&gtk::TreeViewColumn>, false);
+    Some(path)
+}
+
+/// The position of the highlighted row of `view`.
+pub fn selected_position(view: &gtk::TreeView) -> Option<i32> {
+    let (model, iter) = view.selection().selected()?;
+    model.path(&iter)?.indices().first().copied()
+}
+
+/// Rebuilds the rows `view` shows through `filter` for a cause other than a
+/// new filter text: `rebuild` sorts and refilters them. The row highlighted
+/// before stays highlighted while it is still listed, wherever it now
+/// stands. Otherwise the row now at its position is highlighted, or the
+/// last row when the list has become shorter, or none when it is empty.
+/// With nothing highlighted before, the first row is. Returns the path
+/// highlighted.
+pub fn rebuild_keeping_selection(
+    view: &gtk::TreeView,
+    filter: &gtk::TreeModelFilter,
+    rebuild: impl FnOnce(),
+) -> Option<gtk::TreePath> {
+    // The child model's iters last as long as its rows, whatever their order
+    // and whether the filter shows them.
+    let before = view
+        .selection()
+        .selected()
+        .map(|(_, iter)| filter.convert_iter_to_child_iter(&iter));
+    let position = selected_position(view).unwrap_or(0);
+    rebuild();
+    let kept = before
+        .and_then(|child| filter.convert_child_iter_to_iter(&child))
+        .and_then(|iter| filter.path(&iter));
+    match kept {
+        Some(path) => {
+            view.selection().set_mode(gtk::SelectionMode::Single);
+            view.set_cursor(&path, None::<&gtk::TreeViewColumn>, false);
+            Some(path)
+        }
+        None => select_row_near(view, position),
+    }
+}
+
+/// The filter of a page whose rows match through folded copies of their
+/// text, kept in model columns. With subsequence matching on, rows that
+/// match only by subsequence are listed after the others.
+pub struct RowFilter {
+    words: RefCell<Vec<String>>,
+    folded_columns: &'static [u32],
+    subsequence: Cell<bool>,
+}
+
+impl RowFilter {
+    pub fn new(folded_columns: &'static [u32], subsequence: bool) -> Rc<Self> {
+        Rc::new(Self {
+            words: RefCell::default(),
+            folded_columns,
+            subsequence: Cell::new(subsequence),
+        })
+    }
+
+    /// Turns subsequence matching on or off; whether that changed it.
+    pub fn set_subsequence(&self, subsequence: bool) -> bool {
+        self.subsequence.replace(subsequence) != subsequence
+    }
+
+    /// Takes the words of a new filter text.
+    pub fn set_text(&self, text: &str) {
+        *self.words.borrow_mut() = query_words(text);
+    }
+
+    /// How the row at `iter` matches the filter words, or `None` when it
+    /// is not listed.
+    pub fn row_match(&self, model: &gtk::TreeModel, iter: &gtk::TreeIter) -> Option<Match> {
+        let fields: Vec<String> = self
+            .folded_columns
+            .iter()
+            .map(|&column| {
+                model
+                    .value(iter, column as i32)
+                    .get::<String>()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+        match_fields(&self.words.borrow(), &fields, self.subsequence.get())
+    }
+
+    /// Sorts `model` by how its rows match (see [`Match`]), then by the text
+    /// in `column` as GTK sorts strings: the page's usual order. Call it
+    /// again after `set_text` to sort the rows for the new words.
+    pub fn sort(self: &Rc<Self>, model: &gtk::ListStore, column: u32) {
+        let row_filter = self.clone();
+        model.set_sort_func(gtk::SortColumn::Index(column), move |model, a, b| {
+            let text = |iter| {
+                model
+                    .value(iter, column as i32)
+                    .get::<glib::GString>()
+                    .unwrap_or_default()
+            };
+            row_filter
+                .row_match(model, a)
+                .cmp(&row_filter.row_match(model, b))
+                .then_with(|| text(a).as_gstr().collate(text(b)))
+        });
+    }
+}
+
+/// Keeps a page that filters through `row_filter` in step with the
+/// `fuzzy-matching` setting while the launcher runs: when another program
+/// changes it, the rows are matched and sorted again for the same filter
+/// text, keeping the highlighted row (see [`rebuild_keeping_selection`]).
+pub fn follow_fuzzy_setting(
+    settings: &gio::Settings,
+    row_filter: &Rc<RowFilter>,
+    model: &gtk::ListStore,
+    sort_column: u32,
+    filter: &gtk::TreeModelFilter,
+    view: &gtk::TreeView,
+    path: &Rc<RefCell<gtk::TreePath>>,
+) {
+    let (row_filter, model, filter, view, path) = (
+        row_filter.clone(),
+        model.clone(),
+        filter.clone(),
+        view.clone(),
+        path.clone(),
+    );
+    settings.connect_changed(Some(FUZZY_MATCHING), move |settings, _| {
+        if row_filter.set_subsequence(settings.boolean(FUZZY_MATCHING)) {
+            let selected = rebuild_keeping_selection(&view, &filter, || {
+                row_filter.sort(&model, sort_column);
+                filter.refilter();
+            });
+            *path.borrow_mut() = selected.unwrap_or_else(gtk::TreePath::new_first);
+        }
+    });
+}
+
+/// The setting that turns subsequence matching on.
+pub const FUZZY_MATCHING: &str = "fuzzy-matching";
+
 pub fn find(name: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.id.eq_ignore_ascii_case(name))
 }
@@ -120,6 +276,7 @@ pub fn create(
         "apps" => Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit)),
         "terminal" => Rc::new(CommandPage::new(entry.clone(), args.has("-q"), quit)),
         "keybindings" => Rc::new(KeybindingsPage::new(
+            settings.clone(),
             entry.clone(),
             wm_name.to_owned(),
             quit,

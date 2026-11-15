@@ -8,22 +8,25 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
-use crate::filter::matches_all_words;
+use crate::filter::fold_text;
 use crate::icons::load_icon_from_name;
 use crate::ipc::{self, TreeReply};
 use crate::keybindings::{navigate, wm_cli};
-use crate::pages::{select_first_row, DialogPage};
+use crate::pages::{follow_fuzzy_setting, select_first_row, DialogPage, RowFilter, FUZZY_MATCHING};
 
 const ICON: u32 = 0;
 const TITLE: u32 = 1;
 const ID: u32 = 2;
+const FOLDED_TITLE: u32 = 3;
 
 pub struct WindowsPage {
     entry: gtk::Entry,
+    model: gtk::ListStore,
+    row_filter: Rc<RowFilter>,
     filter: gtk::TreeModelFilter,
     view: gtk::TreeView,
     root: gtk::Widget,
-    path: RefCell<gtk::TreePath>,
+    path: Rc<RefCell<gtk::TreePath>>,
     wm_name: String,
     quit: Rc<dyn Fn()>,
 }
@@ -41,14 +44,14 @@ impl WindowsPage {
             Pixbuf::static_type(),
             String::static_type(),
             String::static_type(),
+            String::static_type(),
         ]);
+        // Subsequence matching uses the title too.
+        let row_filter = RowFilter::new(&[FOLDED_TITLE], settings.boolean(FUZZY_MATCHING));
         let filter = gtk::TreeModelFilter::new(&model, None);
-        let entry_for_filter = entry.clone();
+        let row_filter_for_filter = row_filter.clone();
         filter.set_visible_func(move |tree_model, iter| {
-            matches_all_words(
-                entry_for_filter.text().as_str(),
-                &[&string_value(tree_model, iter, TITLE as i32)],
-            )
+            row_filter_for_filter.row_match(tree_model, iter).is_some()
         });
 
         match ipc::get_tree(&wm_name) {
@@ -57,6 +60,7 @@ impl WindowsPage {
                 eprintln!("Failed to read or parse window tree from {wm_name}: {error}")
             }
         }
+        row_filter.sort(&model, TITLE);
         model.set_sort_column_id(gtk::SortColumn::Index(TITLE), gtk::SortType::Ascending);
 
         let view = gtk::TreeView::with_model(&filter);
@@ -88,12 +92,16 @@ impl WindowsPage {
         scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
 
+        let path = Rc::new(RefCell::new(gtk::TreePath::new_first()));
+        follow_fuzzy_setting(&settings, &row_filter, &model, TITLE, &filter, &view, &path);
         let page = Self {
             entry,
+            model,
+            row_filter,
             filter,
             view,
             root: scrolled.upcast(),
-            path: RefCell::new(gtk::TreePath::new_first()),
+            path: path.clone(),
             wm_name,
             quit,
         };
@@ -141,6 +149,8 @@ impl DialogPage for WindowsPage {
         self.root.clone()
     }
     fn on_entry_changed(&self) {
+        self.row_filter.set_text(self.entry.text().as_str());
+        self.row_filter.sort(&self.model, TITLE);
         self.filter.refilter();
         self.set_selection();
     }
@@ -203,11 +213,16 @@ fn add_tree(model: &gtk::ListStore, node: &TreeReply, is_wayland: bool, icon_siz
                 load_icon_from_name(&theme, "application-x-executable", icon_size)
             })
         });
-        if let Some(icon) = icon {
-            model.set(&row, &[(ICON, &icon), (TITLE, &node.name), (ID, &node.id)]);
-        } else {
-            model.set(&row, &[(TITLE, &node.name), (ID, &node.id)]);
+        let folded_title = fold_text(&node.name);
+        let mut values: Vec<(u32, &dyn ToValue)> = vec![
+            (TITLE, &node.name),
+            (ID, &node.id),
+            (FOLDED_TITLE, &folded_title),
+        ];
+        if let Some(icon) = icon.as_ref() {
+            values.push((ICON, icon));
         }
+        model.set(&row, &values);
     }
     for child in &node.nodes {
         add_tree(model, child, is_wayland, icon_size);

@@ -26,9 +26,10 @@ Module map:
   which searches on worker threads once typing pauses.
 - `terminal.rs`: the Commands page (asynchronous PATH scan, launches through
   the `systemd-run` wrapper in `runner.rs`).
-- `textlist.rs`: the TextList page (stdin drained synchronously at startup,
-  filtered into a prebuilt list).
-- `filter.rs`: the every-word query matching shared by the pages.
+- `textlist.rs`: the TextList page (stdin read on a background thread, so
+  complete lines join the list while the input is still open).
+- `filter.rs`: the filter matching shared by the pages: folding, the
+  every-word rule, and subsequences with their spans.
 - `icons.rs`: the reference icon-loader order shared by the new pages.
 - `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
   open (gnome-flashback's input-source D-Bus service on X11).

@@ -6,13 +6,15 @@ use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
-use crate::filter::matches_all_words;
+use crate::filter::fold_text;
 use crate::ipc;
-use crate::pages::{select_first_row, DialogPage};
+use crate::pages::{follow_fuzzy_setting, select_first_row, DialogPage, RowFilter, FUZZY_MATCHING};
 
 const SPEC: u32 = 0;
 const SUMMARY: u32 = 1;
 const EXEC: u32 = 2;
+const FOLDED_SPEC: u32 = 3;
+const FOLDED_SUMMARY: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Keybinding {
@@ -23,30 +25,41 @@ struct Keybinding {
 }
 
 pub struct KeybindingsPage {
+    entry: gtk::Entry,
+    model: gtk::ListStore,
+    row_filter: Rc<RowFilter>,
     filter: gtk::TreeModelFilter,
     view: gtk::TreeView,
     root: gtk::Widget,
-    path: RefCell<gtk::TreePath>,
+    path: Rc<RefCell<gtk::TreePath>>,
     wm_name: String,
     quit: Rc<dyn Fn()>,
 }
 
 impl KeybindingsPage {
-    pub fn new(entry: gtk::Entry, wm_name: String, quit: Rc<dyn Fn()>) -> Self {
+    pub fn new(
+        settings: gio::Settings,
+        entry: gtk::Entry,
+        wm_name: String,
+        quit: Rc<dyn Fn()>,
+    ) -> Self {
         let model = gtk::ListStore::new(&[
             String::static_type(),
             String::static_type(),
             String::static_type(),
+            String::static_type(),
+            String::static_type(),
         ]);
+        // Each word may match the description or the key text, by the word
+        // rule or by subsequence.
+        let row_filter = RowFilter::new(
+            &[FOLDED_SUMMARY, FOLDED_SPEC],
+            settings.boolean(FUZZY_MATCHING),
+        );
         let filter = gtk::TreeModelFilter::new(&model, None);
+        let row_filter_for_filter = row_filter.clone();
         filter.set_visible_func(move |tree_model, iter| {
-            matches_all_words(
-                entry.text().as_str(),
-                &[
-                    &string_value(tree_model, iter, SUMMARY as i32),
-                    &string_value(tree_model, iter, SPEC as i32),
-                ],
-            )
+            row_filter_for_filter.row_match(tree_model, iter).is_some()
         });
 
         match ipc::get_config(&wm_name).and_then(|config| parse_config(&config)) {
@@ -56,11 +69,21 @@ impl KeybindingsPage {
                     let spec = format_spec(&binding.spec);
                     let summary = format!("{} - {}", binding.category, binding.label);
                     let exec = binding.exec.unwrap_or_default();
-                    model.set(&row, &[(SPEC, &spec), (SUMMARY, &summary), (EXEC, &exec)]);
+                    model.set(
+                        &row,
+                        &[
+                            (SPEC, &spec),
+                            (SUMMARY, &summary),
+                            (EXEC, &exec),
+                            (FOLDED_SPEC, &fold_text(&spec)),
+                            (FOLDED_SUMMARY, &fold_text(&summary)),
+                        ],
+                    );
                 }
             }
             Err(error) => eprintln!("Failed to read config from {wm_name}: {error}"),
         }
+        row_filter.sort(&model, SUMMARY);
         model.set_sort_column_id(gtk::SortColumn::Index(SUMMARY), gtk::SortType::Ascending);
 
         let view = gtk::TreeView::with_model(&filter);
@@ -85,11 +108,24 @@ impl KeybindingsPage {
         scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
 
+        let path = Rc::new(RefCell::new(gtk::TreePath::new_first()));
+        follow_fuzzy_setting(
+            &settings,
+            &row_filter,
+            &model,
+            SUMMARY,
+            &filter,
+            &view,
+            &path,
+        );
         let page = Self {
+            entry,
+            model,
+            row_filter,
             filter,
             view,
             root: scrolled.upcast(),
-            path: RefCell::new(gtk::TreePath::new_first()),
+            path: path.clone(),
             wm_name,
             quit,
         };
@@ -144,6 +180,8 @@ impl DialogPage for KeybindingsPage {
     }
 
     fn on_entry_changed(&self) {
+        self.row_filter.set_text(self.entry.text().as_str());
+        self.row_filter.sort(&self.model, SUMMARY);
         self.filter.refilter();
         self.set_selection();
     }
@@ -335,6 +373,7 @@ pub fn format_spec(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{format_spec, keybinding_commandline, parse_config, wm_cli};
+    use crate::filter::{fold_text, match_fields, query_words, Match};
 
     #[test]
     fn parser_attaches_one_command_and_substitutes_whole_tokens() {
@@ -374,6 +413,32 @@ mod tests {
         .unwrap();
         assert_eq!(parsed[0].category, "Alpha");
         assert_eq!(parsed[1].category, "Zed");
+    }
+
+    #[test]
+    fn rows_match_the_folded_description_or_key_text() {
+        let parsed = parse_config(
+            "## Café // Ouvrir le Navigateur // <Super><Shift><Return> ##\nbindsym $mod+Shift+Return exec browser\n",
+        )
+        .unwrap();
+        // The row's searchable fields, as the page folds them.
+        let summary = fold_text(&format!("{} - {}", parsed[0].category, parsed[0].label));
+        let spec = fold_text(&format_spec(&parsed[0].spec));
+        assert_eq!(summary, "cafe - ouvrir le navigateur");
+        assert_eq!(spec, "super shift return ");
+        let matching = |query: &str, subsequence: bool| {
+            match_fields(&query_words(query), &[&summary, &spec], subsequence)
+        };
+        assert_eq!(matching("CAFÉ navigateur", false), Some(Match::Words));
+        // Words may come from the description and the key text.
+        assert_eq!(matching("cafe RETURN", false), Some(Match::Words));
+        assert_eq!(matching("shrt", false), None);
+        // "shrt" spans "shift ret" in the key text.
+        assert_eq!(matching("shrt", true), Some(Match::Subsequence(9)));
+        // Each word takes its shortest span from its own best field...
+        assert_eq!(matching("cfe shrt", true), Some(Match::Subsequence(4 + 9)));
+        // ...but one word never joins the two fields.
+        assert_eq!(matching("nvshrt", true), None);
     }
 
     #[test]
