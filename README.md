@@ -20,11 +20,10 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
   Most of the smaller ones are in this port (fixed here independently, or
-  ported), but some large ones still need porting: running a keybinding
-  from the keybindings page (#158–#161), the keys the window manager binds
-  (#170), window-manager and desktop keys while ilia is open (#171),
-  launching desktop entries per the Desktop Entry spec (#168), and faster
-  apps start-up (#162). See
+  ported), but some large ones still need porting: the keys the window
+  manager binds (#170), window-manager and desktop keys while ilia is open
+  (#171), launching desktop entries per the Desktop Entry spec (#168), and
+  faster apps start-up (#162). See
   [Differences from upstream](#differences-from-upstream). That list was
   made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
   running both builds side by side under i3 and sway.
@@ -80,6 +79,8 @@ Then #169 (matching and ranking) in one commit, together with the rest of
 #134 (standard input read while the window is open) and the additions
 listed under "In the port but not (known to be) upstream".
 
+Then #158–#161 (running a binding from the keybindings page) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -118,7 +119,10 @@ the app-grid icon on the Applications tab; #166 stay open on sway when the
 seat's last keyboard goes away; #169 name matches ranked first in seven
 groups, accents, marks and case folded on every filtering page, opt-in
 subsequence matching (`fuzzy-matching`), `match-fields`, and `hidden-apps`
-with Ctrl+Delete.
+with Ctrl+Delete; #158–#161 the chosen keybinding run once over IPC exactly
+as the window manager holds it (sway's includes read in its order,
+variables and resource values taken where they are used, quotes and
+spacing kept), also when clicked under the X11 grab.
 
 **Partly ported:**
 
@@ -126,11 +130,6 @@ with Ctrl+Delete.
 
 **Not yet ported** (open items):
 
-- #158–#161 (keybindings page): run the chosen binding over IPC with quotes
-  intact, run a clicked row on X11, read config files in order each on its
-  own lines, and send the command the window manager holds for the binding.
-  The port still runs `i3-msg`/`swaymsg`, and `parity/test_keybindings.py`
-  accepts that, so those tests need updating when these fixes are ported.
 - #162: read the desktop files during GTK start-up and decode icons off the
   main thread (the apps page opens about 20–30 % later than ilia's).
 - #168: launch desktop entries per the Desktop Entry spec (field codes,
@@ -205,9 +204,9 @@ ILIA_BINARY=$PWD/rust/target/release/ilia rust/smoke-cutover.sh
 ```
 
 The parity suite and the probes need Xvfb, xdotool, python3-pytest,
-python3-gi with the AT-SPI typelib, and `dbus-daemon`. The Windows and
-Keybindings parity cases expect `/usr/bin/i3-msg` and `/usr/bin/swaymsg` to
-be absent (see `parity/README.md`). In a container that cannot create user
+python3-gi with the AT-SPI typelib, and `dbus-daemon`. The Windows parity
+cases expect `/usr/bin/i3-msg` and `/usr/bin/swaymsg` to be absent (see
+`parity/README.md`). In a container that cannot create user
 namespaces, GdkPixbuf's glycin loaders print
 `WARNING: Glycin running without sandbox.` on stderr, which the probes'
 exact stderr checks reject; run them where bwrap works.

@@ -29,11 +29,17 @@ socket path, and `systemd-run` wrapping. Sway mode reaches the fake window
 manager through `SWAYSOCK` alone; its `I3SOCK` names a socket that does not
 exist, as a stale variable from another session would (upstream #141).
 
-This harness chooses the deterministic absent-binary behavior for the absolute
+The Keybindings tests require the chosen binding as exactly one RUN_COMMAND
+request on the window manager's socket, carrying the command as the window
+manager holds it (upstream #158–#161), and nothing on standard output. The
+fake answers sway's GET_VERSION request with numbers, as sway does, so the
+main file's relative includes are read beside it. For the Windows page this
+harness chooses the deterministic absent-binary behavior for the absolute
 `/usr/bin/i3-msg` and `/usr/bin/swaymsg` paths rather than modifying system
-files. The WM tests require either the exact expected IPC command transcript
-(if one of those clients exists) or the corresponding GLib child-process error
-that names the absent absolute binary; unrelated stderr cannot satisfy them.
+files. The Windows tests require either the exact expected IPC command
+transcript (if one of those clients exists) or the corresponding GLib
+child-process error that names the absent absolute binary; unrelated stderr
+cannot satisfy them.
 Tracker uses the no-miner judgment call and checks nonempty, distribution-
 dependent D-Bus stderr while proving that the UI remains responsive.
 

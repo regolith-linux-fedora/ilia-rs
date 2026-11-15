@@ -1,14 +1,16 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 const IPC_MAGIC: &[u8; 6] = b"i3-ipc";
 const HEADER_SIZE: usize = 14;
 
+pub const RUN_COMMAND: u32 = 0;
 pub const GET_TREE: u32 = 4;
 pub const GET_VERSION: u32 = 7;
 pub const GET_CONFIG: u32 = 9;
@@ -325,7 +327,7 @@ fn hex_value(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn request(wm_name: &str, command: u32) -> Result<Json, String> {
+fn request(wm_name: &str, command: u32, payload: &str) -> Result<Json, String> {
     let socket_path = socket_path(
         wm_name,
         std::env::var_os("I3SOCK"),
@@ -340,12 +342,8 @@ fn request(wm_name: &str, command: u32) -> Result<Json, String> {
         .set_write_timeout(timeout)
         .map_err(|error| error.to_string())?;
 
-    let mut request = [0u8; HEADER_SIZE];
-    request[..6].copy_from_slice(IPC_MAGIC);
-    request[6..10].copy_from_slice(&0u32.to_le_bytes());
-    request[10..14].copy_from_slice(&command.to_le_bytes());
     stream
-        .write_all(&request)
+        .write_all(&encode_request(command, payload)?)
         .map_err(|error| error.to_string())?;
 
     let payload = read_reply(&mut stream)?;
@@ -353,6 +351,18 @@ fn request(wm_name: &str, command: u32) -> Result<Json, String> {
         return Err("No Response".to_owned());
     }
     JsonParser::new(&payload).parse()
+}
+
+/// One request: the fixed header, with the payload's length in bytes, then
+/// the payload as it is.
+fn encode_request(command: u32, payload: &str) -> Result<Vec<u8>, String> {
+    let length = u32::try_from(payload.len()).map_err(|_| "IPC payload too long".to_owned())?;
+    let mut message = Vec::with_capacity(HEADER_SIZE + payload.len());
+    message.extend_from_slice(IPC_MAGIC);
+    message.extend_from_slice(&length.to_ne_bytes());
+    message.extend_from_slice(&command.to_ne_bytes());
+    message.extend_from_slice(payload.as_bytes());
+    Ok(message)
 }
 
 /// The window manager's IPC socket: `SWAYSOCK` for sway, which is how sway
@@ -401,9 +411,8 @@ pub struct VersionReply {
     pub major: String,
 }
 
-#[allow(dead_code)]
 pub fn get_version(wm_name: &str) -> Result<VersionReply, String> {
-    version_from_reply(request(wm_name, GET_VERSION)?)
+    version_from_reply(request(wm_name, GET_VERSION, "")?)
 }
 
 fn version_from_reply(reply: Json) -> Result<VersionReply, String> {
@@ -413,112 +422,318 @@ fn version_from_reply(reply: Json) -> Result<VersionReply, String> {
         loaded_config_file_name: member(object, "loaded_config_file_name")?
             .string()?
             .to_owned(),
-        minor: member(object, "minor")?.string()?.to_owned(),
-        patch: member(object, "patch")?.string()?.to_owned(),
-        major: member(object, "major")?.string()?.to_owned(),
+        // i3 and sway send the parts as numbers.
+        minor: member(object, "minor")?.integer_string()?,
+        patch: member(object, "patch")?.integer_string()?,
+        major: member(object, "major")?.integer_string()?,
     })
 }
 
-pub fn get_config(wm_name: &str) -> Result<String, String> {
-    config_from_reply(request(wm_name, GET_CONFIG)?, wm_name)
+/// The configuration the window manager runs with, as it reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Config {
+    /// i3 reports the contents of every file it read, in its reading order,
+    /// with its variables and X resources already applied.
+    I3 { files: Vec<String> },
+    /// sway reports its main file as written and nothing more: the files it
+    /// includes are read from disk. `path` names the main file, when sway
+    /// does.
+    Sway { main: String, path: Option<PathBuf> },
 }
 
-fn config_from_reply(reply: Json, wm_name: &str) -> Result<String, String> {
+pub fn get_config(wm_name: &str) -> Result<Config, String> {
+    let reply = request(wm_name, GET_CONFIG, "")?;
+    // Only the version reply names sway's main file, which relative includes
+    // in it are read beside.
+    let path = (wm_name == "sway")
+        .then(|| get_version(wm_name).ok())
+        .flatten()
+        .map(|version| PathBuf::from(version.loaded_config_file_name))
+        .filter(|path| !path.as_os_str().is_empty());
+    config_from_reply(reply, wm_name, path)
+}
+
+fn config_from_reply(reply: Json, wm_name: &str, path: Option<PathBuf>) -> Result<Config, String> {
     let object = reply.object()?;
     if wm_name == "sway" {
-        let base = member(object, "config")?.string()?.to_owned();
-        Ok(format!("{base}{}", walk_included_configs(&base)))
+        let main = member(object, "config")?.string()?.to_owned();
+        Ok(Config::Sway { main, path })
     } else {
-        let mut config = String::new();
+        // Each file stays apart, so one without a final newline does not run
+        // into the next.
+        let mut files = Vec::new();
         for included in member(object, "included_configs")?.array()? {
-            config.push_str(member(included.object()?, "variable_replaced_contents")?.string()?);
+            let contents = member(included.object()?, "variable_replaced_contents")?;
+            files.push(contents.string()?.to_owned());
         }
-        Ok(config)
+        Ok(Config::I3 { files })
     }
 }
 
+/// `path` with `$NAME` and `${NAME}` replaced by the session environment's
+/// value, and a leading `~` by the home directory. A variable that is not
+/// set stays as written.
 pub fn expand_path_vars(path: &str) -> String {
-    if !path.contains('$') {
-        return path.to_owned();
-    }
-    // Vala-exact split algorithm, quirks replicated (ConfigReply in
-    // I3Ipc.vala; the reference behavior is buggy but the port matches
-    // it): every `$`-separated segment is parsed as a variable name up
-    // to the next `/`, so a `$` after literal leading text corrupts that
-    // segment (`/lit/$V/x` gains a spurious leading `$`), and `$$`
-    // collapses to a literal `$` while what follows is still expanded
-    // (`$$V` -> `$` + value-or-literal). Byte-wise like the reference
-    // for ASCII paths; non-ASCII variable names are undefined there.
-    let mut result = String::new();
-    for (index, part) in path.split('$').enumerate() {
-        if part.is_empty() {
-            if index == 0 {
-                continue;
+    let path = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("$HOME{rest}"),
+        _ => path.to_owned(),
+    };
+    let mut result = String::with_capacity(path.len());
+    let mut rest = path.as_str();
+    while let Some(dollar) = rest.find('$') {
+        result.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        let (name, written) = match after.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            },
+            None => {
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..end], end)
             }
-            result.push('$');
-            continue;
-        }
-        let end = part.find('/').unwrap_or(part.len());
-        match std::env::var(&part[..end]) {
-            Ok(value) => {
+        };
+        let value = is_environment_name(name)
+            .then(|| std::env::var(name).ok())
+            .flatten();
+        match value {
+            Some(value) => {
                 result.push_str(&value);
-                result.push_str(&part[end..]);
+                rest = &after[written..];
             }
-            Err(_) => {
+            None => {
                 result.push('$');
-                result.push_str(part);
+                rest = after;
             }
         }
     }
+    result.push_str(rest);
     result
 }
 
-fn include_paths(config: &str) -> Vec<String> {
-    config
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("include "))
-        .map(expand_path_vars)
+fn is_environment_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The files an `include` reads, in the order sway reads them: `pattern`
+/// with the session environment applied, taken from `directory` (the one
+/// holding the file that names it) when relative, and its matches sorted.
+fn include_paths(pattern: &str, directory: Option<&Path>) -> Vec<PathBuf> {
+    let pattern = PathBuf::from(expand_path_vars(pattern));
+    let pattern = match directory {
+        Some(directory) if pattern.is_relative() => directory.join(pattern),
+        _ => pattern,
+    };
+    expand_glob(&pattern)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| fs::canonicalize(&path).unwrap_or(path))
         .collect()
 }
 
-fn walk_included_configs(base: &str) -> String {
-    let mut output = String::from("\n");
-    let mut visited = HashSet::new();
-    let mut queue: VecDeque<String> = include_paths(base).into();
-    while let Some(pattern) = queue.pop_front() {
-        let mut matches = expand_glob(&pattern);
-        matches.reverse();
-        for path in matches {
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            let Ok(contents) = fs::read_to_string(&path) else {
-                continue;
-            };
-            output.push_str(&contents);
-            queue.extend(include_paths(&contents));
-        }
-    }
-    output
+/// sway's configuration as sway itself reads it, since sway reports only its
+/// main file, as written: the lines in sway's reading order, each `include`
+/// read in place, the files a pattern matches in alphabetical order and each
+/// file once. Comments stay as written; every other line has its variables
+/// (`set`, and `set_from_resource` with `resources`) replaced by the value
+/// they have where they are used, and its words joined by single spaces with
+/// quoted words kept whole. The lines that define variables or include files
+/// are consumed by the reading.
+///
+/// `main` is the text of the main file and `main_path` the file, when known;
+/// relative includes in `main` are read beside it.
+pub fn walk_included_configs(
+    main: &str,
+    main_path: Option<&Path>,
+    resources: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut walk = ConfigWalk {
+        resources,
+        variables: HashMap::new(),
+        visited: HashSet::new(),
+        lines: Vec::new(),
+    };
+    let directory = main_path.and_then(|path| {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        let directory = path.parent().map(Path::to_owned);
+        // An include that names the main file does not read it again.
+        walk.visited.insert(path);
+        directory
+    });
+    walk.read_text(main, directory.as_deref());
+    walk.lines
 }
 
-fn expand_glob(pattern: &str) -> Vec<String> {
-    if !pattern
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-    {
-        return vec![pattern.to_owned()];
+struct ConfigWalk<'a> {
+    resources: &'a HashMap<String, String>,
+    /// The variables defined so far, by name without the `$`.
+    variables: HashMap<String, String>,
+    /// The files read so far, by canonical path.
+    visited: HashSet<PathBuf>,
+    lines: Vec<String>,
+}
+
+impl ConfigWalk<'_> {
+    /// Reads the text of one file; `directory` holds the file.
+    fn read_text(&mut self, text: &str, directory: Option<&Path>) {
+        for line in text.lines() {
+            self.read_line(line.trim(), directory);
+        }
     }
-    let absolute = pattern.starts_with('/');
-    let mut candidates = vec![if absolute {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    }];
-    for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
-        let wildcard = segment
-            .bytes()
-            .any(|byte| matches!(byte, b'*' | b'?' | b'['));
+
+    fn read_line(&mut self, line: &str, directory: Option<&Path>) {
+        if line.is_empty() || line.starts_with('#') {
+            self.lines.push(line.to_owned());
+            return;
+        }
+        match split_words(line).as_slice() {
+            ["include", pattern @ ..] if !pattern.is_empty() => {
+                let pattern = self.replace(&pattern.join(" "));
+                for path in include_paths(&pattern, directory) {
+                    if !self.visited.insert(path.clone()) {
+                        continue;
+                    }
+                    match fs::read_to_string(&path) {
+                        Ok(text) => self.read_text(&text, path.parent()),
+                        Err(error) => eprintln!("Cannot read {}: {error}", path.display()),
+                    }
+                }
+            }
+            ["set", name, value @ ..] if name.starts_with('$') && !value.is_empty() => {
+                let value = join_words(&self.replace(&value.join(" ")));
+                self.variables.insert(name[1..].to_owned(), value);
+            }
+            ["set_from_resource", name, key, default @ ..] if name.starts_with('$') => {
+                let resource = self
+                    .resources
+                    .get(&self.replace(key))
+                    .filter(|value| !value.is_empty())
+                    .cloned();
+                // With neither a value nor a default the variable is left as
+                // it was, defined or not.
+                let value = resource.or_else(|| {
+                    (!default.is_empty()).then(|| join_words(&self.replace(&default.join(" "))))
+                });
+                if let Some(value) = value {
+                    self.variables.insert(name[1..].to_owned(), value);
+                }
+            }
+            words => {
+                let line = join_words(&self.replace(&words.join(" ")));
+                self.lines.push(line);
+            }
+        }
+    }
+
+    /// `text` with each `$name` replaced by the value the variable has now.
+    /// Of the defined names that start at one `$`, the longest wins; a name
+    /// that is not defined stays as written.
+    fn replace(&self, text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(dollar) = rest.find('$') {
+            result.push_str(&rest[..dollar]);
+            let after = &rest[dollar + 1..];
+            let run = after
+                .find(|c: char| !is_name_char(c))
+                .unwrap_or(after.len());
+            // The run is ASCII, so every prefix ends on a character boundary.
+            let defined = (1..=run)
+                .rev()
+                .map(|end| &after[..end])
+                .find_map(|name| self.variables.get_key_value(name));
+            match defined {
+                Some((name, value)) => {
+                    result.push_str(value);
+                    rest = &after[name.len()..];
+                }
+                None => {
+                    result.push('$');
+                    result.push_str(&after[..run]);
+                    rest = &after[run..];
+                }
+            }
+        }
+        result.push_str(rest);
+        result
+    }
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// The words of a line as sway splits it: at spaces and tabs, but not inside
+/// quotes or inside a criteria block (`[...]` at the start of a word). A
+/// backslash escapes the character after it. Words keep their quotes and
+/// backslashes.
+fn split_words(line: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    let (mut single, mut double, mut criteria, mut escaped) = (false, false, false, false);
+    for (index, c) in line.char_indices() {
+        if !(single || double || criteria || escaped) && matches!(c, ' ' | '\t') {
+            if let Some(start) = start.take() {
+                words.push(&line[start..index]);
+            }
+            continue;
+        }
+        let word_start = start.is_none();
+        start.get_or_insert(index);
+        if escaped {
+            escaped = false;
+        } else if single {
+            single = c != '\'';
+        } else if double {
+            match c {
+                '\\' => escaped = true,
+                '"' => double = false,
+                _ => {}
+            }
+        } else if c == '\\' {
+            escaped = true;
+        } else if criteria {
+            match c {
+                '"' => double = true,
+                '\'' => single = true,
+                ']' => criteria = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '\'' => single = true,
+                '"' => double = true,
+                '[' if word_start => criteria = true,
+                _ => {}
+            }
+        }
+    }
+    if let Some(start) = start {
+        words.push(&line[start..]);
+    }
+    words
+}
+
+/// The words of `text` joined by single spaces.
+fn join_words(text: &str) -> String {
+    split_words(text).join(" ")
+}
+
+/// The paths that `pattern` matches, sorted. A part of the pattern with
+/// wildcards matches the names `wildcard_matches` accepts, except that a name
+/// that starts with a dot is only matched by a part that starts with a dot
+/// too. A pattern without wildcards stands for itself, whether or not it
+/// exists.
+fn expand_glob(pattern: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::new()];
+    for component in pattern.components() {
+        let segment = component.as_os_str().to_string_lossy();
+        let wildcard =
+            matches!(component, Component::Normal(_)) && segment.contains(['*', '?', '[']);
+        let segment: Vec<char> = segment.chars().collect();
         let mut next = Vec::new();
         for candidate in candidates {
             if wildcard {
@@ -532,50 +747,56 @@ fn expand_glob(pattern: &str) -> Vec<String> {
                 };
                 for entry in entries.flatten() {
                     let name = entry.file_name();
-                    if wildcard_matches(segment.as_bytes(), name.to_string_lossy().as_bytes()) {
+                    let text: Vec<char> = name.to_string_lossy().chars().collect();
+                    let hidden = text.first() == Some(&'.') && segment[0] != '.';
+                    if !hidden && wildcard_matches(&segment, &text) {
                         next.push(candidate.join(name));
                     }
                 }
             } else {
-                next.push(candidate.join(segment));
+                next.push(candidate.join(component));
             }
         }
         candidates = next;
     }
-    if candidates.is_empty() {
-        vec![pattern.to_owned()]
-    } else {
-        candidates
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect()
-    }
+    candidates.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+    candidates
 }
 
-fn wildcard_matches(pattern: &[u8], text: &[u8]) -> bool {
-    fn matches(pattern: &[u8], text: &[u8]) -> bool {
+/// Whether `text` fits the glob `pattern`: `*` stands for any run of
+/// characters, `?` for one character and `[...]` for one character of a set,
+/// in which `!` or `^` first negates the set, a `]` first is a member and
+/// `a-z` is a range. An unclosed `[` stands for itself.
+fn wildcard_matches(pattern: &[char], text: &[char]) -> bool {
+    fn matches(pattern: &[char], text: &[char]) -> bool {
         match pattern.first().copied() {
             None => text.is_empty(),
-            Some(b'*') => {
+            Some('*') => {
                 matches(&pattern[1..], text) || (!text.is_empty() && matches(pattern, &text[1..]))
             }
-            Some(b'?') => !text.is_empty() && matches(&pattern[1..], &text[1..]),
-            Some(b'[') => {
-                let Some(end) = pattern.iter().position(|byte| *byte == b']') else {
+            Some('?') => !text.is_empty() && matches(&pattern[1..], &text[1..]),
+            Some('[') => {
+                let negate = matches!(pattern.get(1), Some('!' | '^'));
+                let start = if negate { 2 } else { 1 };
+                // A `]` right at the start of the set is a member, not its end.
+                let Some(end) = pattern
+                    .iter()
+                    .skip(start + 1)
+                    .position(|c| *c == ']')
+                    .map(|position| start + 1 + position)
+                else {
                     return !text.is_empty()
-                        && text[0] == b'['
+                        && text[0] == '['
                         && matches(&pattern[1..], &text[1..]);
                 };
                 if text.is_empty() {
                     return false;
                 }
-                let class = &pattern[1..end];
-                let negate = matches!(class.first(), Some(b'!' | b'^'));
-                let class = if negate { &class[1..] } else { class };
+                let class = &pattern[start..end];
                 let mut hit = false;
                 let mut index = 0;
                 while index < class.len() {
-                    if index + 2 < class.len() && class[index + 1] == b'-' {
+                    if index + 2 < class.len() && class[index + 1] == '-' {
                         hit |= (class[index]..=class[index + 2]).contains(&text[0]);
                         index += 3;
                     } else {
@@ -585,10 +806,32 @@ fn wildcard_matches(pattern: &[u8], text: &[u8]) -> bool {
                 }
                 hit != negate && matches(&pattern[end + 1..], &text[1..])
             }
-            Some(byte) => !text.is_empty() && byte == text[0] && matches(&pattern[1..], &text[1..]),
+            Some(c) => !text.is_empty() && c == text[0] && matches(&pattern[1..], &text[1..]),
         }
     }
     matches(pattern, text)
+}
+
+/// Runs `command` in the window manager, in a message of its own: the text
+/// reaches it unchanged, with no shell or command line in between. A command
+/// the window manager reports as failed is an error carrying its reason.
+pub fn run_command(wm_name: &str, command: &str) -> Result<(), String> {
+    command_outcome(&request(wm_name, RUN_COMMAND, command)?)
+}
+
+/// The outcome of a run request. The reply holds one result per command
+/// run, and a failed one says why.
+fn command_outcome(reply: &Json) -> Result<(), String> {
+    for result in reply.array()? {
+        let result = result.object()?;
+        if !member(result, "success")?.bool()? {
+            return Err(match result.get("error") {
+                Some(Json::String(error)) => error.clone(),
+                _ => "unknown error".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -672,16 +915,21 @@ impl TreeReply {
 }
 
 pub fn get_tree(wm_name: &str) -> Result<TreeReply, String> {
-    TreeReply::from_json(&request(wm_name, GET_TREE)?)
+    TreeReply::from_json(&request(wm_name, GET_TREE, "")?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        config_from_reply, expand_path_vars, include_paths, read_reply, socket_path,
-        version_from_reply, wildcard_matches, JsonParser, TreeReply, IPC_MAGIC,
+        command_outcome, config_from_reply, encode_request, expand_glob, expand_path_vars,
+        include_paths, read_reply, socket_path, split_words, version_from_reply,
+        walk_included_configs, wildcard_matches, Config, JsonParser, TreeReply, IPC_MAGIC,
+        RUN_COMMAND,
     };
+    use std::collections::HashMap;
+    use std::fs;
     use std::io::Read;
+    use std::path::{Path, PathBuf};
 
     /// Hands out at most `chunk` bytes per read, like a socket under load.
     struct Fragmented<'a> {
@@ -770,13 +1018,63 @@ mod tests {
     }
 
     #[test]
-    fn config_reply_concatenates_all_i3_partials() {
+    fn config_reply_keeps_each_i3_file_apart() {
+        // A file without a final newline must not run into the next one.
         let json = JsonParser::new(
-            br#"{"included_configs":[{"variable_replaced_contents":"one"},{"variable_replaced_contents":"two"}]}"#,
+            br#"{"included_configs":[{"variable_replaced_contents":"one"},{"variable_replaced_contents":"two\n"}]}"#,
         )
         .parse()
         .unwrap();
-        assert_eq!(config_from_reply(json, "i3").unwrap(), "onetwo");
+        assert_eq!(
+            config_from_reply(json, "i3", None).unwrap(),
+            Config::I3 {
+                files: vec!["one".to_owned(), "two\n".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn sway_config_reply_is_the_main_file_as_written() {
+        let json = JsonParser::new(br#"{"config":"set $a b\ninclude ~/x/*\n"}"#)
+            .parse()
+            .unwrap();
+        let path = Some(PathBuf::from("/etc/sway/config"));
+        assert_eq!(
+            config_from_reply(json, "sway", path.clone()).unwrap(),
+            Config::Sway {
+                main: "set $a b\ninclude ~/x/*\n".to_owned(),
+                path
+            }
+        );
+    }
+
+    #[test]
+    fn run_request_carries_the_command_as_is() {
+        let command = "exec notify-send \"caf\u{e9}  \\\"x\\\"\"";
+        let request = encode_request(RUN_COMMAND, command).unwrap();
+        assert_eq!(&request[..6], IPC_MAGIC);
+        // The length counts bytes, not characters.
+        let length = u32::from_ne_bytes(request[6..10].try_into().unwrap());
+        assert_eq!(length as usize, command.len());
+        assert_eq!(u32::from_ne_bytes(request[10..14].try_into().unwrap()), 0);
+        assert_eq!(&request[14..], command.as_bytes());
+        assert_eq!(encode_request(9, "").unwrap().len(), 14);
+    }
+
+    #[test]
+    fn a_failed_command_is_an_error_with_its_reason() {
+        let outcome = |reply: &[u8]| command_outcome(&JsonParser::new(reply).parse().unwrap());
+        assert_eq!(outcome(br#"[{"success":true}]"#), Ok(()));
+        assert_eq!(outcome(br#"[]"#), Ok(()));
+        assert_eq!(
+            outcome(br#"[{"success":true},{"success":false,"error":"caf\u00e9 \"x\""}]"#),
+            Err("caf\u{e9} \"x\"".to_owned())
+        );
+        assert_eq!(
+            outcome(br#"[{"success":false}]"#),
+            Err("unknown error".to_owned())
+        );
+        assert!(outcome(br#"{"success":true}"#).is_err());
     }
 
     #[test]
@@ -795,32 +1093,66 @@ mod tests {
     }
 
     #[test]
-    fn expansion_and_glob_matching_cover_vala_shapes() {
-        std::env::set_var("ILIA_TEST_ROOT", "/tmp/example");
-        std::env::set_var("ILIA_TEST_DOLLAR", "x");
-        std::env::remove_var("ILIA_TEST_UNSET_QQ");
+    fn version_reply_takes_numbers_as_i3_and_sway_send_them() {
+        let json = JsonParser::new(
+            br#"{"human_readable":"1.11","loaded_config_file_name":"/etc/sway/config","major":1,"minor":11,"patch":0}"#,
+        )
+        .parse()
+        .unwrap();
+        let version = version_from_reply(json).unwrap();
+        assert_eq!(version.loaded_config_file_name, "/etc/sway/config");
+        assert_eq!(version.major, "1");
+        assert_eq!(version.minor, "11");
+        assert_eq!(version.patch, "0");
+    }
+
+    #[test]
+    fn expansion_and_glob_matching_follow_sway() {
+        std::env::set_var("ILIA_TEST_ROOT", "/root dir");
+        std::env::remove_var("ILIA_TEST_UNSET");
         assert_eq!(
-            expand_path_vars("$ILIA_TEST_ROOT/config"),
-            "/tmp/example/config"
+            expand_path_vars("$ILIA_TEST_ROOT/a/${ILIA_TEST_ROOT}"),
+            "/root dir/a//root dir"
         );
-        // Vala-exact quirks (replicated reference bugs): `$$` collapses
-        // to `$` while the name after it is still expanded; a `$` after
-        // literal leading text corrupts that segment with a spurious
-        // `$`; a trailing `$` re-parses the leading literal as a name.
-        assert_eq!(expand_path_vars("$$ILIA_TEST_DOLLAR"), "$x");
+        // A name that is not set, or is no name at all, stays as written.
         assert_eq!(
-            expand_path_vars("$$ILIA_TEST_UNSET_QQ"),
-            "$$ILIA_TEST_UNSET_QQ"
+            expand_path_vars("/a/$ILIA_TEST_UNSET/${ILIA_TEST_UNSET}/$/${x"),
+            "/a/$ILIA_TEST_UNSET/${ILIA_TEST_UNSET}/$/${x"
         );
-        assert_eq!(expand_path_vars("/lit/$ILIA_TEST_DOLLAR/x"), "$/lit/x/x");
-        assert_eq!(expand_path_vars("zzlit$"), "$zzlit$");
-        assert_eq!(expand_path_vars("$ILIA_MISSING/file"), "$ILIA_MISSING/file");
-        assert!(wildcard_matches(b"[ab]*.conf", b"alpha.conf"));
-        assert!(!wildcard_matches(b"[ab]*.conf", b"zeta.conf"));
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expand_path_vars("~/x"), format!("{home}/x"));
+        }
+        assert_eq!(expand_path_vars("~x/y"), "~x/y");
+        let fits = |pattern: &str, text: &str| {
+            let chars = |text: &str| text.chars().collect::<Vec<_>>();
+            wildcard_matches(&chars(pattern), &chars(text))
+        };
+        assert!(fits("[ab]*.conf", "alpha.conf"));
+        assert!(!fits("[ab]*.conf", "zeta.conf"));
+        assert!(fits("[0-4]?_*", "10_base"));
+        assert!(!fits("[!0-4]?_*", "10_base"));
+        assert!(fits("[]x]", "]"));
+        assert!(fits("a[b", "a[b"));
+        assert!(fits("é?", "éü"));
+        assert!(!fits("a*b", "acd"));
         assert_eq!(
-            include_paths("  include $ILIA_TEST_ROOT/*.conf\n# include ignored\n"),
-            vec!["/tmp/example/*.conf"]
+            expand_glob(Path::new("/nonexistent/x")),
+            [PathBuf::from("/nonexistent/x")]
         );
+        assert!(expand_glob(Path::new("/nonexistent/*")).is_empty());
+        // An include reads existing files only, sorted, and not hidden ones.
+        let directory = scratch("paths");
+        fs::create_dir(directory.join("sub")).unwrap();
+        for name in ["b", "a", ".hidden"] {
+            fs::write(directory.join(name), "").unwrap();
+        }
+        let canonical = fs::canonicalize(&directory).unwrap();
+        assert_eq!(
+            include_paths("*", Some(&directory)),
+            [canonical.join("a"), canonical.join("b")]
+        );
+        assert!(include_paths("missing", Some(&directory)).is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -841,5 +1173,176 @@ mod tests {
                 .as_deref(),
             Some("Editor")
         );
+    }
+
+    fn lines(main: &str, resources: &[(&str, &str)]) -> Vec<String> {
+        let resources: HashMap<_, _> = resources
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        walk_included_configs(main, None, &resources)
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// A fresh directory for one test's files.
+    fn scratch(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("ilia-sway-config-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn words_split_at_blanks_outside_quotes_and_criteria() {
+        assert_eq!(
+            split_words("  bindsym\t$mod+q   exec  a "),
+            ["bindsym", "$mod+q", "exec", "a"]
+        );
+        assert_eq!(
+            split_words(r#"exec notify-send "Two  Words" 'it''s  x'"#),
+            ["exec", "notify-send", r#""Two  Words""#, "'it''s  x'"]
+        );
+        assert_eq!(
+            split_words(r#"[title="a ] b" class='c  d'] focus"#),
+            [r#"[title="a ] b" class='c  d']"#, "focus"]
+        );
+        // Only a bracket that starts a word opens criteria.
+        assert_eq!(split_words("exec a[b c]"), ["exec", "a[b", "c]"]);
+        assert_eq!(
+            split_words(r#"exec "say \"x  y\"" a\ b"#),
+            ["exec", r#""say \"x  y\"""#, r"a\ b"]
+        );
+        assert_eq!(split_words("exec café  ü"), ["exec", "café", "ü"]);
+        assert!(split_words(" \t ").is_empty());
+    }
+
+    #[test]
+    fn variables_have_their_value_where_they_are_used() {
+        assert_eq!(
+            lines(
+                "set $a first\nbindsym x exec $a\nset $a second\nbindsym y exec $a $b\nset $b later",
+                &[]
+            ),
+            ["bindsym x exec first", "bindsym y exec second $b"]
+        );
+    }
+
+    #[test]
+    fn the_longest_defined_name_wins() {
+        assert_eq!(
+            lines(
+                "set $t.s short\nset $t.s.long long\nbindsym x exec $t.s.long $t.s $t.s.other $t",
+                &[]
+            ),
+            ["bindsym x exec long short short.other $t"]
+        );
+    }
+
+    #[test]
+    fn values_are_joined_as_sway_joins_words() {
+        assert_eq!(
+            lines(
+                "set $w  a    b \"Two  Words\"\nbindsym x exec    $w\t[class=\"x  y\"]  'q  r'",
+                &[]
+            ),
+            [r#"bindsym x exec a b "Two  Words" [class="x  y"] 'q  r'"#]
+        );
+        // A value is split again where it is used.
+        assert_eq!(
+            lines(
+                "set_from_resource $r key\nbindsym x exec $r",
+                &[("key", "a   b")]
+            ),
+            ["bindsym x exec a b"]
+        );
+    }
+
+    #[test]
+    fn comments_and_names_in_them_stay_as_written() {
+        assert_eq!(
+            lines(
+                "set $a value\n## Cat // $a  label // <> x ##\n# set $b nope\nbindsym x exec $b",
+                &[]
+            ),
+            [
+                "## Cat // $a  label // <> x ##",
+                "# set $b nope",
+                "bindsym x exec $b"
+            ]
+        );
+    }
+
+    #[test]
+    fn resources_win_over_defaults_unless_empty() {
+        let resources = [("set.key", "from resource"), ("empty.key", "")];
+        assert_eq!(
+            lines(
+                "set $k set.key\n\
+                 set_from_resource $a $k default\n\
+                 set_from_resource $b empty.key \"Two  Words\"   x\n\
+                 set_from_resource $c missing.key\n\
+                 set $d kept\n\
+                 set_from_resource $d missing.key\n\
+                 set_from_resource $e missing.key \"\"\n\
+                 bindsym x exec $a|$b|$c|$d|$e",
+                &resources
+            ),
+            [r#"bindsym x exec from resource|"Two  Words" x|$c|kept|"""#]
+        );
+    }
+
+    #[test]
+    fn includes_are_read_in_place_sorted_and_once() {
+        let directory = scratch("includes");
+        let parts = directory.join("parts");
+        fs::create_dir(&parts).unwrap();
+        fs::write(parts.join("20_b"), "bindsym b exec $v\nset $v from-b").unwrap();
+        fs::write(parts.join("10_a"), "set $v from-a\nbindsym a exec $v\n").unwrap();
+        fs::write(parts.join(".hidden"), "bindsym h exec hidden\n").unwrap();
+        fs::write(
+            directory.join("nested"),
+            "include parts/10_a\nbindsym n exec $v\n",
+        )
+        .unwrap();
+        let main = directory.join("config");
+        let text = "set $v main\n\
+                    include parts/*\n\
+                    bindsym m exec $v\n\
+                    include nested\n\
+                    include config\n\
+                    include ./parts/../parts/20_b\n";
+        fs::write(&main, text).unwrap();
+        let read = walk_included_configs(text, Some(&main), &HashMap::new());
+        let read: Vec<_> = read.iter().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            read,
+            [
+                "bindsym a exec from-a",
+                "bindsym b exec from-a",
+                "bindsym m exec from-b",
+                "bindsym n exec from-b",
+            ]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn include_patterns_take_variables_and_the_environment() {
+        let directory = scratch("patterns");
+        fs::write(directory.join("first"), "bindsym f exec first\n").unwrap();
+        fs::write(directory.join("second"), "bindsym s exec second\n").unwrap();
+        std::env::set_var("ILIA_TEST_PARTS", &directory);
+        let text = "set $file first\n\
+                    include $ILIA_TEST_PARTS/$file\n\
+                    set $file second\n\
+                    include ${ILIA_TEST_PARTS}/$file\n";
+        assert_eq!(
+            lines(text, &[]),
+            ["bindsym f exec first", "bindsym s exec second"]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

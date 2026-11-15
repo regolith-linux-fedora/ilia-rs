@@ -33,6 +33,11 @@ Module map:
 - `icons.rs`: the reference icon-loader order shared by the new pages.
 - `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
   open (gnome-flashback's input-source D-Bus service on X11).
+- `keybindings.rs`: the Keybindings page, which runs the chosen binding's
+  command over IPC (`ipc.rs`) as the window manager holds it. i3 reports its
+  configuration with the variables applied; sway's is read in `ipc.rs` as
+  sway reads it (includes in place, variables and resource-service values
+  where they are used).
 - `dialog.rs`, `application.rs`: the shell.
 
 ## Meson cutover
@@ -105,10 +110,10 @@ Against the parity harness:
 
 - Launch results: gio-rs reports a launch that returns `FALSE` without a
   `GError` as success, so the reference's message-only failure lines
-  (`Error: execute_command failed`, `Error: execute_app failed`,
-  `Error: execute_keybinding failed`) cannot be produced from safe Rust. GIO
-  sets an error whenever a launch fails, so the observable failure paths are
-  the `<prefix>: <message>` forms, which are reproduced.
+  (`Error: execute_command failed`, `Error: execute_app failed`) cannot be
+  produced from safe Rust. GIO sets an error whenever a launch fails, so the
+  observable failure paths are the `<prefix>: <message>` forms, which are
+  reproduced.
 - Text that is not valid UTF-8 is shown lossily, since GTK string values must
   be UTF-8; TextList keeps the bytes of such stdin lines and prints them back
   unchanged.
