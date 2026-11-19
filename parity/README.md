@@ -21,7 +21,9 @@ behaviour contract of the Rust port. Where the port has since fixed a bug on
 purpose, the case expects the fixed behaviour: Enter on text that matches no
 row prints it (TextList) or runs it (Terminal), and the notification fixture
 carries rofication `timestamp` fields because the page lists the newest
-notification first.
+notification first. An Applications entry starts with its `%c`, `%i` and
+`%k` field codes filled in as literal arguments, in the entry's `Path`
+(upstream #168).
 
 The suite records existing behavior, including `ilia version 0.19`, native
 little-endian i3 framing, the single-read IPC client, the fixed rofication

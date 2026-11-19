@@ -15,12 +15,12 @@ use crate::add_app_form::AddAppForm;
 use crate::clipboard_keeper;
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
 use crate::keybindings::navigate;
+use crate::launch::launch_desktop_app;
 use crate::page_files::{PageFile, Rows};
 use crate::pages::{
     rebuild_keeping_selection, select_first_row, select_row_near, DialogPage, FUZZY_MATCHING,
 };
 use crate::program_path;
-use crate::runner::runner_app_info;
 
 const ICON: u32 = 0;
 const NAME: u32 = 1;
@@ -61,7 +61,6 @@ pub struct ApplicationsPage {
     // The desktop ids this run's Ctrl+Delete hides appended to
     // `hidden-apps`, latest last, less those Ctrl+z has reversed.
     hides: RefCell<Vec<String>>,
-    post_launch_sleep: u64,
     quit: Rc<dyn Fn()>,
     // An app was started: ilia is closing. A click can activate a row twice.
     launched: Cell<bool>,
@@ -79,7 +78,6 @@ impl ApplicationsPage {
             *launch_counts.entry(id.clone()).or_insert(0) += 1;
         }
         let icon_size = settings.int("icon-size");
-        let post_launch_sleep = settings.int("post-launch-sleep").max(0) as u64;
 
         let model = gtk::ListStore::new(&[
             Pixbuf::static_type(),
@@ -140,7 +138,6 @@ impl ApplicationsPage {
             launch_history: Rc::new(RefCell::new(launch_history)),
             apps,
             hides: RefCell::default(),
-            post_launch_sleep,
             quit,
             launched: Cell::new(false),
         });
@@ -373,15 +370,11 @@ impl ApplicationsPage {
     }
 
     fn execute(&self, app: &gio::DesktopAppInfo) {
-        // Only the first activation starts anything: ilia is closing.
-        if self.launched.replace(true) {
-            return;
-        }
         execute_app(
             app,
             &self.settings,
             &self.launch_history,
-            self.post_launch_sleep,
+            &self.launched,
             &self.quit,
         );
     }
@@ -734,8 +727,9 @@ pub struct AppListPage {
     rows: Rc<AppRows>,
     settings: gio::Settings,
     launch_history: Rc<RefCell<Vec<String>>>,
-    post_launch_sleep: u64,
     quit: Rc<dyn Fn()>,
+    // An app was started: ilia is closing.
+    launched: Rc<Cell<bool>>,
 }
 
 /// The apps of an `AppListPage`, by the INDEX of their rows, and which of
@@ -799,7 +793,6 @@ impl AppListPage {
             .map(ToString::to_string)
             .collect();
         let icon_size = settings.int("icon-size");
-        let post_launch_sleep = settings.int("post-launch-sleep").max(0) as u64;
         let model = gtk::ListStore::new(&[
             Pixbuf::static_type(),
             String::static_type(),
@@ -846,14 +839,14 @@ impl AppListPage {
             rows,
             settings,
             launch_history: Rc::new(RefCell::new(launch_history)),
-            post_launch_sleep,
             quit,
+            launched: Rc::default(),
         };
         connect_launch(
             &page.view,
             &page.settings,
             &page.launch_history,
-            page.post_launch_sleep,
+            &page.launched,
             &page.quit,
         );
         page.follow_settings();
@@ -905,7 +898,7 @@ impl DialogPage for AppListPage {
                 &app,
                 &self.settings,
                 &self.launch_history,
-                self.post_launch_sleep,
+                &self.launched,
                 &self.quit,
             );
         }
@@ -979,10 +972,11 @@ fn connect_launch(
     view: &gtk::TreeView,
     settings: &gio::Settings,
     history: &Rc<RefCell<Vec<String>>>,
-    post_launch_sleep: u64,
+    launched: &Rc<Cell<bool>>,
     quit: &Rc<dyn Fn()>,
 ) {
     let (settings, history, quit) = (settings.clone(), history.clone(), quit.clone());
+    let launched = launched.clone();
     view.connect_row_activated(move |view, path, _| {
         let Some(filter) = view.model().and_downcast::<gtk::TreeModelFilter>() else {
             return;
@@ -993,7 +987,7 @@ fn connect_launch(
         let Some(app) = app_value(&filter, &iter) else {
             return;
         };
-        execute_app(&app, &settings, &history, post_launch_sleep, &quit);
+        execute_app(&app, &settings, &history, &launched, &quit);
     });
 }
 
@@ -1489,50 +1483,28 @@ impl AppList {
     }
 }
 
+/// Starts the entry as its desktop file describes it, once per run (a click
+/// can activate a row twice), and closes as soon as it has started or
+/// failed. A start that succeeded is recorded in the launch history.
 fn execute_app(
     desktop: &gio::DesktopAppInfo,
     settings: &gio::Settings,
-    history: &RefCell<Vec<String>>,
-    post_launch_sleep: u64,
+    history: &Rc<RefCell<Vec<String>>>,
+    launched: &Cell<bool>,
     quit: &Rc<dyn Fn()>,
 ) {
-    let app_info: gio::AppInfo = desktop.clone().upcast();
-    let id = app_info.id().map(|id| id.to_string()).unwrap_or_default();
-    let name = app_info.name().to_string();
-    let runner = match runner_app_info(&app_info) {
-        Ok(runner) => runner,
-        Err(error) => {
-            eprintln!("{}", error.message());
-            quit();
-            return;
-        }
-    };
-    let context = gio::AppLaunchContext::new();
-    let quit_on_launched = quit.clone();
-    context.connect_launched(move |_, _, _| quit_on_launched());
-    let quit_on_failure = quit.clone();
-    context.connect_launch_failed(move |_, startup_notify_id| {
-        eprintln!("Failed to launch app: {startup_notify_id}");
-        quit_on_failure();
-    });
-    let quit_on_timeout = quit.clone();
-    context.connect_local("launch-started", false, move |_| {
-        let quit = quit_on_timeout.clone();
-        glib::timeout_add_local_once(Duration::from_millis(post_launch_sleep), move || quit());
-        None
-    });
-
-    match runner.launch(&[], Some(&context)) {
-        Ok(()) => record_launch(settings, &mut history.borrow_mut(), id),
-        Err(error) => {
-            if error.message().is_empty() {
-                eprintln!("Failed to launch {name}");
-            } else {
-                eprintln!("{}", error.message());
-            }
-            quit();
-        }
+    if launched.replace(true) {
+        return;
     }
+    let id = desktop.id().map(|id| id.to_string()).unwrap_or_default();
+    let (settings, history, quit) = (settings.clone(), history.clone(), quit.clone());
+    launch_desktop_app(desktop, move |result| {
+        match result {
+            Ok(()) => record_launch(&settings, &mut history.borrow_mut(), id),
+            Err(message) => eprintln!("{message}"),
+        }
+        quit();
+    });
 }
 
 /// Appends `entry` to the launch `history` and stores its newest

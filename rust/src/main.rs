@@ -9,6 +9,7 @@ mod icons;
 mod input_sources;
 mod ipc;
 mod keybindings;
+mod launch;
 mod new_entry;
 mod notifications;
 mod page_files;

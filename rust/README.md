@@ -27,6 +27,9 @@ Module map:
   and the notifications page.
 - `sparql.rs`, `tracker.rs`: the run-time SPARQL binding and the Files page,
   which searches on worker threads once typing pauses.
+- `launch.rs`: starting an Applications-page entry as its desktop file
+  describes it (Exec field codes, Path, `Terminal=true`, the scope, and
+  `DBusActivatable=true` activation over the session bus).
 - `terminal.rs`: the Commands page (asynchronous PATH scan, launches through
   the `systemd-run` wrapper in `runner.rs`).
 - `textlist.rs`: the TextList page (stdin read on a background thread, so

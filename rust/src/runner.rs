@@ -65,6 +65,39 @@ pub fn scope_command(id: &str) -> Option<Vec<OsString>> {
     ])
 }
 
+/// The program and arguments that start a desktop entry's `argv`, without a
+/// shell: inside x-terminal-emulator for `Terminal=true`, and the whole of
+/// it inside the entry's own systemd scope when `systemd_run` (the scope
+/// runner found on PATH) is given.
+pub fn desktop_argv(
+    app_id: &str,
+    argv: Vec<String>,
+    terminal: bool,
+    systemd_run: Option<&std::path::Path>,
+) -> Vec<String> {
+    let argv = if terminal {
+        [TERMINAL.to_owned(), "-e".to_owned()]
+            .into_iter()
+            .chain(argv)
+            .collect()
+    } else {
+        argv
+    };
+    match systemd_run {
+        Some(systemd_run) => [
+            systemd_run.to_string_lossy().into_owned(),
+            "--user".to_owned(),
+            "--scope".to_owned(),
+            "--unit".to_owned(),
+            unit_name(app_id),
+        ]
+        .into_iter()
+        .chain(argv)
+        .collect(),
+        None => argv,
+    }
+}
+
 /// Whether the desktop entry asks to run in a terminal (`Terminal=true`).
 fn needs_terminal(app_info: &gio::AppInfo) -> bool {
     app_info
@@ -110,8 +143,9 @@ pub fn systemd_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_terminal, needs_terminal, systemd_escape, unit_name};
+    use super::{desktop_argv, in_terminal, needs_terminal, systemd_escape, unit_name};
     use gio::prelude::*;
+    use std::path::Path;
 
     // GLib rejects an entry whose Exec program is not on PATH, and another
     // test swaps PATH while it runs: name the program by its absolute path.
@@ -180,5 +214,62 @@ mod tests {
         assert!(random
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    fn is_unit_for(unit: &str, escaped_id: &str) -> bool {
+        let Some(random) = unit
+            .strip_prefix(&format!("run_ilia_{escaped_id}_"))
+            .and_then(|rest| rest.strip_suffix(".scope"))
+        else {
+            return false;
+        };
+        random.len() == 8
+            && random
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[test]
+    fn scope_units_keep_the_vala_pattern_with_a_fresh_suffix() {
+        let first = unit_name(".hidden name.desktop");
+        assert!(
+            is_unit_for(&first, "\\x2ehidden\\x20name.desktop"),
+            "{first}"
+        );
+        let others: Vec<String> = (0..4).map(|_| unit_name("app.desktop")).collect();
+        assert!(others.iter().all(|unit| is_unit_for(unit, "app.desktop")));
+        assert!(others.iter().any(|unit| unit != &others[0]));
+    }
+
+    #[test]
+    fn desktop_argv_wraps_terminal_and_scope_without_a_shell() {
+        let argv = || {
+            vec![
+                "probe".to_owned(),
+                "two words".to_owned(),
+                "$HOME".to_owned(),
+            ]
+        };
+        assert_eq!(desktop_argv("app.desktop", argv(), false, None), argv());
+        assert_eq!(
+            desktop_argv("app.desktop", argv(), true, None),
+            ["x-terminal-emulator", "-e", "probe", "two words", "$HOME"]
+        );
+
+        let scoped = desktop_argv(
+            "app.desktop",
+            argv(),
+            true,
+            Some(Path::new("/usr/bin/systemd-run")),
+        );
+        assert_eq!(
+            scoped[..4],
+            ["/usr/bin/systemd-run", "--user", "--scope", "--unit"]
+        );
+        assert!(is_unit_for(&scoped[4], "app.desktop"), "{}", scoped[4]);
+        assert_eq!(
+            scoped[5..],
+            ["x-terminal-emulator", "-e", "probe", "two words", "$HOME"]
+        );
     }
 }
