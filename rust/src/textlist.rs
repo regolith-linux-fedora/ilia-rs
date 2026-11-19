@@ -1,8 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gio::prelude::*;
 
@@ -10,35 +14,52 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
+use crate::apps::{record_launch, LAUNCH_HISTORY};
 use crate::args::Args;
 use crate::filter::{contains_all_words, fold_text, is_subsequence, query_words};
 use crate::icons::load_icon_from_name;
 use crate::keybindings::navigate;
+use crate::page_files::{Exec, PageFile, Rows};
 use crate::pages::{
     is_enter_key, select_first_row, select_row_near, selected_position, DialogPage, FUZZY_MATCHING,
 };
+use crate::runner::scope_command;
 
 const DEFAULT_ICON: &str = "utilities-terminal";
 const FALLBACK_ICON: &str = "applications-other";
+const HELP: &str = "This dialog presents a filterable list of items to select from. If no item matches, enter returns the typed text.";
+const PAGE_FILE_HELP: &str = "This dialog presents the items of a page file. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will choose it.";
 
 /// Inputs up to this many lines are filtered on every key; larger ones once
 /// typing pauses for `FILTER_DELAY`.
 const IMMEDIATE_FILTER_LINES: usize = 10_000;
 const FILTER_DELAY: Duration = Duration::from_millis(100);
-/// The most standard input read at once by the background reader.
+/// The most input read at once by the background reader.
 const READ_SIZE: usize = 1 << 16;
+/// How many read lines join the page at a time.
+const INGEST_SLICE_LINES: usize = 256;
+/// How long lines keep joining the page before pending events, key
+/// presses included, are handled.
+const INGEST_SLICE_TIME: Duration = Duration::from_millis(20);
+/// How long the launcher, its window gone, waits for a command a choice
+/// started to finish before it exits anyway.
+const LAUNCH_WAIT: Duration = Duration::from_secs(3);
 
-/// One input line, as shown, as matched and as printed.
+/// One input line, as shown, as matched and as chosen.
 struct Line {
     text: String,
     // The folded text, when it differs.
     folded: Option<String>,
-    // The bytes read, when they are not UTF-8: the text shows them with
-    // replacement characters, but the selection prints them back as read.
+    // The bytes a choice acts on, when they are not the text: bytes read
+    // that are not UTF-8, which the text shows with replacement characters
+    // but a choice gives back as read, or a value apart from the label.
     raw: Option<Box<[u8]>>,
+    // How often the line's value was chosen, on a page ordered that way.
+    count: usize,
 }
 
 impl Line {
+    /// A line of standard input: shown and chosen whole.
     fn new(bytes: Vec<u8>) -> Self {
         let (text, raw) = match String::from_utf8(bytes) {
             Ok(text) => (text, None),
@@ -48,9 +69,37 @@ impl Line {
                 (text, Some(bytes.into_boxed_slice()))
             }
         };
+        Self::with_raw(text, raw)
+    }
+
+    /// An entry of a page file: a label and a value divided at the first
+    /// tab, or the whole entry as both. An empty label shows the value, an
+    /// empty value is the label; with both empty there is no row.
+    fn pair(bytes: &[u8]) -> Option<Self> {
+        let (label, value) = match bytes.iter().position(|&byte| byte == b'\t') {
+            Some(tab) => (&bytes[..tab], &bytes[tab + 1..]),
+            None => (bytes, bytes),
+        };
+        let (label, value) = match (label.is_empty(), value.is_empty()) {
+            (true, true) => return None,
+            (true, false) => (value, value),
+            (false, true) => (label, label),
+            (false, false) => (label, value),
+        };
+        let text = String::from_utf8_lossy(label).into_owned();
+        let raw = (value != text.as_bytes()).then(|| value.into());
+        Some(Self::with_raw(text, raw))
+    }
+
+    fn with_raw(text: String, raw: Option<Box<[u8]>>) -> Self {
         let folded = fold_text(&text);
         let folded = (folded != text).then_some(folded);
-        Self { text, folded, raw }
+        Self {
+            text,
+            folded,
+            raw,
+            count: 0,
+        }
     }
 
     fn folded(&self) -> &str {
@@ -60,6 +109,12 @@ impl Line {
     fn bytes(&self) -> &[u8] {
         self.raw.as_deref().unwrap_or(self.text.as_bytes())
     }
+}
+
+/// Whether a line of command output holds no row: empty, or white space
+/// alone.
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
 }
 
 /// Whether the already folded `text` matches the query `words`: every word
@@ -74,7 +129,7 @@ fn line_matches(text: &str, words: &[String], subsequence: bool) -> bool {
     }
 }
 
-/// The lines on show: those matching the query words, in input order.
+/// The lines on show: those matching the query words, in list order.
 #[derive(Debug, Default, PartialEq)]
 struct Shown {
     words: Vec<String>,
@@ -127,12 +182,23 @@ impl Shown {
             lines: matching,
         }
     }
+
+    /// Makes room for a line inserted into the list at `position`: the
+    /// lines from there on move one place down. Returns where among the
+    /// lines on show a line at `position` belongs.
+    fn insert_at(&mut self, position: u32) -> usize {
+        let start = self.lines.partition_point(|&line| line < position);
+        for line in &mut self.lines[start..] {
+            *line += 1;
+        }
+        start
+    }
 }
 
-/// Splits standard input into items as it arrives: an item ends at a
-/// newline, and the end of the input ends a last item without one. Bytes
-/// stay bytes until an item is complete, so a character split between
-/// reads is joined again.
+/// Splits input into items as it arrives: an item ends at a newline, and
+/// the end of the input ends a last item without one. Bytes stay bytes
+/// until an item is complete, so a character split between reads is joined
+/// again.
 #[derive(Default)]
 struct LineSplitter {
     partial: Vec<u8>,
@@ -166,7 +232,51 @@ fn item(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
+/// Where the lines of a list come from.
+enum Source {
+    /// Standard input: the text-list page.
+    Stdin,
+    /// The fixed entries of a page file.
+    Items(Vec<String>),
+    /// The output of a page file's shell command, run once the page is
+    /// first shown.
+    Command(String),
+}
+
+/// What choosing a line does.
+enum Action {
+    /// Print its value.
+    Print,
+    /// Run the page file's Exec words with the value.
+    Exec(Vec<String>),
+    /// Nothing: the Exec value could not be split into words.
+    Nothing,
+}
+
+/// A page's settings: the text-list page's, or a page file's.
+struct Spec {
+    id: String,
+    // The tab title, as markup.
+    name: String,
+    icon: String,
+    help: &'static str,
+    key: Option<char>,
+    // The icon rows show; `None` shows none.
+    row_icon: Option<Option<String>>,
+    source: Source,
+    action: Action,
+    // Whether Enter with no line matching prints the typed text.
+    prints_unmatched: bool,
+    // The prefix of the page's launch history entries, when its rows are
+    // ordered by how often they were chosen.
+    history_prefix: Option<String>,
+}
+
+/// A filterable list of lines: those standard input holds (the text-list
+/// page), or those a page file lists or its command prints.
 pub struct TextListPage {
+    spec: Spec,
+    settings: gio::Settings,
     entry: gtk::Entry,
     view: gtk::TreeView,
     root: gtk::Widget,
@@ -175,19 +285,24 @@ pub struct TextListPage {
     // Whether lines also match by subsequence: the `fuzzy-matching`
     // setting, followed while the launcher runs.
     subsequence: Cell<bool>,
-    // The lines read so far.
+    // The lines read so far, in list order.
     lines: RefCell<Vec<Line>>,
-    // Every line, in input order: the rows for an empty query.
+    // How often each value was chosen, on a page ordered that way.
+    counts: HashMap<String, usize>,
+    // Every line, in list order: the rows for an empty query.
     all_rows: gtk::ListStore,
     // The rows the view shows: `all_rows`, or the matching lines alone.
     rows: RefCell<gtk::ListStore>,
     shown: RefCell<Shown>,
     // A refilter waiting for typing to pause.
     pending: RefCell<Option<glib::SourceId>>,
+    // Whether the lines have started to arrive.
+    started: Cell<bool>,
     this: Weak<TextListPage>,
 }
 
 impl TextListPage {
+    /// The text-list page: the lines of standard input.
     pub fn new(
         settings: gio::Settings,
         entry: gtk::Entry,
@@ -195,23 +310,82 @@ impl TextListPage {
         quit: Rc<dyn Fn()>,
     ) -> Rc<Self> {
         // `-n` drops the icon column.
-        let render_icon = !args.has("-n");
-        // A bare `-i` clears the icon, which falls back to the generic one.
-        let icon = if args.has("-i") {
-            args.value("-i")
-        } else {
-            Some(DEFAULT_ICON)
+        let row_icon = (!args.has("-n")).then(|| {
+            // A bare `-i` clears the icon, which falls back to the generic one.
+            if args.has("-i") {
+                args.value("-i").map(str::to_owned)
+            } else {
+                Some(DEFAULT_ICON.to_owned())
+            }
+        });
+        let spec = Spec {
+            id: "textlist".to_owned(),
+            name: "TextList".to_owned(),
+            icon: DEFAULT_ICON.to_owned(),
+            help: HELP,
+            key: Some('t'),
+            row_icon,
+            source: Source::Stdin,
+            action: Action::Print,
+            prints_unmatched: true,
+            history_prefix: None,
         };
+        Self::build(settings, entry, spec, quit)
+    }
 
+    /// The page a page file of fixed entries or of a command's output
+    /// defines.
+    pub fn from_page_file(
+        settings: gio::Settings,
+        entry: gtk::Entry,
+        file: &PageFile,
+        key: Option<char>,
+        quit: Rc<dyn Fn()>,
+    ) -> Rc<Self> {
+        let source = match &file.rows {
+            Rows::Items(items) => Source::Items(items.clone()),
+            Rows::Command(command) => Source::Command(command.clone()),
+            Rows::Apps(_) => Source::Items(Vec::new()),
+        };
+        let action = match &file.exec {
+            Exec::Print => Action::Print,
+            Exec::Words(words) => Action::Exec(words.clone()),
+            Exec::Invalid => Action::Nothing,
+        };
+        let spec = Spec {
+            id: file.id.clone(),
+            // The title is plain text.
+            name: glib::markup_escape_text(&file.name).into(),
+            icon: file.icon.clone(),
+            help: PAGE_FILE_HELP,
+            key,
+            row_icon: Some(Some(file.icon.clone())),
+            source,
+            action,
+            prints_unmatched: false,
+            history_prefix: file
+                .frequency
+                .then(|| format!("{}#", file.id.to_ascii_lowercase())),
+        };
+        Self::build(settings, entry, spec, quit)
+    }
+
+    fn build(
+        settings: gio::Settings,
+        entry: gtk::Entry,
+        spec: Spec,
+        quit: Rc<dyn Fn()>,
+    ) -> Rc<Self> {
         let view = gtk::TreeView::new();
         view.set_headers_visible(false);
         view.set_fixed_height_mode(true);
         view.set_enable_search(false);
-        if render_icon {
+        if let Some(icon) = &spec.row_icon {
             // Every row shows the same icon, so it is set on the renderer
             // rather than stored in each row.
             let icon_renderer = gtk::CellRendererPixbuf::new();
-            icon_renderer.set_pixbuf(item_icon(icon, settings.int("icon-size")).as_ref());
+            icon_renderer
+                .set_pixbuf(item_icon(icon.as_deref(), settings.int("icon-size")).as_ref());
             let icon_column = gtk::TreeViewColumn::with_attributes("Icon", &icon_renderer, &[]);
             icon_column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
             view.append_column(&icon_column);
@@ -223,11 +397,16 @@ impl TextListPage {
         view.append_column(&text_column);
         view.set_activate_on_single_click(true);
 
-        // Standard input is read in the background: lines join the list as
-        // they arrive, while the input may still be open.
+        // Lines join the list as they arrive, while the input may still be
+        // open.
         let all_rows = rows_store(std::iter::empty());
         view.set_model(Some(&all_rows));
         let subsequence = settings.boolean(FUZZY_MATCHING);
+        let counts = spec
+            .history_prefix
+            .as_deref()
+            .map(|prefix| launch_counts(&settings, prefix))
+            .unwrap_or_default();
 
         let scrolled = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
         scrolled.add(&view);
@@ -235,6 +414,8 @@ impl TextListPage {
         scrolled.set_vexpand(true);
 
         let page = Rc::new_cyclic(|this| Self {
+            spec,
+            settings: settings.clone(),
             entry,
             view,
             root: scrolled.upcast(),
@@ -243,16 +424,44 @@ impl TextListPage {
             subsequence: Cell::new(subsequence),
             shown: RefCell::new(Shown::all(&[], subsequence)),
             lines: RefCell::new(Vec::new()),
+            counts,
             rows: RefCell::new(all_rows.clone()),
             all_rows,
             pending: RefCell::new(None),
+            started: Cell::new(false),
             this: this.clone(),
         });
         page.connect_activation();
         page.follow_fuzzy_setting(&settings);
         page.set_selection();
-        read_lines_in_background(page.this.clone());
+        // A command runs only once its page is shown.
+        if !matches!(page.spec.source, Source::Command(_)) {
+            page.start();
+        }
         page
+    }
+
+    /// Starts the lines arriving, the first time it is called.
+    fn start(&self) {
+        if self.started.replace(true) {
+            return;
+        }
+        match &self.spec.source {
+            Source::Stdin => read_lines_in_background(self.this.clone(), io::stdin(), false),
+            Source::Items(items) => self.add_lines(
+                items
+                    .iter()
+                    .filter_map(|item| Line::pair(item.as_bytes()))
+                    .collect(),
+            ),
+            Source::Command(command) => match run_command(command) {
+                Ok(output) => read_lines_in_background(self.this.clone(), output, true),
+                Err(error) => eprintln!(
+                    "ilia: cannot run the command of page '{}': {error}",
+                    self.spec.id
+                ),
+            },
+        }
     }
 
     /// Applies a change another program makes to `fuzzy-matching` while the
@@ -273,23 +482,49 @@ impl TextListPage {
 
     /// Adds lines that have just been read, in input order: every line to
     /// the unfiltered rows, and those matching the filter in force to the
-    /// rows on show. They come after every line on show, so the highlighted
-    /// row stays where it is; nothing highlighted yet, the first row is.
+    /// rows on show. On a page ordered by how often lines were chosen, a
+    /// line goes after every line chosen as often or more; otherwise, and
+    /// for lines never chosen, after every line, so the highlighted row
+    /// stays where it is. Nothing highlighted yet, the first row is.
     fn add_lines(&self, new_lines: Vec<Line>) {
         {
             let mut lines = self.lines.borrow_mut();
             let mut shown = self.shown.borrow_mut();
             let rows = self.rows.borrow();
             let filtered = *rows != self.all_rows;
-            for line in new_lines {
-                self.all_rows.insert_with_values(None, &[(0, &line.text)]);
-                if shown.accepts(&line) {
-                    shown.lines.push(lines.len() as u32);
-                    if filtered {
-                        rows.insert_with_values(None, &[(0, &line.text)]);
+            for mut line in new_lines {
+                if let Some(prefix) = &self.spec.history_prefix {
+                    let value = String::from_utf8_lossy(line.bytes());
+                    line.count = self
+                        .counts
+                        .get(&format!("{prefix}{value}"))
+                        .copied()
+                        .unwrap_or_default();
+                }
+                let position = lines.partition_point(|other| other.count >= line.count);
+                if position == lines.len() {
+                    self.all_rows.insert_with_values(None, &[(0, &line.text)]);
+                    if shown.accepts(&line) {
+                        shown.lines.push(position as u32);
+                        if filtered {
+                            rows.insert_with_values(None, &[(0, &line.text)]);
+                        }
+                    }
+                } else {
+                    self.all_rows
+                        .insert_with_values(Some(position as u32), &[(0, &line.text)]);
+                    let shown_position = shown.insert_at(position as u32);
+                    if shown.accepts(&line) {
+                        shown.lines.insert(shown_position, position as u32);
+                        if filtered {
+                            rows.insert_with_values(
+                                Some(shown_position as u32),
+                                &[(0, &line.text)],
+                            );
+                        }
                     }
                 }
-                lines.push(line);
+                lines.insert(position, line);
             }
         }
         if self.view.selection().selected().is_none() {
@@ -301,7 +536,7 @@ impl TextListPage {
         let this = self.this.clone();
         self.view.connect_row_activated(move |_, path, _| {
             if let Some(page) = this.upgrade() {
-                page.print_row(path);
+                page.choose_row(path);
             }
         });
     }
@@ -318,12 +553,46 @@ impl TextListPage {
         self.shown.borrow().lines.get(row).copied()
     }
 
-    fn print_row(&self, path: &gtk::TreePath) {
+    /// Acts on the line shown at `path`: prints its value, or runs the
+    /// page's command with it.
+    fn choose_row(&self, path: &gtk::TreePath) {
         let Some(index) = self.line_index(path) else {
             return;
         };
-        let bytes = self.lines.borrow()[index as usize].bytes().to_vec();
-        print_line(&bytes, &self.quit);
+        let value = self.lines.borrow()[index as usize].bytes().to_vec();
+        match &self.spec.action {
+            Action::Nothing => {}
+            Action::Print => {
+                self.record_choice(&value);
+                print_line(&value, &self.quit);
+            }
+            Action::Exec(words) => {
+                self.record_choice(&value);
+                if let Err(error) = run_exec(&self.spec.id, words, &value) {
+                    eprintln!(
+                        "ilia: cannot run the command of page '{}': {error}",
+                        self.spec.id
+                    );
+                }
+                (self.quit)();
+            }
+        }
+    }
+
+    /// Counts a choice of `value` in the launch history, on a page ordered
+    /// by how often its lines were chosen.
+    fn record_choice(&self, value: &[u8]) {
+        let Some(prefix) = &self.spec.history_prefix else {
+            return;
+        };
+        let mut history: Vec<String> = self
+            .settings
+            .strv(LAUNCH_HISTORY)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let entry = format!("{prefix}{}", String::from_utf8_lossy(value));
+        record_launch(&self.settings, &mut history, entry);
     }
 
     fn selected_path(&self) -> Option<gtk::TreePath> {
@@ -355,7 +624,7 @@ impl TextListPage {
             self.shown.borrow().lines.get(row).copied()
         });
         self.update_rows();
-        // The lines on show are in input order.
+        // The lines on show are in list order.
         let kept = line.and_then(|line| self.shown.borrow().lines.binary_search(&line).ok());
         let position = kept.map_or(position.unwrap_or(0), |row| row as i32);
         *self.path.borrow_mut() =
@@ -430,20 +699,20 @@ impl DialogPage for TextListPage {
     fn on_entry_activated(&self) {
         self.flush();
         if let Some(path) = self.selected_path() {
-            self.print_row(&path);
+            self.choose_row(&path);
         }
     }
-    fn get_id(&self) -> &'static str {
-        "textlist"
+    fn get_id(&self) -> &str {
+        &self.spec.id
     }
-    fn get_name(&self) -> &'static str {
-        "TextList"
+    fn get_name(&self) -> &str {
+        &self.spec.name
     }
-    fn get_icon_name(&self) -> &'static str {
-        DEFAULT_ICON
+    fn get_icon_name(&self) -> &str {
+        &self.spec.icon
     }
-    fn get_help(&self) -> &'static str {
-        "This dialog presents a filterable list of items to select from. If no item matches, enter returns the typed text."
+    fn get_help(&self) -> &str {
+        self.spec.help
     }
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
         [("enter", "Select Item")].into_iter().collect()
@@ -456,35 +725,194 @@ impl DialogPage for TextListPage {
         if navigate(&self.view, &self.path, event) {
             return true;
         }
-        if enter && self.shown.borrow().lines.is_empty() && !self.entry.text().is_empty() {
+        if enter
+            && self.spec.prints_unmatched
+            && self.shown.borrow().lines.is_empty()
+            && !self.entry.text().is_empty()
+        {
             print_line(self.entry.text().as_bytes(), &self.quit);
             return true;
         }
         false
     }
-    fn get_keybinding(&self) -> char {
-        't'
+    fn get_keybinding(&self) -> Option<char> {
+        self.spec.key
     }
     fn show(&self) {
+        self.start();
         self.flush();
         self.view.grab_focus();
     }
 }
 
-/// Reads standard input on a thread of its own, so the window stays
-/// responsive while the input is open, and hands each read's complete lines,
-/// already folded, to the page.
+/// How often each launch history entry starting with `prefix` was recorded,
+/// by entry.
+fn launch_counts(settings: &gio::Settings, prefix: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for entry in settings.strv(LAUNCH_HISTORY).iter() {
+        if entry.as_str().starts_with(prefix) {
+            *counts.entry(entry.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+thread_local! {
+    /// The page commands started, never waited for until the launcher
+    /// quits, so their process groups stay theirs.
+    static COMMANDS: RefCell<Vec<Child>> = const { RefCell::new(Vec::new()) };
+    /// The commands choices started.
+    static LAUNCHED: RefCell<Vec<Child>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Starts a page file's command through `/bin/sh -c`, in a process group of
+/// its own, with standard input from `/dev/null`, and returns its output.
+fn run_command(command: &str) -> io::Result<std::process::ChildStdout> {
+    // Processes the command leaves behind become the launcher's children,
+    // so that it can wait for them once they are ended.
+    // SAFETY: PR_SET_CHILD_SUBREAPER takes integer arguments only and
+    // touches no memory of this process.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no output pipe"))?;
+    COMMANDS.with(|commands| commands.borrow_mut().push(child));
+    Ok(output)
+}
+
+/// Ends every page command, with every process in its group, and waits
+/// for them.
+pub fn stop_commands() {
+    COMMANDS.with(|commands| {
+        for child in commands.borrow_mut().drain(..) {
+            // The group is the shell's: it has not been waited for, so its
+            // id cannot have been reused.
+            let Ok(group) = libc::pid_t::try_from(child.id()) else {
+                continue;
+            };
+            // SAFETY: killpg takes plain integers and touches no memory.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            // The shell, and the processes it started, which the launcher
+            // adopts as they lose their parent.
+            loop {
+                let mut status = 0;
+                // SAFETY: `status` is a live, writable c_int for the call.
+                if unsafe { libc::waitpid(-group, &mut status, 0) } < 0
+                    && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Waits, for at most `LAUNCH_WAIT`, until the commands choices started
+/// have finished, so that a quick one is done when the launcher exits.
+pub fn wait_for_launched() {
+    let deadline = std::time::Instant::now() + LAUNCH_WAIT;
+    LAUNCHED.with(|launched| {
+        for child in launched.borrow_mut().iter_mut() {
+            while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+}
+
+/// The command a choice of `value` runs: the Exec words, in each of which
+/// every `%s` is the value and `%%` a `%`, other `%` signs staying as they
+/// are. When no word holds `%s`, the value is a last word of its own.
+fn exec_words(words: &[String], value: &[u8]) -> Vec<Vec<u8>> {
+    let mut substituted = false;
+    let mut command: Vec<Vec<u8>> = words
+        .iter()
+        .map(|word| {
+            let mut out = Vec::new();
+            let mut rest = word.as_bytes();
+            while let Some(percent) = rest.iter().position(|&byte| byte == b'%') {
+                out.extend_from_slice(&rest[..percent]);
+                match rest.get(percent + 1).copied() {
+                    Some(b's') => {
+                        out.extend_from_slice(value);
+                        substituted = true;
+                        rest = &rest[percent + 2..];
+                    }
+                    Some(b'%') => {
+                        out.push(b'%');
+                        rest = &rest[percent + 2..];
+                    }
+                    _ => {
+                        out.push(b'%');
+                        rest = &rest[percent + 1..];
+                    }
+                }
+            }
+            out.extend_from_slice(rest);
+            out
+        })
+        .collect();
+    if !substituted {
+        command.push(value.to_vec());
+    }
+    command
+}
+
+/// Starts the command a choice of `value` runs on the page `id`, in a fresh
+/// scope when the scope runner is available, never through a shell.
+fn run_exec(id: &str, words: &[String], value: &[u8]) -> io::Result<()> {
+    let command = exec_words(words, value).into_iter().map(OsString::from_vec);
+    let command: Vec<OsString> = match scope_command(id) {
+        Some(scope) => scope.into_iter().chain(command).collect(),
+        None => command.collect(),
+    };
+    let Some((program, args)) = command.split_first() else {
+        return Ok(());
+    };
+    let child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    LAUNCHED.with(|launched| launched.borrow_mut().push(child));
+    Ok(())
+}
+
+/// Reads `input` on a thread of its own, so the window stays responsive
+/// while it is open, and hands each read's complete lines, already folded,
+/// to the page. Page file output is divided into labels and values, and its
+/// blank lines skipped.
 #[allow(deprecated)]
-fn read_lines_in_background(page: Weak<TextListPage>) {
+fn read_lines_in_background(
+    page: Weak<TextListPage>,
+    mut input: impl Read + Send + 'static,
+    pairs: bool,
+) {
     let (sender, receiver) = glib::MainContext::channel::<Vec<Line>>(glib::Priority::DEFAULT_IDLE);
+    let to_line = move |bytes: Vec<u8>| {
+        if !pairs {
+            Some(Line::new(bytes))
+        } else if is_blank(&bytes) {
+            None
+        } else {
+            Line::pair(&bytes)
+        }
+    };
     let reader = std::thread::Builder::new()
-        .name("ilia-stdin".into())
+        .name("ilia-input".into())
         .spawn(move || {
-            let mut stdin = io::stdin().lock();
             let mut splitter = LineSplitter::default();
             let mut buffer = vec![0; READ_SIZE];
             loop {
-                let read = match stdin.read(&mut buffer) {
+                let read = match input.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => read,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -493,26 +921,58 @@ fn read_lines_in_background(page: Weak<TextListPage>) {
                 let lines: Vec<Line> = splitter
                     .push(&buffer[..read])
                     .into_iter()
-                    .map(Line::new)
+                    .filter_map(to_line)
                     .collect();
                 if !lines.is_empty() && sender.send(lines).is_err() {
                     return;
                 }
             }
-            if let Some(last) = splitter.finish() {
-                let _ = sender.send(vec![Line::new(last)]);
+            if let Some(last) = splitter.finish().and_then(to_line) {
+                let _ = sender.send(vec![last]);
             }
         });
     if let Err(error) = reader {
         eprintln!("Failed to read standard input: {error}");
         return;
     }
-    receiver.attach(None, move |lines| match page.upgrade() {
-        Some(page) => {
-            page.add_lines(lines);
-            glib::ControlFlow::Continue
+    // The channel only queues what was read; rows join the page in short
+    // slices from an idle source, so key presses (Escape included) are
+    // handled between slices however much output is waiting.
+    let pending: Rc<RefCell<VecDeque<Line>>> = Rc::default();
+    let draining = Rc::new(Cell::new(false));
+    receiver.attach(None, move |lines| {
+        if page.upgrade().is_none() {
+            return glib::ControlFlow::Break;
         }
-        None => glib::ControlFlow::Break,
+        pending.borrow_mut().extend(lines);
+        if !draining.replace(true) {
+            let page = page.clone();
+            let pending = pending.clone();
+            let draining = draining.clone();
+            glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+                let Some(page) = page.upgrade() else {
+                    draining.set(false);
+                    return glib::ControlFlow::Break;
+                };
+                let started = Instant::now();
+                loop {
+                    let batch: Vec<Line> = {
+                        let mut pending = pending.borrow_mut();
+                        let take = pending.len().min(INGEST_SLICE_LINES);
+                        pending.drain(..take).collect()
+                    };
+                    if batch.is_empty() {
+                        draining.set(false);
+                        return glib::ControlFlow::Break;
+                    }
+                    page.add_lines(batch);
+                    if started.elapsed() >= INGEST_SLICE_TIME {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+            });
+        }
+        glib::ControlFlow::Continue
     });
 }
 
@@ -559,7 +1019,7 @@ fn print_line(line: &[u8], quit: &Rc<dyn Fn()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_items, Line, LineSplitter, Shown};
+    use super::{exec_words, is_blank, read_items, Line, LineSplitter, Shown};
     use crate::filter::query_words;
 
     const FIXTURE: &str = "Alpha\nNeedle Item\nOmega\n";
@@ -735,5 +1195,72 @@ mod tests {
                 .lines,
             [3]
         );
+    }
+
+    #[test]
+    fn page_entries_divide_label_and_value_at_the_first_tab() {
+        let pair =
+            |entry: &[u8]| Line::pair(entry).map(|line| (line.text.clone(), line.bytes().to_vec()));
+        assert_eq!(
+            pair(b"Mail\tmail.example.org"),
+            Some(("Mail".into(), b"mail.example.org".to_vec()))
+        );
+        assert_eq!(
+            pair(b"label\tvalue\tmore"),
+            Some(("label".into(), b"value\tmore".to_vec()))
+        );
+        assert_eq!(
+            pair(b"  padded  "),
+            Some(("  padded  ".into(), b"  padded  ".to_vec()))
+        );
+        assert_eq!(pair(b"\tvalue"), Some(("value".into(), b"value".to_vec())));
+        assert_eq!(pair(b"label\t"), Some(("label".into(), b"label".to_vec())));
+        assert_eq!(pair(b"\t"), None);
+        assert_eq!(
+            pair(b"caf\xe9"),
+            Some(("caf\u{fffd}".into(), b"caf\xe9".to_vec()))
+        );
+        assert!(is_blank(b"") && is_blank(b" \t\r") && !is_blank(b" x "));
+    }
+
+    #[test]
+    fn exec_words_take_the_whole_value() {
+        let words = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>()
+        };
+        let value = b"a 'b' $(x); end";
+        assert_eq!(
+            exec_words(&words(&["probe", "pre%s:%s", "%%", "%q", "%"]), value),
+            [
+                &b"probe"[..],
+                b"prea 'b' $(x); end:a 'b' $(x); end",
+                b"%",
+                b"%q",
+                b"%"
+            ]
+        );
+        assert_eq!(
+            exec_words(&words(&["probe", "50%%s"]), b"v"),
+            [&b"probe"[..], b"50%s", b"v"]
+        );
+        assert_eq!(
+            exec_words(&words(&["probe"]), b"caf\xe9"),
+            [&b"probe"[..], b"caf\xe9"]
+        );
+    }
+
+    #[test]
+    fn lines_inserted_ahead_move_the_lines_on_show() {
+        let mut shown = Shown {
+            lines: vec![0, 2, 3],
+            ..Shown::default()
+        };
+        assert_eq!(shown.insert_at(2), 1);
+        assert_eq!(shown.lines, [0, 3, 4]);
+        assert_eq!(shown.insert_at(9), 3);
+        assert_eq!(shown.lines, [0, 3, 4]);
     }
 }

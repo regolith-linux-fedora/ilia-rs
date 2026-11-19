@@ -6,8 +6,9 @@ resolves the locked dependencies from crates.io; the only crate outside the
 gtk-rs graph is `libc`, for `dlopen`. The SPARQL library (`libtinysparql-3.0.so.0`, or
 `libtracker-sparql-3.0.so.0` on older systems) is not linked: the Files page
 loads it the first time it searches, so every other page works without it.
-`sparql.rs`, which wraps its C calls in a safe API, is the only module with
-`unsafe`.
+`sparql.rs`, which wraps its C calls in a safe API, holds nearly all the
+`unsafe`; the rest is three libc calls in `textlist.rs` that end a page
+file's command with its whole process group and reap it.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -38,7 +39,13 @@ Module map:
   configuration with the variables applied; sway's is read in `ipc.rs` as
   sway reads it (includes in place, variables and resource-service values
   where they are used).
-- `dialog.rs`, `application.rs`: the shell.
+- `page_files.rs`: pages defined in key files (`ilia/pages/*.page` under
+  the XDG configuration directories): discovery, precedence and parsing.
+  Their pages live in `apps.rs` (`Apps` rows, launched like the
+  Applications page) and `textlist.rs` (`Items` and `ItemsCommand` rows,
+  the command read on a background thread in its own process group).
+- `dialog.rs`, `application.rs`: the shell, which also picks the pages the
+  current window manager (i3, sway or other) can show.
 
 ## Meson cutover
 

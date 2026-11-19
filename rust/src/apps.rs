@@ -11,6 +11,8 @@ use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk::prelude::*;
 
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
+use crate::keybindings::navigate;
+use crate::page_files::{PageFile, Rows};
 use crate::pages::{
     rebuild_keeping_selection, select_first_row, select_row_near, DialogPage, FUZZY_MATCHING,
 };
@@ -22,6 +24,9 @@ const APP_INFO: u32 = 2;
 // The index of the row's app in the page's `AppList`.
 const INDEX: u32 = 3;
 const HISTORY_MAX_LEN: usize = 32;
+/// The launch history the pages share: desktop ids, and the choices on page
+/// files ordered by frequency.
+pub const LAUNCH_HISTORY: &str = "app-launch-counts";
 const HIDDEN_APPS: &str = "hidden-apps";
 const MATCH_FIELDS: &str = "match-fields";
 
@@ -44,7 +49,7 @@ pub struct ApplicationsPage {
 impl ApplicationsPage {
     pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Self {
         let launch_history: Vec<String> = settings
-            .strv("app-launch-counts")
+            .strv(LAUNCH_HISTORY)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -76,38 +81,13 @@ impl ApplicationsPage {
         install_sort(&model, &apps);
         model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
 
-        let view = gtk::TreeView::with_model(&filter);
-        view.style_context().add_class("item_view");
-        view.set_headers_visible(false);
-        view.set_fixed_height_mode(true);
-        view.set_enable_search(false);
-        view.selection().set_mode(gtk::SelectionMode::Single);
-        if icon_size > 0 {
-            let renderer = gtk::CellRendererPixbuf::new();
-            let column =
-                gtk::TreeViewColumn::with_attributes("Icon", &renderer, &[("pixbuf", ICON as i32)]);
-            column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-            view.append_column(&column);
-        }
-        let renderer = gtk::CellRendererText::new();
-        let column =
-            gtk::TreeViewColumn::with_attributes("Name", &renderer, &[("text", NAME as i32)]);
-        column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-        view.append_column(&column);
-        view.set_activate_on_single_click(true);
-
-        let scrolled = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-        scrolled.style_context().add_class("scrolled_window");
-        scrolled.add(&view);
-        scrolled.set_hexpand(true);
-        scrolled.set_vexpand(true);
-
+        let (view, root) = app_view(&filter, icon_size);
         let page = Self {
             entry,
             model,
             filter,
             view,
-            root: scrolled.upcast(),
+            root,
             settings,
             launch_history: Rc::new(RefCell::new(launch_history)),
             apps,
@@ -125,22 +105,13 @@ impl ApplicationsPage {
     }
 
     fn connect_activation(&self) {
-        let settings = self.settings.clone();
-        let history = self.launch_history.clone();
-        let quit = self.quit.clone();
-        let post_launch_sleep = self.post_launch_sleep;
-        self.view.connect_row_activated(move |view, path, _| {
-            let Some(filter) = view.model().and_downcast::<gtk::TreeModelFilter>() else {
-                return;
-            };
-            let Some(iter) = filter.iter(path) else {
-                return;
-            };
-            let Some(app) = app_value(&filter, &iter) else {
-                return;
-            };
-            execute_app(&app, &settings, &history, post_launch_sleep, &quit);
-        });
+        connect_launch(
+            &self.view,
+            &self.settings,
+            &self.launch_history,
+            self.post_launch_sleep,
+            &self.quit,
+        );
     }
 
     /// Highlights the first row: the best match for the text typed.
@@ -378,13 +349,310 @@ impl DialogPage for ApplicationsPage {
         self.navigate(event)
     }
 
-    fn get_keybinding(&self) -> char {
-        'a'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('a')
     }
 
     fn show(&self) {
         self.view.grab_focus();
     }
+}
+
+/// A page file's applications: those it names that are installed and ask to
+/// be shown, in the order it names them, whatever the filter text, the
+/// launch history and the hidden apps.
+pub struct AppListPage {
+    id: String,
+    name: String,
+    icon: String,
+    key: Option<char>,
+    entry: gtk::Entry,
+    filter: gtk::TreeModelFilter,
+    view: gtk::TreeView,
+    root: gtk::Widget,
+    path: RefCell<gtk::TreePath>,
+    rows: Rc<AppRows>,
+    settings: gio::Settings,
+    launch_history: Rc<RefCell<Vec<String>>>,
+    post_launch_sleep: u64,
+    quit: Rc<dyn Fn()>,
+}
+
+/// The apps of an `AppListPage`, by the INDEX of their rows, and which of
+/// them the filter text lists. They match as on the applications page.
+struct AppRows {
+    // Every field, folded.
+    all: Vec<AppText>,
+    // The fields `match-fields` lets the filter search.
+    text: RefCell<Vec<AppText>>,
+    settings: RefCell<(bool, MatchFields)>,
+    words: RefCell<Vec<String>>,
+}
+
+impl AppRows {
+    fn new(all: Vec<AppText>, settings: &gio::Settings) -> Self {
+        let rows = Self {
+            text: RefCell::new(all.clone()),
+            all,
+            settings: RefCell::new((false, MatchFields::ALL)),
+            words: RefCell::default(),
+        };
+        rows.apply_settings(settings);
+        rows
+    }
+
+    /// Takes the `fuzzy-matching` and `match-fields` settings; whether they
+    /// changed.
+    fn apply_settings(&self, settings: &gio::Settings) -> bool {
+        let new = AppSettings::read(settings);
+        let (subsequence, fields) = (new.subsequence, new.fields);
+        let (old_subsequence, old_fields) = self.settings.replace((subsequence, fields));
+        if old_fields != fields {
+            *self.text.borrow_mut() = self.all.iter().map(|text| text.only(fields)).collect();
+        }
+        (old_subsequence, old_fields) != (subsequence, fields)
+    }
+
+    fn is_listed(&self, index: usize) -> bool {
+        let words = self.words.borrow();
+        words.is_empty()
+            || self
+                .text
+                .borrow()
+                .get(index)
+                .and_then(|text| text.tier(&words, self.settings.borrow().0))
+                .is_some()
+    }
+}
+
+impl AppListPage {
+    pub fn new(
+        settings: gio::Settings,
+        entry: gtk::Entry,
+        file: &PageFile,
+        key: Option<char>,
+        quit: Rc<dyn Fn()>,
+    ) -> Self {
+        let launch_history: Vec<String> = settings
+            .strv(LAUNCH_HISTORY)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let icon_size = settings.int("icon-size");
+        let post_launch_sleep = settings.int("post-launch-sleep").max(0) as u64;
+        let model = gtk::ListStore::new(&[
+            Pixbuf::static_type(),
+            String::static_type(),
+            gio::DesktopAppInfo::static_type(),
+            u32::static_type(),
+        ]);
+        let blank = blank_icon(icon_size);
+        let ids: &[String] = match &file.rows {
+            Rows::Apps(ids) => ids,
+            _ => &[],
+        };
+        let mut texts = Vec::new();
+        for id in ids {
+            // GIO finds no app for an id that is not installed, or whose
+            // TryExec program is missing.
+            let Some(desktop) = gio::DesktopAppInfo::new(id) else {
+                continue;
+            };
+            if !desktop.should_show() {
+                continue;
+            }
+            let name = desktop.name().to_string();
+            let index = texts.len() as u32;
+            let mut values: Vec<(u32, &dyn ToValue)> =
+                vec![(NAME, &name), (APP_INFO, &desktop), (INDEX, &index)];
+            if let Some(blank) = blank.as_ref() {
+                values.push((ICON, blank));
+            }
+            model.insert_with_values(None, &values);
+            texts.push(AppText::new(&desktop, MatchFields::ALL));
+        }
+        let rows = Rc::new(AppRows::new(texts, &settings));
+        let filter = gtk::TreeModelFilter::new(&model, None);
+        let rows_for_filter = rows.clone();
+        filter.set_visible_func(move |tree_model, iter| {
+            rows_for_filter.is_listed(index_value(tree_model, iter))
+        });
+        let (view, root) = app_view(&filter, icon_size);
+
+        let page = Self {
+            id: file.id.clone(),
+            // The title is plain text.
+            name: glib::markup_escape_text(&file.name).into(),
+            icon: file.icon.clone(),
+            key,
+            entry,
+            filter,
+            view,
+            root,
+            path: RefCell::new(gtk::TreePath::new_first()),
+            rows,
+            settings,
+            launch_history: Rc::new(RefCell::new(launch_history)),
+            post_launch_sleep,
+            quit,
+        };
+        connect_launch(
+            &page.view,
+            &page.settings,
+            &page.launch_history,
+            page.post_launch_sleep,
+            &page.quit,
+        );
+        page.follow_settings();
+        page.set_selection();
+        if icon_size > 0 {
+            load_icons_in_background(&model, icon_size);
+        }
+        page
+    }
+
+    /// Applies changes another program makes to `fuzzy-matching` and
+    /// `match-fields` while the launcher runs, keeping the highlighted app.
+    fn follow_settings(&self) {
+        for key in [FUZZY_MATCHING, MATCH_FIELDS] {
+            let (rows, filter, view) = (self.rows.clone(), self.filter.clone(), self.view.clone());
+            self.settings
+                .connect_changed(Some(key), move |settings, _| {
+                    if rows.apply_settings(settings) {
+                        rebuild_keeping_selection(&view, &filter, || filter.refilter());
+                    }
+                });
+        }
+    }
+
+    /// Highlights the first row listed.
+    fn set_selection(&self) {
+        self.view.selection().set_mode(gtk::SelectionMode::Single);
+        *self.path.borrow_mut() = select_first_row(&self.view);
+    }
+}
+
+impl DialogPage for AppListPage {
+    fn get_root(&self) -> gtk::Widget {
+        self.root.clone()
+    }
+
+    fn on_entry_changed(&self) {
+        *self.rows.words.borrow_mut() = query_words(self.entry.text().as_str());
+        self.filter.refilter();
+        self.set_selection();
+    }
+
+    fn on_entry_activated(&self) {
+        let Some((model, iter)) = self.view.selection().selected() else {
+            return;
+        };
+        if let Some(app) = app_value(&model, &iter) {
+            execute_app(
+                &app,
+                &self.settings,
+                &self.launch_history,
+                self.post_launch_sleep,
+                &self.quit,
+            );
+        }
+    }
+
+    fn get_id(&self) -> &str {
+        &self.id
+    }
+
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_icon_name(&self) -> &str {
+        &self.icon
+    }
+
+    fn get_help(&self) -> &str {
+        "This dialog lists the applications a page file names, in its order. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it."
+    }
+
+    fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
+        [("enter", "Launch Application")].into_iter().collect()
+    }
+
+    fn key_event(&self, event: &gdk::EventKey) -> bool {
+        navigate(&self.view, &self.path, event)
+    }
+
+    fn get_keybinding(&self) -> Option<char> {
+        self.key
+    }
+
+    fn show(&self) {
+        self.view.grab_focus();
+    }
+}
+
+/// A list of apps showing the rows of `filter`, and the scrolled window
+/// holding it.
+fn app_view(filter: &gtk::TreeModelFilter, icon_size: i32) -> (gtk::TreeView, gtk::Widget) {
+    let view = gtk::TreeView::with_model(filter);
+    view.style_context().add_class("item_view");
+    view.set_headers_visible(false);
+    view.set_fixed_height_mode(true);
+    view.set_enable_search(false);
+    view.selection().set_mode(gtk::SelectionMode::Single);
+    if icon_size > 0 {
+        let renderer = gtk::CellRendererPixbuf::new();
+        let column =
+            gtk::TreeViewColumn::with_attributes("Icon", &renderer, &[("pixbuf", ICON as i32)]);
+        column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+        view.append_column(&column);
+    }
+    let renderer = gtk::CellRendererText::new();
+    let column = gtk::TreeViewColumn::with_attributes("Name", &renderer, &[("text", NAME as i32)]);
+    column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+    view.append_column(&column);
+    view.set_activate_on_single_click(true);
+
+    let scrolled = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    scrolled.style_context().add_class("scrolled_window");
+    scrolled.add(&view);
+    scrolled.set_hexpand(true);
+    scrolled.set_vexpand(true);
+    (view, scrolled.upcast())
+}
+
+/// Launches the app of a row activated in `view`.
+fn connect_launch(
+    view: &gtk::TreeView,
+    settings: &gio::Settings,
+    history: &Rc<RefCell<Vec<String>>>,
+    post_launch_sleep: u64,
+    quit: &Rc<dyn Fn()>,
+) {
+    let (settings, history, quit) = (settings.clone(), history.clone(), quit.clone());
+    view.connect_row_activated(move |view, path, _| {
+        let Some(filter) = view.model().and_downcast::<gtk::TreeModelFilter>() else {
+            return;
+        };
+        let Some(iter) = filter.iter(path) else {
+            return;
+        };
+        let Some(app) = app_value(&filter, &iter) else {
+            return;
+        };
+        execute_app(&app, &settings, &history, post_launch_sleep, &quit);
+    });
+}
+
+/// The transparent icon a row shows until its app's icon is loaded.
+fn blank_icon(icon_size: i32) -> Option<Pixbuf> {
+    if icon_size <= 0 {
+        return None;
+    }
+    Pixbuf::new(Colorspace::Rgb, true, 8, icon_size, icon_size).map(|pixbuf| {
+        pixbuf.fill(0);
+        pixbuf
+    })
 }
 
 fn index_value(model: &impl glib::IsA<gtk::TreeModel>, iter: &gtk::TreeIter) -> usize {
@@ -413,14 +681,7 @@ fn load_apps(
     icon_size: i32,
     launch_counts: &HashMap<String, usize>,
 ) -> Vec<App> {
-    let blank = if icon_size > 0 {
-        Pixbuf::new(Colorspace::Rgb, true, 8, icon_size, icon_size).map(|pixbuf| {
-            pixbuf.fill(0);
-            pixbuf
-        })
-    } else {
-        None
-    };
+    let blank = blank_icon(icon_size);
 
     let mut apps = Vec::new();
     for app in gio::AppInfo::all() {
@@ -846,17 +1107,7 @@ fn execute_app(
     });
 
     match runner.launch(&[], Some(&context)) {
-        Ok(()) => {
-            let mut history = history.borrow_mut();
-            history.push(id);
-            let stored = if history.len() <= HISTORY_MAX_LEN {
-                history.as_slice()
-            } else {
-                &history[1..=HISTORY_MAX_LEN]
-            };
-            let values: Vec<&str> = stored.iter().map(String::as_str).collect();
-            let _ = settings.set_strv("app-launch-counts", values);
-        }
+        Ok(()) => record_launch(settings, &mut history.borrow_mut(), id),
         Err(error) => {
             if error.message().is_empty() {
                 eprintln!("Failed to launch {name}");
@@ -866,6 +1117,25 @@ fn execute_app(
             quit();
         }
     }
+}
+
+/// Appends `entry` to the launch `history` and stores its newest
+/// `HISTORY_MAX_LEN` entries, the new one last.
+pub fn record_launch(settings: &gio::Settings, history: &mut Vec<String>, entry: String) {
+    push_capped(history, entry);
+    let values: Vec<&str> = history.iter().map(String::as_str).collect();
+    if settings.set_strv(LAUNCH_HISTORY, values).is_ok() {
+        // The launcher exits right after a launch.
+        gio::Settings::sync();
+    }
+}
+
+/// Appends `entry` to `history`, dropping its oldest entries beyond
+/// `HISTORY_MAX_LEN`.
+fn push_capped(history: &mut Vec<String>, entry: String) {
+    history.push(entry);
+    let excess = history.len().saturating_sub(HISTORY_MAX_LEN);
+    history.drain(..excess);
 }
 
 fn load_icons_in_background(model: &gtk::ListStore, icon_size: i32) {
@@ -893,9 +1163,9 @@ fn load_icons_in_background(model: &gtk::ListStore, icon_size: i32) {
             let id = desktop.id();
             if let Some(iter) = model.iter_first() {
                 loop {
+                    // A page file may list an app more than once.
                     if app_value(&model, &iter).and_then(|app| app.id()) == id {
                         model.set(&iter, &[(ICON, &icon)]);
-                        break;
                     }
                     if !model.iter_next(&iter) {
                         break;
@@ -927,8 +1197,8 @@ fn load_icon(theme: &gtk::IconTheme, app: &gio::DesktopAppInfo, icon_size: i32) 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_last, fits_pattern, is_hidden, remove_last, App, AppList, AppSettings, AppText,
-        AppTier, MatchFields,
+        append_last, fits_pattern, is_hidden, push_capped, remove_last, App, AppList, AppSettings,
+        AppText, AppTier, MatchFields,
     };
     use crate::filter::{fold_text, query_words};
 
@@ -1384,5 +1654,17 @@ mod tests {
             &["other.desktop".to_owned(), "vendor-*".to_owned()]
         ));
         assert!(!is_hidden("vendor-tool.desktop", &[]));
+    }
+
+    #[test]
+    fn the_launch_history_keeps_its_newest_entries() {
+        let mut history: Vec<String> = (0..40).map(|index| format!("old{index}")).collect();
+        push_capped(&mut history, "new".to_owned());
+        assert_eq!(history.len(), 32);
+        assert_eq!(history[0], "old9");
+        assert_eq!(history.last().map(String::as_str), Some("new"));
+        let mut short = vec!["a".to_owned()];
+        push_capped(&mut short, "b".to_owned());
+        assert_eq!(short, ["a", "b"]);
     }
 }

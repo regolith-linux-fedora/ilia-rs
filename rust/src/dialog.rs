@@ -9,7 +9,8 @@ use glib::Unichar;
 
 use crate::args::Args;
 use crate::input_sources::InputSourceSwitcher;
-use crate::pages::{create, find, is_enter_key, DialogPage, Page, PAGES};
+use crate::page_files::{self, PageFile};
+use crate::pages::{create, create_from_file, find, is_enter_key, DialogPage, Page, PAGES};
 
 const MIN_WINDOW_WIDTH: i32 = 160;
 const MIN_WINDOW_HEIGHT: i32 = 100;
@@ -25,6 +26,59 @@ const ALL_PAGE_IDS: &[&str] = &[
 
 pub type SharedSeat = Rc<RefCell<Option<gdk::Seat>>>;
 
+/// A page the dialog can show: a built-in one, or one a page file defines.
+#[derive(Clone, Copy)]
+enum PageSpec<'a> {
+    Builtin(&'static Page),
+    File(&'a PageFile),
+}
+
+impl PageSpec<'_> {
+    fn id(&self) -> &str {
+        match self {
+            Self::Builtin(page) => page.id,
+            Self::File(file) => &file.id,
+        }
+    }
+}
+
+/// The name the page files' show-in keys give the window manager
+/// `wm_name`.
+fn manager_name(wm_name: &str) -> &str {
+    match wm_name {
+        "i3" | "sway" => wm_name,
+        _ => "other",
+    }
+}
+
+/// The letter that selects each page with Alt. With every page open, a
+/// page file's letter goes to it unless an earlier page has it already:
+/// the built-in pages come first, then the files in order.
+fn shortcut_letters(specs: &[PageSpec], all: bool) -> Vec<Option<char>> {
+    let mut taken: Vec<char> = Vec::new();
+    specs
+        .iter()
+        .map(|spec| match spec {
+            PageSpec::Builtin(page) => {
+                taken.push(page.key);
+                Some(page.key)
+            }
+            PageSpec::File(file) => {
+                let key = file.key?;
+                if all && taken.contains(&key) {
+                    eprintln!(
+                        "ilia: page file '{}': Key '{key}' already selects another page; it is ignored",
+                        file.path.display()
+                    );
+                    return None;
+                }
+                taken.push(key);
+                Some(key)
+            }
+        })
+        .collect()
+}
+
 pub fn build(
     app: &gtk::Application,
     args: &Args,
@@ -34,8 +88,29 @@ pub fn build(
 ) -> Result<gtk::Window, ()> {
     let focus_name = args.value("-p").unwrap_or("Apps");
     let all = args.has("-a");
+    // Every page file is read at start-up, whichever page is asked for.
+    let reserved: Vec<&str> = PAGES.iter().map(|page| page.id).collect();
+    let files = page_files::discover(&reserved);
+    let manager = manager_name(wm_name);
     // With -a only the general pages are loaded: textlist cannot be chosen.
-    let focus = find(focus_name).filter(|page| !all || ALL_PAGE_IDS.contains(&page.id));
+    let builtin = find(focus_name).filter(|page| !all || ALL_PAGE_IDS.contains(&page.id));
+    let file = files
+        .iter()
+        .find(|file| file.id.eq_ignore_ascii_case(focus_name));
+    // `None` when no page has the name, `Some(None)` when the page is not
+    // available under this window manager.
+    let focus = match (builtin, file) {
+        (Some(page), _) => Some(
+            page.available_under(wm_name)
+                .then_some(PageSpec::Builtin(page)),
+        ),
+        (None, Some(file)) => Some(file.shows_in(manager).then_some(PageSpec::File(file))),
+        (None, None) => None,
+    };
+    if matches!(focus, Some(None)) && !all {
+        eprintln!("ilia: page '{focus_name}' is not available under the current window manager");
+        return Err(());
+    }
 
     let settings = gio::Settings::new("org.regolith-linux.ilia");
     let width = settings.int("window-width");
@@ -77,12 +152,27 @@ pub fn build(
     grid.attach(&notebook, 0, 1, 1, 1);
     window.add(&grid);
 
-    let selected = focus.unwrap_or(&PAGES[0]);
-    let page_specs: Vec<&Page> = if all {
-        ALL_PAGE_IDS.iter().filter_map(|id| find(id)).collect()
+    // The page asked for, when it can be shown.
+    let focus = focus.flatten();
+    let page_specs: Vec<PageSpec> = if all {
+        // The built-in pages this window manager supports, then the page
+        // files it shows, by file name.
+        ALL_PAGE_IDS
+            .iter()
+            .filter_map(|id| find(id))
+            .filter(|page| page.available_under(wm_name))
+            .map(PageSpec::Builtin)
+            .chain(
+                files
+                    .iter()
+                    .filter(|file| file.shows_in(manager))
+                    .map(PageSpec::File),
+            )
+            .collect()
     } else {
-        vec![selected]
+        vec![focus.unwrap_or(PageSpec::Builtin(&PAGES[0]))]
     };
+    let letters = shortcut_letters(&page_specs, all);
     let app_for_pages = app.clone();
     let window_for_pages = window.clone();
     let seat_for_pages = seat.clone();
@@ -90,8 +180,9 @@ pub fn build(
         Rc::new(move || quit(&window_for_pages, &app_for_pages, &seat_for_pages));
     let pages: Vec<Rc<dyn DialogPage>> = page_specs
         .iter()
-        .map(|page| {
-            create(
+        .zip(&letters)
+        .map(|(spec, key)| match spec {
+            PageSpec::Builtin(page) => create(
                 page,
                 args,
                 &settings,
@@ -99,12 +190,15 @@ pub fn build(
                 page_quit.clone(),
                 wm_name,
                 is_wayland,
-            )
+            ),
+            PageSpec::File(file) => {
+                create_from_file(file, *key, &settings, &entry, page_quit.clone())
+            }
         })
         .collect();
+    let shortcuts: Vec<Option<char>> = pages.iter().map(|page| page.get_keybinding()).collect();
     for page in &pages {
         page.initialize();
-        let _ = page.get_keybinding();
         let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let icon = if page.get_id() == "textlist" {
             args.value("-i").unwrap_or(page.get_icon_name())
@@ -142,7 +236,11 @@ pub fn build(
         // visible. Realize the page set before choosing the requested tab so
         // a later window.show_all() preserves the selection.
         notebook.show_all();
-        if let Some(index) = pages.iter().position(|page| page.get_id() == selected.id) {
+        let selected = focus.map(|spec| spec.id().to_owned());
+        if let Some(index) = pages
+            .iter()
+            .position(|page| Some(page.get_id()) == selected.as_deref())
+        {
             notebook.set_current_page(Some(index as u32));
             active_page.set(index);
         }
@@ -229,10 +327,6 @@ pub fn build(
             }
         }
         if state.contains(gdk::ModifierType::MOD1_MASK) {
-            let shortcuts: Vec<char> = pages_for_key
-                .iter()
-                .map(|page| page.get_keybinding())
-                .collect();
             if let Some(index) = alt_switch_target(&shortcuts, keyval) {
                 notebook_for_key.set_current_page(Some(index as u32));
                 return glib::Propagation::Stop;
@@ -456,10 +550,12 @@ fn resized(current: (i32, i32), delta: i32, monitor: Option<(i32, i32)>) -> Opti
 
 /// The first page whose shortcut matches the pressed key, compared like the
 /// reference: the shortcut itself or its ASCII uppercase form.
-fn alt_switch_target(shortcuts: &[char], keyval: u32) -> Option<usize> {
+fn alt_switch_target(shortcuts: &[Option<char>], keyval: u32) -> Option<usize> {
     shortcuts.iter().position(|shortcut| {
-        let shortcut = *shortcut as u32;
-        shortcut == keyval || shortcut.wrapping_sub(32) == keyval
+        shortcut.is_some_and(|shortcut| {
+            let shortcut = shortcut as u32;
+            shortcut == keyval || shortcut.wrapping_sub(32) == keyval
+        })
     })
 }
 
@@ -678,12 +774,18 @@ mod tests {
 
     #[test]
     fn alt_switch_matches_shortcut_or_its_uppercase() {
-        let all_mode = ['a', 'c', 'n', 'k', 'w', 'f'];
+        let all_mode = ['a', 'c', 'n', 'k', 'w', 'f'].map(Some);
         assert_eq!(alt_switch_target(&all_mode, u32::from('w')), Some(4));
         assert_eq!(alt_switch_target(&all_mode, u32::from('W')), Some(4));
         assert_eq!(alt_switch_target(&all_mode, u32::from('t')), None);
-        assert_eq!(alt_switch_target(&['t'], u32::from('T')), Some(0));
+        assert_eq!(alt_switch_target(&[Some('t')], u32::from('T')), Some(0));
         assert_eq!(alt_switch_target(&all_mode, u32::from('+')), None);
+        // A page without a letter is never selected by one.
+        assert_eq!(
+            alt_switch_target(&[None, Some('q')], u32::from('q')),
+            Some(1)
+        );
+        assert_eq!(alt_switch_target(&[None], 0), None);
     }
 
     #[test]

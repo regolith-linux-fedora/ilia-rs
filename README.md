@@ -81,6 +81,9 @@ listed under "In the port but not (known to be) upstream".
 
 Then #158–#161 (running a binding from the keybindings page) in one commit.
 
+Then the open upstream pull request #174 (pages defined in key files, and
+no window-manager pages under other window managers) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -124,6 +127,13 @@ as the window manager holds it (sway's includes read in its order,
 variables and resource values taken where they are used, quotes and
 spacing kept), also when clicked under the X11 grab.
 
+**Ported ahead of upstream** (open upstream pull requests): #174 pages
+defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
+or the lines a command prints, with `Exec`, `Sort=frequency`,
+`OnlyShowIn`/`NotShowIn` and an Alt key), and the Keybindings and Windows
+pages left out under window managers other than i3 and sway, where `-p`
+for either exits with an error instead of opening an empty page.
+
 **Partly ported:**
 
 - #171: only its Ctrl+$ fix (see below).
@@ -137,7 +147,8 @@ spacing kept), also when clicked under the X11 grab.
 - #170: the keybindings page shows the keys the window manager binds.
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
-  #172 (calculator page) and #173 (desktop-entry actions).
+  #172 (calculator page) and #173 (desktop-entry actions). #174 is already
+  in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help tab's
@@ -245,6 +256,7 @@ Ilia provides pages to view and select from the following types of things:
 - Text List (`textlist`)
 - File Search (`tracker`)
 - Open Windows (`windows`)
+- Pages defined in files: favourite apps, fixed lines, or the lines a command prints (see [Pages from files](#pages-from-files))
 
 ### Usage
 
@@ -273,6 +285,53 @@ The `textlist` page supports two additional parameters for more customization:
         -l: page label
         -i: page icon
 ```
+
+#### Pages from files
+
+More pages can be defined in key files, without changing ilia: a file `<name>.page` in the `ilia/pages` directory of an XDG configuration directory.
+The directories are `$XDG_CONFIG_HOME/ilia/pages` (`~/.config/ilia/pages`), then `ilia/pages` in each directory of `$XDG_CONFIG_DIRS` (`/etc/xdg/ilia/pages`).
+When several files define the same page, the first one found is used: the user's file hides the shared ones.
+`<name>` may hold ASCII letters, digits, `-` and `_`, and cannot be the name of a built-in page; names are matched without regard to case.
+A page is opened with `ilia -p <name>`, and `ilia -a` shows the pages from files after the built-in ones, ordered by file name.
+
+```
+[Ilia Page]
+Name=Favourites
+Icon=starred
+Key=v
+Apps=org.gnome.Nautilus.desktop;firefox.desktop;org.gnome.Terminal.desktop
+```
+
+```
+[Ilia Page]
+Name=Hosts
+Icon=network-server
+Key=h
+ItemsCommand=awk '/^Host / && $2 !~ /[*?]/ { print $2 }' ~/.ssh/config
+Exec=x-terminal-emulator -e ssh %s
+Sort=frequency
+OnlyShowIn=i3;sway
+```
+
+The keys of the `[Ilia Page]` group:
+
+- `Name` (required): the label of the page's tab, as plain text. `Name[<lang>]` gives a translation.
+- `Icon`: the icon of the tab and of the text rows (`applications-other` by default).
+- `Key`: a letter that selects the page with Alt when all pages are shown; a letter another page already uses is ignored.
+- Exactly one of:
+  - `Apps`: desktop file IDs, listed in the order given. Choosing one launches it as the Applications page does; entries that are not installed or not shown on this desktop are left out.
+  - `Items`: lines of text, separated by `;`.
+  - `ItemsCommand`: a shell command (`/bin/sh -c`), each line it prints is a row. It runs when the page is first shown, rows appear as they are printed, and it is stopped, with its process group, when ilia closes.
+- `Exec`: for `Items` and `ItemsCommand`, the command that choosing a row runs, with each `%s` replaced by the row's value as one argument (`%%` is a `%`; without `%s` the value is added as the last argument). The command is not run by a shell; it starts in its own `systemd-run --user --scope` unit when `systemd-run` is available. Without `Exec`, the value is printed, as with `textlist`.
+- `Sort=frequency`: for `Items` and `ItemsCommand`, the rows chosen most often come first. Choices are recorded as `<name>#<value>` in the `app-launch-counts` setting, the launch history the Applications page ranks by, which keeps the latest 32 launches.
+- `OnlyShowIn`, `NotShowIn`: window managers the page is or is not shown under: `i3`, `sway`, or `other` for any other.
+
+A row of `Items` or `ItemsCommand` may be `label<tab>value`: the label is shown and searched, and choosing the row uses the value (in a key file, a tab is written `\t`).
+Rows are matched as on the other pages, following the `fuzzy-matching` setting; rows of `Apps` are matched as on the Applications page, following `match-fields` too, but keep their order.
+Files that cannot be used are reported on standard error and skipped.
+
+The window manager is sway when `SWAYSOCK` is set to something, else i3 when `I3SOCK` is.
+The `keybindings` and `windows` pages need i3 or sway: under other window managers they are not shown, and `ilia -p keybindings` exits with an error.
 
 ### Configuration
 

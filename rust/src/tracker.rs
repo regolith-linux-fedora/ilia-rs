@@ -301,8 +301,8 @@ impl DialogPage for TrackerPage {
         self.activate_when_ready()
             || (self.model.iter_first().is_none() && !self.entry.text().is_empty())
     }
-    fn get_keybinding(&self) -> char {
-        'f'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('f')
     }
     fn show(&self) {
         self.view.grab_focus();

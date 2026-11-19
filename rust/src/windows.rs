@@ -180,8 +180,8 @@ impl DialogPage for WindowsPage {
             && self.filter.iter_first().is_none()
             && !self.entry.text().is_empty()
     }
-    fn get_keybinding(&self) -> char {
-        'w'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('w')
     }
     fn show(&self) {
         self.view.grab_focus();

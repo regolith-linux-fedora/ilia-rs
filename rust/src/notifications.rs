@@ -303,8 +303,8 @@ impl DialogPage for RoficationPage {
         }
         false
     }
-    fn get_keybinding(&self) -> char {
-        'n'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('n')
     }
     fn show(&self) {
         self.inner.view.grab_focus();

@@ -7,6 +7,7 @@ use gtk_layer_shell::LayerShell;
 
 use crate::args::Args;
 use crate::dialog;
+use crate::textlist;
 
 const DEFAULT_CSS: &str = r#"                .root_box {
                     margin: 8px;
@@ -37,10 +38,9 @@ const DEFAULT_CSS: &str = r#"                .root_box {
 type SharedConnection = Rc<RefCell<Option<gio::DBusConnection>>>;
 
 pub fn run(args: Args) -> i32 {
-    let wm_name = detect_wm(
-        std::env::var_os("SWAYSOCK").is_some(),
-        std::env::var_os("I3SOCK").is_some(),
-    );
+    // A variable that is set but empty counts as unset.
+    let has_socket = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    let wm_name = detect_wm(has_socket("SWAYSOCK"), has_socket("I3SOCK"));
     let app = gtk::Application::new(
         Some("org.regolith.launcher"),
         gio::ApplicationFlags::REPLACE | gio::ApplicationFlags::ALLOW_REPLACEMENT,
@@ -99,6 +99,10 @@ pub fn run(args: Args) -> i32 {
         }
     });
     app.run_with_args(&["ilia"]);
+    // Page commands still running end with the launcher; a command a
+    // choice started gets a moment to finish.
+    textlist::stop_commands();
+    textlist::wait_for_launched();
     exit_status.get()
 }
 

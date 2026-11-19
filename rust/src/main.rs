@@ -8,6 +8,7 @@ mod input_sources;
 mod ipc;
 mod keybindings;
 mod notifications;
+mod page_files;
 mod pages;
 mod rofication;
 mod runner;

@@ -154,8 +154,8 @@ impl DialogPage for CommandPage {
         }
         false
     }
-    fn get_keybinding(&self) -> char {
-        'c'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('c')
     }
     fn show(&self) {
         self.view.grab_focus();

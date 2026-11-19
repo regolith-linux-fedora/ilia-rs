@@ -6,11 +6,12 @@ use gio::prelude::*;
 use gtk::gdk;
 use gtk::prelude::*;
 
-use crate::apps::ApplicationsPage;
+use crate::apps::{AppListPage, ApplicationsPage};
 use crate::args::Args;
 use crate::filter::{match_fields, query_words, Match};
 use crate::keybindings::KeybindingsPage;
 use crate::notifications::RoficationPage;
+use crate::page_files::{PageFile, Rows};
 use crate::terminal::CommandPage;
 use crate::textlist::TextListPage;
 use crate::tracker::TrackerPage;
@@ -31,15 +32,17 @@ pub trait DialogPage {
     fn get_root(&self) -> gtk::Widget;
     fn on_entry_changed(&self) {}
     fn on_entry_activated(&self) {}
-    fn get_id(&self) -> &'static str;
-    fn get_name(&self) -> &'static str;
-    fn get_icon_name(&self) -> &'static str;
-    fn get_help(&self) -> &'static str;
+    fn get_id(&self) -> &str;
+    /// The tab title, as markup.
+    fn get_name(&self) -> &str;
+    fn get_icon_name(&self) -> &str;
+    fn get_help(&self) -> &str;
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str>;
     fn key_event(&self, _event: &gdk::EventKey) -> bool {
         false
     }
-    fn get_keybinding(&self) -> char;
+    /// The letter that selects the page with Alt.
+    fn get_keybinding(&self) -> Option<char>;
     fn show(&self) {}
 }
 
@@ -48,19 +51,19 @@ impl DialogPage for Page {
         gtk::ListBox::new().upcast()
     }
 
-    fn get_id(&self) -> &'static str {
+    fn get_id(&self) -> &str {
         self.id
     }
 
-    fn get_name(&self) -> &'static str {
+    fn get_name(&self) -> &str {
         self.name
     }
 
-    fn get_icon_name(&self) -> &'static str {
+    fn get_icon_name(&self) -> &str {
         self.icon
     }
 
-    fn get_help(&self) -> &'static str {
+    fn get_help(&self) -> &str {
         self.help
     }
 
@@ -68,8 +71,8 @@ impl DialogPage for Page {
         self.bindings.iter().copied().collect()
     }
 
-    fn get_keybinding(&self) -> char {
-        self.key
+    fn get_keybinding(&self) -> Option<char> {
+        Some(self.key)
     }
 }
 
@@ -82,6 +85,18 @@ pub const PAGES: &[Page] = &[
     Page { id: "windows", name: "<u>W</u>indows", icon: "window-new", key: 'w', help: "This dialog allows for navigating between open windows in the desktop environment.  Selecting a window from the list will cause it to be viewed on screen and focused.", bindings: &[("enter", "Navigate to Window")] },
     Page { id: "tracker", name: "<u>F</u>iles", icon: "emblem-documents", key: 'f', help: "This dialog allows for searching for files based on content. Type in a text query, hit enter and select from the list of files which contain the search string to open it.", bindings: &[("enter", "Open File")] },
 ];
+
+/// The pages that need i3 or sway, which are not offered under any other
+/// window manager.
+const WM_PAGE_IDS: &[&str] = &["keybindings", "windows"];
+
+impl Page {
+    /// Whether the page works under the window manager `wm_name`: `i3`,
+    /// `sway`, or `Unknown` for any other.
+    pub fn available_under(&self, wm_name: &str) -> bool {
+        !WM_PAGE_IDS.contains(&self.id) || matches!(wm_name, "i3" | "sway")
+    }
+}
 
 /// The keys that act on the highlighted row: Return and the keypad Enter.
 pub fn is_enter_key(key: &gdk::keys::Key) -> bool {
@@ -292,5 +307,27 @@ pub fn create(
             quit,
         )),
         _ => Rc::new(*page),
+    }
+}
+
+/// The page a page file defines; `key` is the letter that selects it.
+pub fn create_from_file(
+    file: &PageFile,
+    key: Option<char>,
+    settings: &gio::Settings,
+    entry: &gtk::Entry,
+    quit: Rc<dyn Fn()>,
+) -> Rc<dyn DialogPage> {
+    match file.rows {
+        Rows::Apps(_) => Rc::new(AppListPage::new(
+            settings.clone(),
+            entry.clone(),
+            file,
+            key,
+            quit,
+        )),
+        Rows::Items(_) | Rows::Command(_) => {
+            TextListPage::from_page_file(settings.clone(), entry.clone(), file, key, quit)
+        }
     }
 }

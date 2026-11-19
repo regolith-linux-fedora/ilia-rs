@@ -227,8 +227,8 @@ impl DialogPage for KeybindingsPage {
         // so Enter then does nothing.
         self.navigate(event)
     }
-    fn get_keybinding(&self) -> char {
-        'k'
+    fn get_keybinding(&self) -> Option<char> {
+        Some('k')
     }
     fn show(&self) {
         self.view.grab_focus();

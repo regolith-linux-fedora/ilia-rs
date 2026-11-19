@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use gio::prelude::*;
 
 /// The terminal Regolith starts programs in, as the commands page does.
@@ -37,15 +39,30 @@ pub fn runner_app_info(app_info: &gio::AppInfo) -> Result<gio::AppInfo, glib::Er
     } else {
         (commandline, gio::AppInfoCreateFlags::NONE)
     };
-    let random = glib::uuid_string_random();
-    let unit = format!(
-        "run_ilia_{}_{}.scope",
-        systemd_escape(&app_id),
-        &random[..8]
-    );
+    let unit = unit_name(&app_id);
     let wrapped = format!("systemd-run --user --scope --unit \"{unit}\" {commandline}");
 
     gio::AppInfo::create_from_commandline(&wrapped, Some(&app_id), flags)
+}
+
+/// A fresh scope unit name for a program started for `id`: the escaped id
+/// and eight random lowercase hexadecimal digits.
+fn unit_name(id: &str) -> String {
+    let random = glib::uuid_string_random();
+    format!("run_ilia_{}_{}.scope", systemd_escape(id), &random[..8])
+}
+
+/// The words that start a program in a fresh user scope named for `id`,
+/// when systemd-run is available; the program's own words follow them.
+pub fn scope_command(id: &str) -> Option<Vec<OsString>> {
+    let runner = glib::find_program_in_path("systemd-run")?;
+    Some(vec![
+        runner.into_os_string(),
+        "--user".into(),
+        "--scope".into(),
+        format!("--unit={}", unit_name(id)).into(),
+        "--".into(),
+    ])
 }
 
 /// Whether the desktop entry asks to run in a terminal (`Terminal=true`).
@@ -93,7 +110,7 @@ pub fn systemd_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_terminal, needs_terminal, systemd_escape};
+    use super::{in_terminal, needs_terminal, systemd_escape, unit_name};
     use gio::prelude::*;
 
     // GLib rejects an entry whose Exec program is not on PATH, and another
@@ -148,5 +165,20 @@ mod tests {
         assert_eq!(systemd_escape("-hyphen"), "-hyphen");
         assert_eq!(systemd_escape("a-hyphen"), "a\\x2dhyphen");
         assert_eq!(systemd_escape("a\u{1f}control"), "a\u{1f}control");
+    }
+
+    #[test]
+    fn unit_names_are_fresh_for_each_launch() {
+        let first = unit_name("Page-ID_2");
+        let second = unit_name("Page-ID_2");
+        assert_ne!(first, second);
+        let random = first
+            .strip_prefix("run_ilia_Page\\x2dID_2_")
+            .and_then(|rest| rest.strip_suffix(".scope"))
+            .unwrap();
+        assert_eq!(random.len(), 8);
+        assert!(random
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
     }
 }
