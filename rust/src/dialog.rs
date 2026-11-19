@@ -7,7 +7,9 @@ use std::rc::Rc;
 use glib::translate::IntoGlib;
 use glib::Unichar;
 
+use crate::apps::is_copy_program_path_key;
 use crate::args::Args;
+use crate::clipboard_keeper;
 use crate::input_sources::InputSourceSwitcher;
 use crate::page_files::{self, PageFile};
 use crate::pages::{create, create_from_file, find, is_enter_key, DialogPage, Page, PAGES};
@@ -496,7 +498,10 @@ pub fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
     }
     window.hide();
     window.close();
-    app.quit();
+    // A path copied from the Applications page stays pasteable.
+    if !clipboard_keeper::keep_after_close(app) {
+        app.quit();
+    }
 }
 
 pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
@@ -582,6 +587,10 @@ fn size_change_allowed(width: i32, height: i32, monitor: Option<(i32, i32)>) -> 
 /// Ctrl+key entry editing in the reference's branch order. Returns `None`
 /// when the key is not an editing key, so the plain-key handling runs.
 fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPage) -> Option<bool> {
+    // The page's own copy key, not the entry's Ctrl+c.
+    if is_copy_program_path_key(event) {
+        return Some(page.key_event(event));
+    }
     let keyval = *event.keyval();
     let text = entry.text();
     // Entry positions count characters.

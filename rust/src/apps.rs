@@ -12,12 +12,14 @@ use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk::prelude::*;
 
 use crate::add_app_form::AddAppForm;
+use crate::clipboard_keeper;
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
 use crate::keybindings::navigate;
 use crate::page_files::{PageFile, Rows};
 use crate::pages::{
     rebuild_keeping_selection, select_first_row, select_row_near, DialogPage, FUZZY_MATCHING,
 };
+use crate::program_path;
 use crate::runner::runner_app_info;
 
 const ICON: u32 = 0;
@@ -31,6 +33,9 @@ const HISTORY_MAX_LEN: usize = 32;
 pub const LAUNCH_HISTORY: &str = "app-launch-counts";
 const HIDDEN_APPS: &str = "hidden-apps";
 const MATCH_FIELDS: &str = "match-fields";
+// How often the path strip is worked out again while the page is shown, so
+// that it follows changes to the files it names.
+const PROGRAM_PATH_RECHECK: Duration = Duration::from_millis(500);
 
 pub struct ApplicationsPage {
     entry: gtk::Entry,
@@ -38,7 +43,12 @@ pub struct ApplicationsPage {
     filter: gtk::TreeModelFilter,
     view: gtk::TreeView,
     root: gtk::Widget,
-    // The + button in the strip below the list, and the form it opens over
+    // At the left of the strip below the list, the program of the
+    // highlighted app.
+    program_path: gtk::Label,
+    // The program path's complete text, as its accessible name gives it.
+    program_text: RefCell<String>,
+    // At the right of the strip, the + button, and the form it opens over
     // the list.
     add_button: gtk::EventBox,
     form: Rc<AddAppForm>,
@@ -101,10 +111,13 @@ impl ApplicationsPage {
         overlay.add(&scrolled);
         overlay.add_overlay(form.widget());
 
-        // One line below the list, the + button at its right end.
+        // One line below the list: the program of the highlighted app from
+        // its left edge, the + button at its right end.
+        let program_path = program_path_label();
         let add_button = add_app_button();
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         strip.style_context().add_class("app_strip");
+        strip.pack_start(&program_path, true, true, 0);
         strip.pack_end(&add_button, false, false, 0);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -117,6 +130,8 @@ impl ApplicationsPage {
             filter,
             view,
             root: root.upcast(),
+            program_path,
+            program_text: RefCell::default(),
             add_button,
             form,
             focus_before_form: RefCell::default(),
@@ -131,6 +146,7 @@ impl ApplicationsPage {
         });
         page.connect_activation();
         page.connect_form();
+        page.connect_program_path();
         page.follow_settings();
         page.set_selection();
         if icon_size > 0 {
@@ -209,6 +225,65 @@ impl ApplicationsPage {
                 page.on_app_added(path);
             }
         });
+    }
+
+    /// Keeps the path strip naming the program of the highlighted row: when
+    /// the highlight moves, when the page is shown again, and periodically
+    /// while it is shown, for changes to the files the program is found by.
+    fn connect_program_path(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.view.selection().connect_changed(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.update_program_path();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.root.connect_map(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.update_program_path();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(PROGRAM_PATH_RECHECK, move || {
+            let Some(page) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if page.root.is_mapped() {
+                page.update_program_path();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Shows the program of the highlighted row, or nothing when no row is
+    /// highlighted.
+    fn update_program_path(&self) {
+        let text = self
+            .view
+            .selection()
+            .selected()
+            .and_then(|(model, iter)| app_value(&model, &iter))
+            .map(|app| program_path::describe_app(&app))
+            .unwrap_or_default();
+        // Only a different text is news, to assistive technology as well.
+        if *self.program_text.borrow() == text {
+            return;
+        }
+        self.program_path
+            .set_text(&program_path::single_line_display(&text));
+        if let Some(accessible) = self.program_path.accessible() {
+            accessible.set_name(&text);
+        }
+        self.program_text.replace(text);
+    }
+
+    /// Ctrl+Shift+C copies the program path shown, without the target of a
+    /// link. Nothing is copied when no program was found.
+    fn copy_program_path(&self) {
+        let text = self.program_text.borrow();
+        if let Some(path) = program_path::copied_path(&text) {
+            clipboard_keeper::copy(&self.program_path.display(), path);
+        }
     }
 
     /// Shows the add-application form over the list.
@@ -489,6 +564,9 @@ impl DialogPage for ApplicationsPage {
         install_sort(&self.model, &self.apps);
         self.filter.refilter();
         self.set_selection();
+        // The highlighted row may be the one highlighted before, with the
+        // files behind it changed while another page was shown.
+        self.update_program_path();
     }
 
     fn on_entry_activated(&self) {
@@ -515,6 +593,7 @@ impl DialogPage for ApplicationsPage {
         [
             ("enter", "Launch Application"),
             ("ctrl+=", "Add Application"),
+            ("ctrl+shift+c", "Copy Program Path"),
             ("ctrl+delete", "Hide Application"),
             ("ctrl+z", "Undo Hide"),
         ]
@@ -525,6 +604,11 @@ impl DialogPage for ApplicationsPage {
     fn key_event(&self, event: &gdk::EventKey) -> bool {
         if is_add_app_shortcut(event) {
             self.open_form();
+            return true;
+        }
+        // Only while the page is shown: not from the Help tab.
+        if is_copy_program_path_key(event) && self.root.is_mapped() {
+            self.copy_program_path();
             return true;
         }
         if event.keyval() == gdk::keys::constants::Delete
@@ -559,6 +643,27 @@ impl DialogPage for ApplicationsPage {
             self.view.grab_focus();
         }
     }
+}
+
+/// The strip's program path: one line from the page's left edge that never
+/// takes the focus. It keeps the end of the path, the program's file name,
+/// in view, and never asks for more width than the window has.
+fn program_path_label() -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.style_context().add_class("app_path");
+    label.set_can_focus(false);
+    label.set_single_line_mode(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+    label.set_max_width_chars(1);
+    label.set_xalign(0.0);
+    label
+}
+
+/// Ctrl+Shift+C, whatever the state of Caps Lock.
+pub fn is_copy_program_path_key(event: &gdk::EventKey) -> bool {
+    let modifiers = event.state() & gtk::accelerator_get_default_mod_mask();
+    modifiers == gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+        && event.keyval().to_lower() == gdk::keys::constants::c
 }
 
 /// The strip's + button. A GtkButton's accessible exposes neither its label

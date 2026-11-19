@@ -8,8 +8,9 @@ gtk-rs graph is `libc`, for `dlopen` and a few system calls. The SPARQL library 
 loads it the first time it searches, so every other page works without it.
 `sparql.rs`, which wraps its C calls in a safe API, holds nearly all the
 `unsafe`; the rest is three libc calls in `textlist.rs` that end a page
-file's command with its whole process group and reap it, and one
-`access(2)` in `new_entry.rs` that checks a program is executable.
+file's command with its whole process group and reap it, one
+`faccessat(2)` in `program_path.rs` that checks a program is executable,
+and one GTK call in `clipboard_keeper.rs` that gtk-rs has no binding for.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -49,6 +50,13 @@ Module map:
   form (the `+` button below the list, or Ctrl+=), shown inside the window
   over the list, and the desktop entry it checks and writes to the user's
   applications directory.
+- `program_path.rs`: the program behind a desktop entry, as the
+  Applications page's strip names it (the `Exec` words, `env` wrappers,
+  the search path, links, and session-bus entries).
+- `clipboard_keeper.rs`: the path copied with Ctrl+Shift+C, which stays
+  pasteable after the window closes: handed to an X11 clipboard manager,
+  or served by ilia, running on without a window, until the clipboard
+  holds something else.
 - `dialog.rs`, `application.rs`: the shell, which also picks the pages the
   current window manager (i3, sway or other) can show.
 

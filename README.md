@@ -87,6 +87,9 @@ no window-manager pages under other window managers) in one commit.
 Then the open upstream pull request #184 (adding applications from a form
 on the Applications page, and row clicks under the X11 grab) in one commit.
 
+Then the open upstream pull request #181 (the program path of the
+highlighted application, and Ctrl+Shift+C to copy it) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -140,7 +143,12 @@ button and Ctrl+= on the Applications page open a form inside the window
 that writes a checked desktop entry to the user's applications directory
 and lists and highlights it at once, a click on an Applications row
 launches it under the X11 grab too, and keywords holding an escaped `;`
-are searched.
+are searched; #181 the strip under the Applications list names the
+program of the highlighted app as its `Exec` line finds it (through
+`env`, the search path and links, or the session-bus name of a
+D-Bus-activatable entry), kept current while the page is shown, and
+Ctrl+Shift+C copies the path so that it can still be pasted after ilia
+closes.
 
 **Partly ported:**
 
@@ -155,8 +163,8 @@ are searched.
 - #170: the keybindings page shows the keys the window manager binds.
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
-  #172 (calculator page) and #173 (desktop-entry actions). #174 and #184
-  are already in the port (see above).
+  #172 (calculator page) and #173 (desktop-entry actions). #174, #181 and
+  #184 are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help tab's
@@ -286,6 +294,8 @@ It asks for a name and a command, and optionally an icon, a comment, keywords an
 The command is split into words with shell quoting rules (no expansion), and its program must be an executable file, given as an absolute path, a `~/` path or a name found on `PATH`.
 Add writes a new desktop entry to `$XDG_DATA_HOME/applications` (`~/.local/share/applications` by default), named after the application, with `-2`, `-3`, ... added when that desktop file id is taken.
 The new application is listed and highlighted at once. Escape or Cancel closes the form without writing anything.
+
+The same line under the list shows where the highlighted app's program is on disk, as its `Exec` line finds it on `PATH` (through `env`, with the target of a symbolic link after `→`), or `D-Bus: ` and the bus name for an entry started over the session bus. It follows the highlight and changes on disk while ilia is open. Ctrl+Shift+C copies that path, and the copy stays on the clipboard after ilia closes: an X11 clipboard manager takes it, and without one ilia keeps running without a window until something else is copied. The path has the style class `app_path`.
 
 #### Text List
 

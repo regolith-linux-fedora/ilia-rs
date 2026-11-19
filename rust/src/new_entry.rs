@@ -3,12 +3,13 @@
 //! user's applications directory.
 
 use std::collections::HashSet;
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+use crate::program_path::is_executable_file;
 
 const GROUP: &str = "Desktop Entry";
 // The longest file name stem made from a name.
@@ -379,17 +380,6 @@ fn resolve_program(word: &str, home: &Path, path: Option<&OsStr>) -> Result<Stri
     } else {
         Err(format!("The program {word} is not in PATH."))
     }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-        return false;
-    }
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `path` is a valid NUL-terminated string for the whole call.
-    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 /// The Icon value: none for an empty field, an absolute path to an existing
