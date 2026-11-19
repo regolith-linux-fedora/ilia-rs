@@ -84,6 +84,9 @@ Then #158–#161 (running a binding from the keybindings page) in one commit.
 Then the open upstream pull request #174 (pages defined in key files, and
 no window-manager pages under other window managers) in one commit.
 
+Then the open upstream pull request #184 (adding applications from a form
+on the Applications page, and row clicks under the X11 grab) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -132,7 +135,12 @@ defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
 or the lines a command prints, with `Exec`, `Sort=frequency`,
 `OnlyShowIn`/`NotShowIn` and an Alt key), and the Keybindings and Windows
 pages left out under window managers other than i3 and sway, where `-p`
-for either exits with an error instead of opening an empty page.
+for either exits with an error instead of opening an empty page; #184 a `+`
+button and Ctrl+= on the Applications page open a form inside the window
+that writes a checked desktop entry to the user's applications directory
+and lists and highlights it at once, a click on an Applications row
+launches it under the X11 grab too, and keywords holding an escaped `;`
+are searched.
 
 **Partly ported:**
 
@@ -147,8 +155,8 @@ for either exits with an error instead of opening an empty page.
 - #170: the keybindings page shows the keys the window manager binds.
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
-  #172 (calculator page) and #173 (desktop-entry actions). #174 is already
-  in the port (see above).
+  #172 (calculator page) and #173 (desktop-entry actions). #174 and #184
+  are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help tab's
@@ -272,6 +280,12 @@ ilia -p keybindings
 
 Ilia searches the system-configured `$XDG_DATA_DIRS` with `applications` applied at the end of each path for desktop application files.
 For example, if your system has `$HOME/.local/share` in the set of paths in `$XDG_DATA_DIRS`, the path `$HOME/.local/share/applications/` will be searched for desktop app files.
+
+The `+` button below the list, or Ctrl and the `+` key (Ctrl+= on a US layout, or the keypad's `+`), opens a form inside the window for adding an application.
+It asks for a name and a command, and optionally an icon, a comment, keywords and whether the program runs in a terminal.
+The command is split into words with shell quoting rules (no expansion), and its program must be an executable file, given as an absolute path, a `~/` path or a name found on `PATH`.
+Add writes a new desktop entry to `$XDG_DATA_HOME/applications` (`~/.local/share/applications` by default), named after the application, with `-2`, `-3`, ... added when that desktop file id is taken.
+The new application is listed and highlighted at once. Escape or Cancel closes the form without writing anything.
 
 #### Text List
 

@@ -3,12 +3,13 @@
 Build from this directory with `cargo build --release --locked`.
 The binary is `target/release/ilia`. Cargo
 resolves the locked dependencies from crates.io; the only crate outside the
-gtk-rs graph is `libc`, for `dlopen`. The SPARQL library (`libtinysparql-3.0.so.0`, or
+gtk-rs graph is `libc`, for `dlopen` and a few system calls. The SPARQL library (`libtinysparql-3.0.so.0`, or
 `libtracker-sparql-3.0.so.0` on older systems) is not linked: the Files page
 loads it the first time it searches, so every other page works without it.
 `sparql.rs`, which wraps its C calls in a safe API, holds nearly all the
 `unsafe`; the rest is three libc calls in `textlist.rs` that end a page
-file's command with its whole process group and reap it.
+file's command with its whole process group and reap it, and one
+`access(2)` in `new_entry.rs` that checks a program is executable.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -44,6 +45,10 @@ Module map:
   Their pages live in `apps.rs` (`Apps` rows, launched like the
   Applications page) and `textlist.rs` (`Items` and `ItemsCommand` rows,
   the command read on a background thread in its own process group).
+- `add_app_form.rs`, `new_entry.rs`: the Applications page's add-application
+  form (the `+` button below the list, or Ctrl+=), shown inside the window
+  over the list, and the desktop entry it checks and writes to the user's
+  applications directory.
 - `dialog.rs`, `application.rs`: the shell, which also picks the pages the
   current window manager (i3, sway or other) can show.
 

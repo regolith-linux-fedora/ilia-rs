@@ -1,15 +1,17 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gio::prelude::*;
+use gtk::atk::prelude::AtkObjectExt;
 use gtk::gdk;
 use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk::prelude::*;
 
+use crate::add_app_form::AddAppForm;
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
 use crate::keybindings::navigate;
 use crate::page_files::{PageFile, Rows};
@@ -36,6 +38,13 @@ pub struct ApplicationsPage {
     filter: gtk::TreeModelFilter,
     view: gtk::TreeView,
     root: gtk::Widget,
+    // The + button in the strip below the list, and the form it opens over
+    // the list.
+    add_button: gtk::EventBox,
+    form: Rc<AddAppForm>,
+    // What had the keyboard focus before the form was opened.
+    focus_before_form: RefCell<Option<gtk::Widget>>,
+    icon_size: i32,
     settings: gio::Settings,
     launch_history: Rc<RefCell<Vec<String>>>,
     apps: Rc<AppList>,
@@ -44,10 +53,12 @@ pub struct ApplicationsPage {
     hides: RefCell<Vec<String>>,
     post_launch_sleep: u64,
     quit: Rc<dyn Fn()>,
+    // An app was started: ilia is closing. A click can activate a row twice.
+    launched: Cell<bool>,
 }
 
 impl ApplicationsPage {
-    pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Self {
+    pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Rc<Self> {
         let launch_history: Vec<String> = settings
             .strv(LAUNCH_HISTORY)
             .iter()
@@ -81,21 +92,45 @@ impl ApplicationsPage {
         install_sort(&model, &apps);
         model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
 
-        let (view, root) = app_view(&filter, icon_size);
-        let page = Self {
+        let (view, scrolled) = app_view(&filter, icon_size);
+
+        // The form covers the list while it is shown; the list stays as it
+        // is underneath.
+        let form = AddAppForm::new();
+        let overlay = gtk::Overlay::new();
+        overlay.add(&scrolled);
+        overlay.add_overlay(form.widget());
+
+        // One line below the list, the + button at its right end.
+        let add_button = add_app_button();
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        strip.style_context().add_class("app_strip");
+        strip.pack_end(&add_button, false, false, 0);
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.pack_start(&overlay, true, true, 0);
+        root.pack_start(&strip, false, false, 0);
+
+        let page = Rc::new(Self {
             entry,
             model,
             filter,
             view,
-            root,
+            root: root.upcast(),
+            add_button,
+            form,
+            focus_before_form: RefCell::default(),
+            icon_size,
             settings,
             launch_history: Rc::new(RefCell::new(launch_history)),
             apps,
             hides: RefCell::default(),
             post_launch_sleep,
             quit,
-        };
+            launched: Cell::new(false),
+        });
         page.connect_activation();
+        page.connect_form();
         page.follow_settings();
         page.set_selection();
         if icon_size > 0 {
@@ -104,9 +139,171 @@ impl ApplicationsPage {
         page
     }
 
-    fn connect_activation(&self) {
-        connect_launch(
-            &self.view,
+    fn connect_activation(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.view.connect_row_activated(move |_, path, _| {
+            if let Some(page) = weak.upgrade() {
+                page.execute_path(path);
+            }
+        });
+
+        // Under the X11 grab the tree view does not activate a row on a
+        // single click itself: launch the row a primary click is released
+        // on. Where it does (Wayland), `launched` keeps it to one launch.
+        let weak = Rc::downgrade(self);
+        self.view.connect_button_release_event(move |view, event| {
+            let Some(page) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if event.button() != gdk::BUTTON_PRIMARY
+                || event
+                    .state()
+                    .intersects(gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK)
+                || page.form.is_open()
+            {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(path) = row_at_pointer(view, event) {
+                page.execute_path(&path);
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    fn connect_form(self: &Rc<Self>) {
+        // A primary click: the press and the release both on the button.
+        let pressed = Rc::new(Cell::new(false));
+        let pressed_for_press = pressed.clone();
+        self.add_button.connect_button_press_event(move |_, event| {
+            if event.button() == gdk::BUTTON_PRIMARY
+                && event.event_type() == gdk::EventType::ButtonPress
+            {
+                pressed_for_press.set(true);
+            }
+            glib::Propagation::Stop
+        });
+        let weak = Rc::downgrade(self);
+        self.add_button
+            .connect_button_release_event(move |button, event| {
+                let (x, y) = event.position();
+                let inside = x >= 0.0
+                    && y >= 0.0
+                    && x < f64::from(button.allocated_width())
+                    && y < f64::from(button.allocated_height());
+                if pressed.replace(false) && event.button() == gdk::BUTTON_PRIMARY && inside {
+                    if let Some(page) = weak.upgrade() {
+                        page.open_form();
+                    }
+                }
+                glib::Propagation::Stop
+            });
+        let weak = Rc::downgrade(self);
+        self.form.connect_cancelled(move || {
+            if let Some(page) = weak.upgrade() {
+                page.close_form();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.form.connect_added(move |path| {
+            if let Some(page) = weak.upgrade() {
+                page.on_app_added(path);
+            }
+        });
+    }
+
+    /// Shows the add-application form over the list.
+    fn open_form(&self) {
+        if self.form.is_open() {
+            return;
+        }
+        let focus = self
+            .root
+            .toplevel()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| window.focused_widget());
+        *self.focus_before_form.borrow_mut() = focus;
+        // The filter belongs to the list: it keeps its text, and the form's
+        // keys stay out of it.
+        self.entry.set_sensitive(false);
+        self.add_button.set_sensitive(false);
+        self.form.open();
+    }
+
+    /// Shows the list again, as it was before the form was opened.
+    fn close_form(&self) {
+        self.form.close();
+        self.add_button.set_sensitive(true);
+        self.entry.set_sensitive(true);
+        match self.focus_before_form.take() {
+            Some(focus) => match focus.downcast::<gtk::Entry>() {
+                Ok(entry) => entry.grab_focus_without_selecting(),
+                Err(focus) => focus.grab_focus(),
+            },
+            None => self.view.grab_focus(),
+        }
+    }
+
+    /// A desktop entry was written at `path`: clear the filter, then list
+    /// the entry and highlight it.
+    fn on_app_added(&self, path: PathBuf) {
+        self.entry.set_text("");
+        self.close_form();
+        let Some((desktop, id)) = gio::DesktopAppInfo::from_filename(&path)
+            .filter(|desktop| desktop.should_show())
+            .and_then(|desktop| {
+                let id = desktop.id()?.to_string();
+                Some((desktop, id))
+            })
+        else {
+            eprintln!("The new desktop entry {} cannot be listed", path.display());
+            return;
+        };
+        let index = self.apps.push(App::new(id, &desktop, 0));
+        let row = insert_row(
+            &self.model,
+            &desktop,
+            index,
+            blank_icon(self.icon_size).as_ref(),
+        );
+        if let Some(icon) = gtk::IconTheme::default()
+            .filter(|_| self.icon_size > 0)
+            .and_then(|theme| load_icon(&theme, &desktop, self.icon_size))
+        {
+            self.model.set(&row, &[(ICON, &icon)]);
+        }
+        self.highlight(&row);
+    }
+
+    /// Highlights a model row, if the filter lists it.
+    fn highlight(&self, row: &gtk::TreeIter) {
+        let Some(path) = self
+            .filter
+            .convert_child_iter_to_iter(row)
+            .and_then(|iter| self.filter.path(&iter))
+        else {
+            return;
+        };
+        // Also selects the row and scrolls to it.
+        self.view
+            .set_cursor(&path, None::<&gtk::TreeViewColumn>, false);
+    }
+
+    fn execute_path(&self, path: &gtk::TreePath) {
+        let Some(iter) = self.filter.iter(path) else {
+            return;
+        };
+        if let Some(app) = app_value(&self.filter, &iter) {
+            self.execute(&app);
+        }
+    }
+
+    fn execute(&self, app: &gio::DesktopAppInfo) {
+        // Only the first activation starts anything: ilia is closing.
+        if self.launched.replace(true) {
+            return;
+        }
+        execute_app(
+            app,
             &self.settings,
             &self.launch_history,
             self.post_launch_sleep,
@@ -124,16 +321,9 @@ impl ApplicationsPage {
         let Some((model, iter)) = self.view.selection().selected() else {
             return;
         };
-        let Some(app) = app_value(&model, &iter) else {
-            return;
-        };
-        execute_app(
-            &app,
-            &self.settings,
-            &self.launch_history,
-            self.post_launch_sleep,
-            &self.quit,
-        );
+        if let Some(app) = app_value(&model, &iter) {
+            self.execute(&app);
+        }
     }
 
     fn navigate(&self, event: &gdk::EventKey) -> bool {
@@ -324,6 +514,7 @@ impl DialogPage for ApplicationsPage {
     fn get_keybindings(&self) -> BTreeMap<&'static str, &'static str> {
         [
             ("enter", "Launch Application"),
+            ("ctrl+=", "Add Application"),
             ("ctrl+delete", "Hide Application"),
             ("ctrl+z", "Undo Hide"),
         ]
@@ -332,6 +523,10 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn key_event(&self, event: &gdk::EventKey) -> bool {
+        if is_add_app_shortcut(event) {
+            self.open_form();
+            return true;
+        }
         if event.keyval() == gdk::keys::constants::Delete
             && event.state().contains(gdk::ModifierType::CONTROL_MASK)
         {
@@ -353,9 +548,69 @@ impl DialogPage for ApplicationsPage {
         Some('a')
     }
 
-    fn show(&self) {
-        self.view.grab_focus();
+    fn capture_key_event(&self, event: &gdk::EventKey) -> bool {
+        self.form.is_open() && self.form.handle_key(event)
     }
+
+    fn show(&self) {
+        if self.form.is_open() {
+            self.form.take_focus();
+        } else {
+            self.view.grab_focus();
+        }
+    }
+}
+
+/// The strip's + button. A GtkButton's accessible exposes neither its label
+/// nor any child, so the button is an event box that shows assistive
+/// technologies a push button holding the + label, as GTK 4 buttons do. It
+/// takes no focus: the keys stay with the filter and the list.
+fn add_app_button() -> gtk::EventBox {
+    let label = gtk::Label::new(Some("+"));
+    label.set_margin_start(10);
+    label.set_margin_end(10);
+    label.set_margin_top(4);
+    label.set_margin_bottom(4);
+    let button = gtk::EventBox::new();
+    button.set_visible_window(false);
+    button.style_context().add_class("add_app_button");
+    button.add(&label);
+    if let Some(accessible) = button.accessible() {
+        accessible.set_role(gtk::atk::Role::PushButton);
+        accessible.set_name("Add application");
+    }
+    button
+}
+
+/// Ctrl and the key bearing + on a US layout, shifted or not, or the
+/// keypad's +.
+fn is_add_app_shortcut(event: &gdk::EventKey) -> bool {
+    event.state().contains(gdk::ModifierType::CONTROL_MASK)
+        && matches!(
+            event.keyval(),
+            gdk::keys::constants::plus | gdk::keys::constants::equal | gdk::keys::constants::KP_Add
+        )
+}
+
+/// The path of the row under a button event on `view`, if any.
+fn row_at_pointer(view: &gtk::TreeView, event: &gdk::EventButton) -> Option<gtk::TreePath> {
+    let bin_window = view.bin_window()?;
+    let (mut x, mut y) = event.position();
+    if event.window().as_ref() != Some(&bin_window) {
+        let (_, origin_x, origin_y) = bin_window.origin();
+        let (root_x, root_y) = event.root();
+        x = root_x - f64::from(origin_x);
+        y = root_y - f64::from(origin_y);
+    }
+    // Only a release over the rows themselves.
+    if x < 0.0
+        || y < 0.0
+        || x >= f64::from(bin_window.width())
+        || y >= f64::from(bin_window.height())
+    {
+        return None;
+    }
+    view.path_at_pos(x as i32, y as i32)?.0
 }
 
 /// A page file's applications: those it names that are installed and ask to
@@ -461,14 +716,7 @@ impl AppListPage {
             if !desktop.should_show() {
                 continue;
             }
-            let name = desktop.name().to_string();
-            let index = texts.len() as u32;
-            let mut values: Vec<(u32, &dyn ToValue)> =
-                vec![(NAME, &name), (APP_INFO, &desktop), (INDEX, &index)];
-            if let Some(blank) = blank.as_ref() {
-                values.push((ICON, blank));
-            }
-            model.insert_with_values(None, &values);
+            insert_row(&model, &desktop, texts.len(), blank.as_ref());
             texts.push(AppText::new(&desktop, MatchFields::ALL));
         }
         let rows = Rc::new(AppRows::new(texts, &settings));
@@ -694,24 +942,29 @@ fn load_apps(
         if !desktop.should_show() {
             continue;
         }
-        let name = desktop.name().to_string();
-        let index = apps.len() as u32;
-        let mut values: Vec<(u32, &dyn ToValue)> =
-            vec![(NAME, &name), (APP_INFO, &desktop), (INDEX, &index)];
-        if let Some(blank) = blank.as_ref() {
-            values.push((ICON, blank));
-        }
-        model.insert_with_values(None, &values);
-        let all = AppText::new(&desktop, MatchFields::ALL);
-        apps.push(App {
-            launches: launch_counts.get(id.as_str()).copied().unwrap_or_default(),
-            lowercase_name: name.to_lowercase(),
-            text: all.clone(),
-            all,
-            id: id.into(),
-        });
+        insert_row(model, &desktop, apps.len(), blank.as_ref());
+        let launches = launch_counts.get(id.as_str()).copied().unwrap_or_default();
+        apps.push(App::new(id.into(), &desktop, launches));
     }
     apps
+}
+
+/// Adds a row for `desktop` whose INDEX is `index`, and returns it.
+/// GtkListStore iterators stay valid across re-sorting.
+fn insert_row(
+    model: &gtk::ListStore,
+    desktop: &gio::DesktopAppInfo,
+    index: usize,
+    blank: Option<&Pixbuf>,
+) -> gtk::TreeIter {
+    let name = desktop.name().to_string();
+    let index = index as u32;
+    let mut values: Vec<(u32, &dyn ToValue)> =
+        vec![(NAME, &name), (APP_INFO, desktop), (INDEX, &index)];
+    if let Some(blank) = blank {
+        values.push((ICON, blank));
+    }
+    model.insert_with_values(None, &values)
 }
 
 fn install_sort(model: &gtk::ListStore, apps: &Rc<AppList>) {
@@ -843,7 +1096,7 @@ impl AppText {
             name: fold_text(&desktop.name()),
             generic_name: fold(desktop.generic_name().filter(|_| fields.generic_name)),
             keywords: if fields.keywords {
-                fold_text(&desktop.keywords().join(" "))
+                fold_text(&keywords(desktop).join(" "))
             } else {
                 String::new()
             },
@@ -898,6 +1151,30 @@ impl AppText {
     }
 }
 
+/// The entry's keywords for the current locale. GLib's localized list reader
+/// cannot read a keyword holding an escaped `;` (`\;`), and the entry then
+/// has no keywords at all: read the untranslated list from the file instead.
+fn keywords(desktop: &gio::DesktopAppInfo) -> Vec<String> {
+    let keywords = desktop.keywords();
+    if !keywords.is_empty() || !desktop.has_key("Keywords") {
+        return keywords.iter().map(ToString::to_string).collect();
+    }
+    let Some(path) = desktop.filename() else {
+        return Vec::new();
+    };
+    let keyfile = glib::KeyFile::new();
+    if keyfile
+        .load_from_file(path, glib::KeyFileFlags::NONE)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    keyfile
+        .string_list("Desktop Entry", "Keywords")
+        .map(|keywords| keywords.iter().map(ToString::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// Whether `word` begins a word of `text`, a longest run of letters and
 /// digits.
 fn begins_word(text: &str, word: &str) -> bool {
@@ -935,6 +1212,21 @@ struct App {
     all: AppText,
     // The fields `match-fields` lets the filter search.
     text: AppText,
+}
+
+impl App {
+    /// The app of `desktop`, whose desktop id is `id`, launched `launches`
+    /// times. Every field is searched until the list applies `match-fields`.
+    fn new(id: String, desktop: &gio::DesktopAppInfo, launches: usize) -> Self {
+        let all = AppText::new(desktop, MatchFields::ALL);
+        Self {
+            id,
+            launches,
+            lowercase_name: desktop.name().to_lowercase(),
+            text: all.clone(),
+            all,
+        }
+    }
 }
 
 /// The settings that decide which apps are listed and how they match.
@@ -988,6 +1280,25 @@ impl AppList {
 
     fn id(&self, index: usize) -> String {
         self.apps.borrow()[index].id.clone()
+    }
+
+    /// Adds an app after the others, matched, hidden and grouped as they
+    /// are, and returns its index.
+    fn push(&self, mut app: App) -> usize {
+        let settings = self.settings.borrow();
+        app.text = app.all.only(settings.fields);
+        self.hidden
+            .borrow_mut()
+            .push(is_hidden(&app.id, &settings.hidden));
+        if let (Some(words), Some(tiers)) = (
+            self.words.borrow().as_ref(),
+            self.tiers.borrow_mut().as_mut(),
+        ) {
+            tiers.push(app.text.tier(words, settings.subsequence));
+        }
+        let mut apps = self.apps.borrow_mut();
+        apps.push(app);
+        apps.len() - 1
     }
 
     /// The index of the app with the desktop id `id`.
@@ -1471,6 +1782,54 @@ mod tests {
             ..settings(true, &[])
         }));
         assert_eq!(rows(&list), ["beta.desktop"]);
+    }
+
+    #[test]
+    fn added_apps_are_matched_hidden_and_grouped_like_the_others() {
+        let list = AppList::new(
+            vec![app("alpha.desktop", 2, named("Probe Alpha"))],
+            AppSettings {
+                fields: MatchFields::from_names(["keywords"]),
+                ..settings(false, &["probe-h*"])
+            },
+        );
+        list.rank("probe");
+        let beta = app(
+            "beta.desktop",
+            0,
+            text("Probe Beta", "", "needle", "remark"),
+        );
+        assert_eq!(list.push(beta), 1);
+        assert_eq!(
+            list.push(app("probe-hidden.desktop", 0, named("Probe Hidden"))),
+            2
+        );
+        assert_eq!(rows(&list), ["alpha.desktop", "beta.desktop"]);
+        list.rank("needle");
+        assert_eq!(rows(&list), ["beta.desktop"]);
+        // The comment is not searched.
+        list.rank("remark");
+        assert!(rows(&list).is_empty());
+        list.rank("");
+        assert_eq!(rows(&list), ["alpha.desktop", "beta.desktop"]);
+    }
+
+    #[test]
+    fn keywords_holding_semicolons_are_searched() {
+        let directory = std::env::temp_dir().join(format!("ilia-keywords-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("keywords.desktop");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Fixture\nExec=/usr/bin/true\n\
+             Keywords=Alpha\\;beta;gamma;\n",
+        )
+        .unwrap();
+        let desktop = gio::DesktopAppInfo::from_filename(&path).unwrap();
+        // The keywords GLib cannot read are read from the file.
+        let keywords = AppText::new(&desktop, ALL_FIELDS).keywords;
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(keywords, "alpha;beta gamma");
     }
 
     #[test]

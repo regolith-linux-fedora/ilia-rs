@@ -326,6 +326,10 @@ pub fn build(
                 return glib::Propagation::Stop;
             }
         }
+        // A form shown by the page takes every key, Escape included.
+        if pages_for_key[active_for_key.get()].capture_key_event(event) {
+            return glib::Propagation::Stop;
+        }
         if state.contains(gdk::ModifierType::MOD1_MASK) {
             if let Some(index) = alt_switch_target(&shortcuts, keyval) {
                 notebook_for_key.set_current_page(Some(index as u32));

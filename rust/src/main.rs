@@ -1,3 +1,4 @@
+mod add_app_form;
 mod application;
 mod apps;
 mod args;
@@ -7,6 +8,7 @@ mod icons;
 mod input_sources;
 mod ipc;
 mod keybindings;
+mod new_entry;
 mod notifications;
 mod page_files;
 mod pages;
