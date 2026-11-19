@@ -3,8 +3,9 @@
 A Rust port of [ilia](https://github.com/regolith-linux/ilia), the launcher
 of the [Regolith](https://regolith-desktop.com/) desktop: a small GTK 3
 window that filters applications, commands, keybindings, notifications,
-windows, files and piped-in text lists, and acts on the selected row. It
-runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
+windows, files, piped-in text lists and Regolith's optional packages, and
+acts on the selected row. It runs under i3 (X11) and sway (Wayland, as a
+layer-shell surface).
 
 ## Status
 
@@ -42,7 +43,8 @@ Everything the Vala program does, page by page: Applications (desktop
 entries, history-ranked sorting, `systemd-run` launch wrapper), Commands
 (PATH scan), Notifications (rofication socket client), TextList (stdin
 rows), Files (Tracker/tinysparql full-text search), Keybindings and Windows
-(i3/sway IPC), and the dialog shell (stylesheets, Alt+letter page
+(i3/sway IPC), Features (Regolith's optional packages through PackageKit,
+from #186), and the dialog shell (stylesheets, Alt+letter page
 switching, Alt+plus/Alt+minus resizing with persistence, the Help tab,
 Ctrl entry-editing keys, focus-loss quitting, the X11 seat grab, native
 Wayland layer-shell start-up). The command line, GSettings schema
@@ -83,6 +85,8 @@ Then #158–#161 (running a binding from the keybindings page) in one commit.
 
 Then the open upstream pull request #174 (pages defined in key files, and
 no window-manager pages under other window managers) in one commit.
+
+Then #186 (the Features page) in one commit.
 
 ## Differences from upstream
 
@@ -133,6 +137,18 @@ or the lines a command prints, with `Exec`, `Sort=frequency`,
 `OnlyShowIn`/`NotShowIn` and an Alt key), and the Keybindings and Windows
 pages left out under window managers other than i3 and sway, where `-p`
 for either exits with an error instead of opening an empty page.
+
+**Ported from later pull requests:** #186 the Features page (`-p features`,
+Alt+e, the last built-in tab in `-a`, after Files): the session's optional
+Regolith packages listed from PackageKit (looks, i3xrocks bar blocks,
+compositors and window manager parts; i3-only and sway-only prefixes by
+session; parts of a feature and transitional packages left out), installed
+and removed with a simulated run first, a question before any removal,
+progress on the row, `Failed: …` with PackageKit's message, cancel with
+Escape, and the keyboard handed to the authorisation window during a change
+(on X11 while PackageKit waits for authorisation, on sway for the whole
+change) and taken back afterwards. PackageKit is contacted only once the
+page is shown.
 
 **Partly ported:**
 
@@ -256,6 +272,7 @@ Ilia provides pages to view and select from the following types of things:
 - Text List (`textlist`)
 - File Search (`tracker`)
 - Open Windows (`windows`)
+- Optional Regolith Features (`features`)
 - Pages defined in files: favourite apps, fixed lines, or the lines a command prints (see [Pages from files](#pages-from-files))
 
 ### Usage
@@ -362,6 +379,10 @@ gsettings reset org.regolith-linux.ilia window-width
 #### Notifications
 
 This page communicates with the [Rofication](https://github.com/regolith-linux/regolith-rofication) daemon for managing desktop notifications.
+
+#### Features
+
+This page lists Regolith's optional packages for the running session (looks, i3xrocks bar blocks, compositors and window manager extensions), marks the installed ones, and installs or removes the selected one through [PackageKit](https://www.freedesktop.org/software/PackageKit/) on the system bus. PackageKit first reports what the change would do: when other packages would be removed, the page asks for confirmation. When PackageKit asks for authorisation, ilia lets the authorisation window have the keyboard and stays open until the change ends. Escape cancels a running change where PackageKit allows it. Filtering on this page matches the typed text within package names and summaries, ignoring case. Without PackageKit the page says that package management is not available.
 
 #### Keybindings
 

@@ -9,13 +9,15 @@ loads it the first time it searches, so every other page works without it.
 `sparql.rs`, which wraps its C calls in a safe API, holds nearly all the
 `unsafe`; the rest is three libc calls in `textlist.rs` that end a page
 file's command with its whole process group and reap it.
+PackageKit is reached over D-Bus through gio; `libpackagekit-glib2` is
+not linked.
 
-This is the complete port. All seven pages are real: Applications,
-Keybindings and Windows, and the Commands (terminal),
-Notifications, TextList, and Files (Tracker) pages. The dialog shell is
-complete as well: stylesheet modes, Alt+letter page switching, Alt+plus /
-Alt+minus resizing with `window-width`/`window-height` persistence, the Help
-tab and its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
+This is the complete port. All eight pages are real: Applications,
+Keybindings and Windows, the Commands (terminal), Notifications, TextList,
+and Files (Tracker) pages, and Features (#186). The dialog shell is complete
+as well: stylesheet modes, Alt+letter page switching, Alt+plus / Alt+minus
+resizing with `window-width`/`window-height` persistence, the Help tab and
+its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
 click-outside quitting, and the seat-grab retry with its failure messages.
 
 Module map:
@@ -44,6 +46,11 @@ Module map:
   Their pages live in `apps.rs` (`Apps` rows, launched like the
   Applications page) and `textlist.rs` (`Items` and `ItemsCommand` rows,
   the command read on a background thread in its own process group).
+- `packagekit.rs`, `features.rs`: a PackageKit 1.x D-Bus client (one
+  transaction per listing, trial run or change, reported as events) and the
+  Features page: the session's catalogue by package-name prefix, questions
+  before removals, progress on the row, and the keyboard lent to the
+  authorisation window through the dialog's `hold_inputs` hook.
 - `dialog.rs`, `application.rs`: the shell, which also picks the pages the
   current window manager (i3, sway or other) can show.
 

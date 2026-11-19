@@ -8,6 +8,7 @@ use gtk::prelude::*;
 
 use crate::apps::{AppListPage, ApplicationsPage};
 use crate::args::Args;
+use crate::features::FeaturesPage;
 use crate::filter::{match_fields, query_words, Match};
 use crate::keybindings::KeybindingsPage;
 use crate::notifications::RoficationPage;
@@ -44,6 +45,22 @@ pub trait DialogPage {
     /// The letter that selects the page with Alt.
     fn get_keybinding(&self) -> Option<char>;
     fn show(&self) {}
+    /// Whether the page's help lists the keys every page shares after its
+    /// own.
+    fn lists_common_keys(&self) -> bool {
+        true
+    }
+    /// Escape: true when the page took it and the launcher stays open,
+    /// false to exit.
+    fn cancel(&self) -> bool {
+        false
+    }
+    /// Whether the launcher must stay open when it loses the focus, as
+    /// while a change the page runs may ask for authorisation in a window
+    /// of its own.
+    fn keeps_open(&self) -> bool {
+        false
+    }
 }
 
 impl DialogPage for Page {
@@ -84,6 +101,7 @@ pub const PAGES: &[Page] = &[
     Page { id: "textlist", name: "TextList", icon: "utilities-terminal", key: 't', help: "This dialog presents a filterable list of items to select from. If no item matches, enter returns the typed text.", bindings: &[("enter", "Select Item")] },
     Page { id: "windows", name: "<u>W</u>indows", icon: "window-new", key: 'w', help: "This dialog allows for navigating between open windows in the desktop environment.  Selecting a window from the list will cause it to be viewed on screen and focused.", bindings: &[("enter", "Navigate to Window")] },
     Page { id: "tracker", name: "<u>F</u>iles", icon: "emblem-documents", key: 'f', help: "This dialog allows for searching for files based on content. Type in a text query, hit enter and select from the list of files which contain the search string to open it.", bindings: &[("enter", "Open File")] },
+    Page { id: "features", name: "F<u>e</u>atures", icon: "system-software-install", key: 'e', help: "This dialog lists the optional Regolith features for the running session: looks, bar blocks, compositors and window manager extensions. Installed features are marked. The user may filter the list in the top text box. Enter installs the selected feature, or removes it if it is installed, asking first when other packages would be removed. Escape cancels a question or a running change.", bindings: &[("enter", "Install or Remove Package"), ("escape", "Cancel")] },
 ];
 
 /// The pages that need i3 or sway, which are not offered under any other
@@ -278,15 +296,23 @@ pub fn find(name: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.id.eq_ignore_ascii_case(name))
 }
 
+/// What the dialog lends its pages: closing the launcher, and letting go of
+/// (`false`) or taking back (`true`) the keyboard and pointer it holds.
+pub struct DialogHooks {
+    pub quit: Rc<dyn Fn()>,
+    pub hold_inputs: Rc<dyn Fn(bool)>,
+}
+
 pub fn create(
     page: &'static Page,
     args: &Args,
     settings: &gio::Settings,
     entry: &gtk::Entry,
-    quit: Rc<dyn Fn()>,
+    hooks: &DialogHooks,
     wm_name: &str,
     is_wayland: bool,
 ) -> Rc<dyn DialogPage> {
+    let quit = hooks.quit.clone();
     match page.id {
         "apps" => Rc::new(ApplicationsPage::new(settings.clone(), entry.clone(), quit)),
         "terminal" => Rc::new(CommandPage::new(entry.clone(), args.has("-q"), quit)),
@@ -305,6 +331,12 @@ pub fn create(
             wm_name.to_owned(),
             is_wayland,
             quit,
+        )),
+        "features" => Rc::new(FeaturesPage::new(
+            entry.clone(),
+            wm_name,
+            is_wayland,
+            hooks.hold_inputs.clone(),
         )),
         _ => Rc::new(*page),
     }

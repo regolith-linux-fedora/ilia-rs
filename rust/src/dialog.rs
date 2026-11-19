@@ -6,11 +6,14 @@ use std::rc::Rc;
 
 use glib::translate::IntoGlib;
 use glib::Unichar;
+use gtk_layer_shell::LayerShell;
 
 use crate::args::Args;
 use crate::input_sources::InputSourceSwitcher;
 use crate::page_files::{self, PageFile};
-use crate::pages::{create, create_from_file, find, is_enter_key, DialogPage, Page, PAGES};
+use crate::pages::{
+    create, create_from_file, find, is_enter_key, DialogHooks, DialogPage, Page, PAGES,
+};
 
 const MIN_WINDOW_WIDTH: i32 = 160;
 const MIN_WINDOW_HEIGHT: i32 = 100;
@@ -22,6 +25,7 @@ const ALL_PAGE_IDS: &[&str] = &[
     "keybindings",
     "windows",
     "tracker",
+    "features",
 ];
 
 pub type SharedSeat = Rc<RefCell<Option<gdk::Seat>>>;
@@ -178,21 +182,32 @@ pub fn build(
     let seat_for_pages = seat.clone();
     let page_quit: Rc<dyn Fn()> =
         Rc::new(move || quit(&window_for_pages, &app_for_pages, &seat_for_pages));
+    // Set while the launcher takes the keyboard back on Wayland, until the
+    // window has the focus again: the compositor moves the focus away and
+    // back meanwhile.
+    let reclaiming_keyboard = Rc::new(Cell::new(false));
+    let window_for_inputs = window.clone();
+    let seat_for_inputs = seat.clone();
+    let reclaiming_for_inputs = reclaiming_keyboard.clone();
+    let page_hold_inputs: Rc<dyn Fn(bool)> = Rc::new(move |hold| {
+        if is_wayland && hold {
+            reclaiming_for_inputs.set(true);
+        }
+        hold_inputs(&window_for_inputs, &seat_for_inputs, is_wayland, hold)
+    });
+    let hooks = DialogHooks {
+        quit: page_quit,
+        hold_inputs: page_hold_inputs,
+    };
     let pages: Vec<Rc<dyn DialogPage>> = page_specs
         .iter()
         .zip(&letters)
         .map(|(spec, key)| match spec {
-            PageSpec::Builtin(page) => create(
-                page,
-                args,
-                &settings,
-                &entry,
-                page_quit.clone(),
-                wm_name,
-                is_wayland,
-            ),
+            PageSpec::Builtin(page) => {
+                create(page, args, &settings, &entry, &hooks, wm_name, is_wayland)
+            }
             PageSpec::File(file) => {
-                create_from_file(file, *key, &settings, &entry, page_quit.clone())
+                create_from_file(file, *key, &settings, &entry, hooks.quit.clone())
             }
         })
         .collect();
@@ -363,6 +378,10 @@ pub fn build(
             super_release_for_key.set(!is_wayland);
             return glib::Propagation::Stop;
         }
+        if key == gdk::keys::constants::Escape && pages_for_key[active_for_key.get()].cancel() {
+            // The page dismissed a question or cancels a change of its own.
+            return glib::Propagation::Stop;
+        }
         if matches!(
             key,
             gdk::keys::constants::Escape
@@ -431,12 +450,24 @@ pub fn build(
     let app_for_focus = app.clone();
     let window_for_focus = window.clone();
     let seat_for_focus = seat.clone();
+    let pages_for_focus = pages.clone();
+    let reclaiming_for_focus_in = reclaiming_keyboard.clone();
+    window.connect_focus_in_event(move |_, _| {
+        reclaiming_for_focus_in.set(false);
+        glib::Propagation::Proceed
+    });
     window.connect_focus_out_event(move |window, _| {
         // Removing the seat's last keyboard (one wtype run, a virtual or
         // Bluetooth keyboard going away) also takes the keyboard focus on
         // Wayland, though it went nowhere; the next keyboard to appear
         // focuses ilia again.
         if is_wayland && !seat_has_keyboard(window) {
+            return glib::Propagation::Proceed;
+        }
+        // A page waiting for an answer or a change stays: the change may
+        // ask for authorisation in a window of its own. Nor does the focus
+        // leave for good while the launcher takes the keyboard back.
+        if reclaiming_keyboard.get() || pages_for_focus.iter().any(|page| page.keeps_open()) {
             return glib::Propagation::Proceed;
         }
         quit(&window_for_focus, &app_for_focus, &seat_for_focus);
@@ -493,6 +524,30 @@ pub fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
     window.hide();
     window.close();
     app.quit();
+}
+
+/// Gives up (`hold` false) or takes back the keyboard the launcher holds,
+/// so that a window of another program can take key presses meanwhile. On
+/// X11 that is the keyboard and pointer grab; on Wayland the exclusive
+/// keyboard focus of the layer surface.
+pub fn hold_inputs(window: &gtk::Window, seat: &SharedSeat, is_wayland: bool, hold: bool) {
+    if is_wayland {
+        if window.is_layer_window() {
+            window.set_keyboard_mode(if hold {
+                gtk_layer_shell::KeyboardMode::Exclusive
+            } else {
+                gtk_layer_shell::KeyboardMode::OnDemand
+            });
+        }
+    } else if !hold {
+        if let Some(seat) = seat.borrow_mut().take() {
+            seat.ungrab();
+        }
+    } else if seat.borrow().is_none() && window.is_visible() {
+        if let Some(grabbed) = grab_inputs(window) {
+            *seat.borrow_mut() = Some(grabbed);
+        }
+    }
 }
 
 pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
@@ -714,15 +769,20 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
         let row = model.append();
         model.set(&row, &[(0, &key), (1, &action)]);
     }
-    for (key, action) in [
-        ("Alt -", "Decrease Dialog Size"),
-        ("Alt +", "Increase Dialog Size"),
-        ("↑ ↓", "Change Selected Item"),
-        ("Home End", "Select First or Last Item"),
-        ("Ctrl+p Ctrl+n", "Change Selected Item (emacs style)"),
-        ("Ctrl+k Ctrl+j", "Change Selected Item (vim style)"),
-        ("Esc", "Exit"),
-    ] {
+    let common_keys: &[(&str, &str)] = if page.lists_common_keys() {
+        &[
+            ("Alt -", "Decrease Dialog Size"),
+            ("Alt +", "Increase Dialog Size"),
+            ("↑ ↓", "Change Selected Item"),
+            ("Home End", "Select First or Last Item"),
+            ("Ctrl+p Ctrl+n", "Change Selected Item (emacs style)"),
+            ("Ctrl+k Ctrl+j", "Change Selected Item (vim style)"),
+            ("Esc", "Exit"),
+        ]
+    } else {
+        &[]
+    };
+    for (key, action) in common_keys {
         let row = model.append();
         model.set(&row, &[(0, &key), (1, &action)]);
     }
