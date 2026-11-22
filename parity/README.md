@@ -35,8 +35,13 @@ The Keybindings tests require the chosen binding as exactly one RUN_COMMAND
 request on the window manager's socket, carrying the command as the window
 manager holds it (upstream #158–#161), and nothing on standard output. The
 fake answers sway's GET_VERSION request with numbers, as sway does, so the
-main file's relative includes are read beside it. For the Windows page this
-harness chooses the deterministic absent-binary behavior for the absolute
+main file's relative includes are read beside it. A row's key text is the
+key it is bound to once a resource retuned it, and its comment's text while
+it is bound as with no resource set (upstream #170); the cases see it
+through the filter, which matches that text. A comment before a `mode`
+block and a row bound only with `bindcode` run their bindings too.
+
+For the Windows page this harness chooses the deterministic absent-binary behavior for the absolute
 `/usr/bin/i3-msg` and `/usr/bin/swaymsg` paths rather than modifying system
 files. The Windows tests require either the exact expected IPC command
 transcript (if one of those clients exists) or the corresponding GLib

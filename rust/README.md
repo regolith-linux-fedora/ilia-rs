@@ -10,7 +10,9 @@ loads it the first time it searches, so every other page works without it.
 `unsafe`; the rest is three libc calls in `textlist.rs` that end a page
 file's command with its whole process group and reap it, one
 `faccessat(2)` in `program_path.rs` that checks a program is executable,
-and one GTK call in `clipboard_keeper.rs` that gtk-rs has no binding for.
+one GTK call in `clipboard_keeper.rs` that gtk-rs has no binding for, and
+the libxkbcommon calls in `xkb.rs` that build sway's keymap for the
+Keybindings page (libxkbcommon is linked; GTK already depends on it).
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -43,7 +45,11 @@ Module map:
   command over IPC (`ipc.rs`) as the window manager holds it. i3 reports its
   configuration with the variables applied; sway's is read in `ipc.rs` as
   sway reads it (includes in place, variables and resource-service values
-  where they are used).
+  where they are used). A row shows its comment's key text while its
+  bindings are what they are with no resource set, and its bound keys
+  otherwise.
+- `xkb.rs`: the key a key code gives in a layout, from libxkbcommon, for
+  sway's configured keymap.
 - `page_files.rs`: pages defined in key files (`ilia/pages/*.page` under
   the XDG configuration directories): discovery, precedence and parsing.
   Their pages live in `apps.rs` (`Apps` rows, launched like the

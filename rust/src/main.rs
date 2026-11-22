@@ -22,6 +22,7 @@ mod terminal;
 mod textlist;
 mod tracker;
 mod windows;
+mod xkb;
 
 use std::ffi::OsString;
 

@@ -12,6 +12,9 @@ find_program ('glib-compile-schemas')
 # Files page loads it at run time.
 dependency('gtk+-3.0')
 dependency('gtk-layer-shell-0')
+# The Keybindings page links libxkbcommon directly: it builds sway's keymap
+# to show the keys of key codes.
+dependency('xkbcommon')
 
 meson.add_install_script(join_paths(meson.current_source_dir(),'meson_scripts','install_data.sh'),join_paths(get_option('prefix'),get_option('datadir'),'ilia'),join_paths(meson.current_source_dir(),'data/local','','*'))
 

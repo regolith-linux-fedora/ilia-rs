@@ -20,9 +20,9 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
   Most of the smaller ones are in this port (fixed here independently, or
-  ported), but some large ones still need porting: the keys the window
-  manager binds (#170), window-manager and desktop keys while ilia is open
-  (#171), and faster apps start-up (#162). See
+  ported), but some large ones still need porting: window-manager and
+  desktop keys while ilia is open (#171), and faster apps start-up (#162).
+  See
   [Differences from upstream](#differences-from-upstream). That list was
   made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
   running both builds side by side under i3 and sway.
@@ -92,6 +92,9 @@ highlighted application, and Ctrl+Shift+C to copy it) in one commit.
 Then #168 (launching desktop entries per the Desktop Entry spec) in one
 commit.
 
+Then #170 (the keybindings page shows the keys the window manager binds)
+in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -140,7 +143,12 @@ entry's `Path` as the working directory, `Terminal=true` inside
 x-terminal-emulator, all inside the `run_ilia_<id>_<8 hex>.scope` scope
 when systemd-run is on `PATH`, `DBusActivatable=true` entries activated
 over the session bus (the service started first when its name has no
-owner), and a double click launching once.
+owner), and a double click launching once; #170 the keybindings page shows
+the keys each documented binding is left with after resources retune it
+(i3's own reply, sway's configuration with the resource service's values,
+key codes through the first layout), keeps the comment's key text while a
+row is bound as it is with no resource set, filters on the keys shown, and
+runs a row bound only with `bindcode` or standing before a `mode` block.
 
 **Ported ahead of upstream** (open upstream pull requests): #174 pages
 defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
@@ -167,7 +175,6 @@ closes.
 
 - #162: read the desktop files during GTK start-up and decode icons off the
   main thread (the apps page opens about 20–30 % later than ilia's).
-- #170: the keybindings page shows the keys the window manager binds.
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
   #172 (calculator page) and #173 (desktop-entry actions). #174, #181 and

@@ -433,8 +433,13 @@ fn version_from_reply(reply: Json) -> Result<VersionReply, String> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Config {
     /// i3 reports the contents of every file it read, in its reading order,
-    /// with its variables and X resources already applied.
-    I3 { files: Vec<String> },
+    /// with its variables and X resources already applied. i3 4.20 and later
+    /// also report each file as written, in `written`; it is `None` when the
+    /// reply does not carry them.
+    I3 {
+        files: Vec<String>,
+        written: Option<Vec<String>>,
+    },
     /// sway reports its main file as written and nothing more: the files it
     /// includes are read from disk. `path` names the main file, when sway
     /// does.
@@ -462,11 +467,18 @@ fn config_from_reply(reply: Json, wm_name: &str, path: Option<PathBuf>) -> Resul
         // Each file stays apart, so one without a final newline does not run
         // into the next.
         let mut files = Vec::new();
+        let mut written = Some(Vec::new());
         for included in member(object, "included_configs")?.array()? {
-            let contents = member(included.object()?, "variable_replaced_contents")?;
+            let included = included.object()?;
+            let contents = member(included, "variable_replaced_contents")?;
             files.push(contents.string()?.to_owned());
+            written = written.and_then(|mut written: Vec<String>| {
+                let raw = included.get("raw_contents")?.string().ok()?;
+                written.push(raw.to_owned());
+                Some(written)
+            });
         }
-        Ok(Config::I3 { files })
+        Ok(Config::I3 { files, written })
     }
 }
 
@@ -541,30 +553,30 @@ fn include_paths(pattern: &str, directory: Option<&Path>) -> Vec<PathBuf> {
 /// (`set`, and `set_from_resource` with `resources`) replaced by the value
 /// they have where they are used, and its words joined by single spaces with
 /// quoted words kept whole. The lines that define variables or include files
-/// are consumed by the reading.
+/// stay in place as written, after they have taken effect.
+///
+/// The lines come in runs that each hold the lines of one file: a run ends
+/// where an included file starts or ends.
 ///
 /// `main` is the text of the main file and `main_path` the file, when known;
 /// relative includes in `main` are read beside it.
-pub fn walk_included_configs(
+pub fn read_config_files(
     main: &str,
     main_path: Option<&Path>,
     resources: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut walk = ConfigWalk {
-        resources,
-        variables: HashMap::new(),
-        visited: HashSet::new(),
-        lines: Vec::new(),
-    };
-    let directory = main_path.and_then(|path| {
-        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-        let directory = path.parent().map(Path::to_owned);
-        // An include that names the main file does not read it again.
-        walk.visited.insert(path);
-        directory
-    });
-    walk.read_text(main, directory.as_deref());
-    walk.lines
+) -> Vec<Vec<String>> {
+    let walk = ConfigWalk::new(resources).walk(main, main_path);
+    let mut lines = walk.lines.into_iter();
+    let mut files = Vec::new();
+    let mut start = 0;
+    for end in walk.breaks.into_iter().chain([usize::MAX]) {
+        let run: Vec<String> = lines.by_ref().take(end.saturating_sub(start)).collect();
+        if !run.is_empty() {
+            files.push(run);
+        }
+        start = end;
+    }
+    files
 }
 
 struct ConfigWalk<'a> {
@@ -574,14 +586,51 @@ struct ConfigWalk<'a> {
     /// The files read so far, by canonical path.
     visited: HashSet<PathBuf>,
     lines: Vec<String>,
+    /// Where in `lines` the text of one file starts or ends.
+    breaks: Vec<usize>,
 }
 
-impl ConfigWalk<'_> {
+impl<'a> ConfigWalk<'a> {
+    fn new(resources: &'a HashMap<String, String>) -> Self {
+        Self {
+            resources,
+            variables: HashMap::new(),
+            visited: HashSet::new(),
+            lines: Vec::new(),
+            breaks: Vec::new(),
+        }
+    }
+
+    fn walk(mut self, main: &str, main_path: Option<&Path>) -> Self {
+        let directory = main_path.and_then(|path| {
+            let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+            let directory = path.parent().map(Path::to_owned);
+            // An include that names the main file does not read it again.
+            self.visited.insert(path);
+            directory
+        });
+        self.read_text(main, directory.as_deref());
+        self
+    }
+
     /// Reads the text of one file; `directory` holds the file.
     fn read_text(&mut self, text: &str, directory: Option<&Path>) {
+        self.file_break();
         for line in text.lines() {
             self.read_line(line.trim(), directory);
         }
+        self.file_break();
+    }
+
+    fn file_break(&mut self) {
+        if self.breaks.last() != Some(&self.lines.len()) {
+            self.breaks.push(self.lines.len());
+        }
+    }
+
+    /// Keeps a line that defines a variable or includes files as written.
+    fn keep(&mut self, line: &str) {
+        self.lines.push(line.to_owned());
     }
 
     fn read_line(&mut self, line: &str, directory: Option<&Path>) {
@@ -591,6 +640,7 @@ impl ConfigWalk<'_> {
         }
         match split_words(line).as_slice() {
             ["include", pattern @ ..] if !pattern.is_empty() => {
+                self.keep(line);
                 let pattern = self.replace(&pattern.join(" "));
                 for path in include_paths(&pattern, directory) {
                     if !self.visited.insert(path.clone()) {
@@ -603,10 +653,12 @@ impl ConfigWalk<'_> {
                 }
             }
             ["set", name, value @ ..] if name.starts_with('$') && !value.is_empty() => {
+                self.keep(line);
                 let value = join_words(&self.replace(&value.join(" ")));
                 self.variables.insert(name[1..].to_owned(), value);
             }
             ["set_from_resource", name, key, default @ ..] if name.starts_with('$') => {
+                self.keep(line);
                 let resource = self
                     .resources
                     .get(&self.replace(key))
@@ -670,7 +722,7 @@ fn is_name_char(c: char) -> bool {
 /// quotes or inside a criteria block (`[...]` at the start of a word). A
 /// backslash escapes the character after it. Words keep their quotes and
 /// backslashes.
-fn split_words(line: &str) -> Vec<&str> {
+pub(crate) fn split_words(line: &str) -> Vec<&str> {
     let mut words = Vec::new();
     let mut start = None;
     let (mut single, mut double, mut criteria, mut escaped) = (false, false, false, false);
@@ -720,6 +772,115 @@ fn split_words(line: &str) -> Vec<&str> {
 /// The words of `text` joined by single spaces.
 fn join_words(text: &str) -> String {
     split_words(text).join(" ")
+}
+
+/// The files of an i3 configuration, given as written and in i3's reading
+/// order, with i3's variables applied the way i3 4.20 and later apply them
+/// when no X resource is set: every `set_from_resource` takes its default.
+///
+/// Within each file, lines continued with a trailing backslash are joined
+/// (not in comments), all of the file's `set` and `set_from_resource` lines
+/// are taken first and then the file's whole text is substituted once. Names
+/// are matched without regard to ASCII case wherever they occur, the longest
+/// name wins where several start at one `$`, a name set again takes its last
+/// value, and values are inserted as written, not substituted again. The
+/// variables a file sets stay set for the files read after it.
+pub fn replace_i3_variables(files: &[String]) -> Vec<String> {
+    let mut variables: Vec<(String, String)> = Vec::new();
+    files
+        .iter()
+        .map(|text| {
+            let text = join_i3_continuations(text);
+            for line in text.lines() {
+                if let Some((name, value)) = i3_variable(line) {
+                    match variables
+                        .iter_mut()
+                        .find(|(known, _)| known.eq_ignore_ascii_case(&name))
+                    {
+                        Some(variable) => *variable = (name, value),
+                        None => variables.push((name, value)),
+                    }
+                }
+            }
+            replace_i3_names(&text, &variables)
+        })
+        .collect()
+}
+
+/// `text` with each line that ends in a backslash joined to the next, the
+/// backslash and line break dropped, unless the line is a comment.
+fn join_i3_continuations(text: &str) -> String {
+    let mut joined = String::with_capacity(text.len());
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        joined.push_str(line);
+        let comment = joined[line_start..].trim_start().starts_with('#');
+        if !comment && joined.ends_with("\\\n") {
+            joined.truncate(joined.len() - 2);
+        } else {
+            line_start = joined.len();
+        }
+    }
+    joined
+}
+
+/// The variable a line of an i3 file defines with no X resources set, as
+/// `($name, value)`: `set $name value`, or `set_from_resource $name resource
+/// default` with its default, empty when there is none.
+fn i3_variable(line: &str) -> Option<(String, String)> {
+    let (keyword, rest) = split_i3_word(line)?;
+    let (name, value) = if keyword.eq_ignore_ascii_case("set") {
+        split_i3_word(rest)?
+    } else if keyword.eq_ignore_ascii_case("set_from_resource") {
+        let (name, rest) = split_i3_word(rest)?;
+        let default = split_i3_word(rest).map_or("", |(_resource, default)| default);
+        (name, default)
+    } else {
+        return None;
+    };
+    name.starts_with('$')
+        .then(|| (name.to_owned(), value.to_owned()))
+}
+
+/// The first blank-separated word of `text` and the text after the blanks
+/// that follow it.
+fn split_i3_word(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    Some((&text[..end], text[end..].trim_start()))
+}
+
+/// `text` with every occurrence of a variable name replaced by its value, in
+/// one pass from the start: the longest of the names that start at a `$`
+/// wins, and inserted values are not searched again.
+fn replace_i3_names(text: &str, variables: &[(String, String)]) -> String {
+    let mut by_length: Vec<&(String, String)> = variables.iter().collect();
+    by_length.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dollar) = rest.find('$') {
+        result.push_str(&rest[..dollar]);
+        rest = &rest[dollar..];
+        let found = by_length.iter().find(|(name, _)| {
+            rest.get(..name.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(name))
+        });
+        match found {
+            Some((name, value)) => {
+                result.push_str(value);
+                rest = &rest[name.len()..];
+            }
+            None => {
+                result.push('$');
+                rest = &rest[1..];
+            }
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 /// The paths that `pattern` matches, sorted. A part of the pattern with
@@ -922,9 +1083,9 @@ pub fn get_tree(wm_name: &str) -> Result<TreeReply, String> {
 mod tests {
     use super::{
         command_outcome, config_from_reply, encode_request, expand_glob, expand_path_vars,
-        include_paths, read_reply, socket_path, split_words, version_from_reply,
-        walk_included_configs, wildcard_matches, Config, JsonParser, TreeReply, IPC_MAGIC,
-        RUN_COMMAND,
+        include_paths, read_config_files, read_reply, replace_i3_variables, socket_path,
+        split_words, version_from_reply, wildcard_matches, Config, JsonParser, TreeReply,
+        IPC_MAGIC, RUN_COMMAND,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1028,9 +1189,64 @@ mod tests {
         assert_eq!(
             config_from_reply(json, "i3", None).unwrap(),
             Config::I3 {
-                files: vec!["one".to_owned(), "two\n".to_owned()]
+                files: vec!["one".to_owned(), "two\n".to_owned()],
+                written: None,
             }
         );
+        // i3 4.20 and later also send each file as written.
+        let json = JsonParser::new(
+            br#"{"included_configs":[{"raw_contents":"set $a b\n$a","variable_replaced_contents":"set b b\nb"}]}"#,
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            config_from_reply(json, "i3", None).unwrap(),
+            Config::I3 {
+                files: vec!["set b b\nb".to_owned()],
+                written: Some(vec!["set $a b\n$a".to_owned()]),
+            }
+        );
+    }
+
+    #[test]
+    fn i3_variables_apply_as_i3_applies_them() {
+        let replaced = replace_i3_variables(&[
+            concat!(
+                "bindsym $MOD+$key.long exec $term\n",
+                "set $mod Mod4\n",
+                "set $key F1\n",
+                "set $key.long F2\n",
+                "set_from_resource $term wm.term x-terminal\n",
+                "set_from_resource $none wm.none\n",
+                "set $alias $term\n",
+                "bindsym $mod+Shift+\\\n",
+                "  $key exec [$none] $alias\n",
+                "# a comment ending in \\\n",
+                "set $key F3\n",
+            )
+            .to_owned(),
+            "bindsym $mod+$key exec $later\nset $later x\n".to_owned(),
+        ]);
+        assert_eq!(
+            replaced[0],
+            concat!(
+                "bindsym Mod4+F2 exec x-terminal\n",
+                "set Mod4 Mod4\n",
+                "set F3 F1\n",
+                "set F2 F2\n",
+                "set_from_resource x-terminal wm.term x-terminal\n",
+                "set_from_resource  wm.none\n",
+                "set $term x-terminal\n",
+                "bindsym Mod4+Shift+  F3 exec [] $term\n",
+                "# a comment ending in \\\n",
+                "set F3 F3\n",
+            )
+        );
+        // Variables stay set for later files; values are not substituted
+        // again.
+        assert_eq!(replaced[1], "bindsym Mod4+F3 exec x\nset x x\n");
+        let replaced = replace_i3_variables(&["set $b $a\nset $a 1\n$b".to_owned()]);
+        assert_eq!(replaced[0], "set $a 1\nset 1 1\n$a");
     }
 
     #[test]
@@ -1195,6 +1411,25 @@ mod tests {
         directory
     }
 
+    /// The lines `read_config_files` reads, in one run and without the
+    /// lines that define variables or include files.
+    fn walk_included_configs(
+        main: &str,
+        main_path: Option<&Path>,
+        resources: &HashMap<String, String>,
+    ) -> Vec<String> {
+        read_config_files(main, main_path, resources)
+            .into_iter()
+            .flatten()
+            .filter(|line| {
+                !matches!(
+                    split_words(line).first(),
+                    Some(&("set" | "set_from_resource" | "include"))
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn words_split_at_blanks_outside_quotes_and_criteria() {
         assert_eq!(
@@ -1291,6 +1526,42 @@ mod tests {
                 &resources
             ),
             [r#"bindsym x exec from resource|"Two  Words" x|$c|kept|"""#]
+        );
+    }
+
+    #[test]
+    fn files_are_read_in_runs_with_their_directives() {
+        let directory = scratch("runs");
+        fs::write(directory.join("a"), "## A // B // c ##\nbindsym a exec a").unwrap();
+        let main = format!(
+            "set $x y\n## X // Y // z ##\ninclude {}/a\nbindsym $x exec x\n",
+            directory.display()
+        );
+        let files = read_config_files(&main, None, &HashMap::new());
+        assert_eq!(
+            files,
+            [
+                vec![
+                    "set $x y".to_owned(),
+                    "## X // Y // z ##".to_owned(),
+                    format!("include {}/a", directory.display()),
+                ],
+                vec![
+                    "## A // B // c ##".to_owned(),
+                    "bindsym a exec a".to_owned()
+                ],
+                vec!["bindsym y exec x".to_owned()],
+            ]
+        );
+        // The plain reading is the same lines without the directives.
+        assert_eq!(
+            walk_included_configs(&main, None, &HashMap::new()),
+            [
+                "## X // Y // z ##",
+                "## A // B // c ##",
+                "bindsym a exec a",
+                "bindsym y exec x"
+            ]
         );
     }
 
