@@ -19,7 +19,8 @@ hand-over of the entries read on worker threads in `apps.rs`.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
-Notifications, TextList, and Files (Tracker) pages. The dialog shell is
+Notifications, TextList, and Files (Tracker) pages. An eighth, the
+Calculator page, is ported ahead of upstream. The dialog shell is
 complete as well: stylesheet modes, Alt+letter page switching, Alt+plus /
 Alt+minus resizing with `window-width`/`window-height` persistence, the Help
 tab and its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
@@ -48,6 +49,15 @@ Module map:
 - `filter.rs`: the filter matching shared by the pages: folding, the
   every-word rule, and subsequences with their spans.
 - `icons.rs`: the reference icon-loader order shared by the new pages.
+- `calculator/`: the Calculator page. `expression.rs` reads the typed
+  expression and writes it out for libqalculate with its grouping spelled
+  out, `evaluation.rs` works it out in the `ilia-calculator` helper
+  (`src/calculator-helper.cc`, built by meson against libqalculate; one
+  process per expression, killed when the text changes or after three
+  seconds), and `answer.rs` rounds and formats the value with the decimal
+  mark of the locale's numbers, which the helper reports. Enter prints the
+  answer and copies it through `clipboard_keeper.rs`. On this page Left and
+  Right move the entry's text cursor instead of switching pages.
 - `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
   open (gnome-flashback's input-source D-Bus service on X11).
 - `keybindings.rs`: the Keybindings page, which runs the chosen binding's
@@ -71,12 +81,14 @@ Module map:
 - `program_path.rs`: the program behind a desktop entry, as the
   Applications page's strip names it (the `Exec` words, `env` wrappers,
   the search path, links, and session-bus entries).
-- `clipboard_keeper.rs`: the path copied with Ctrl+Shift+C, which stays
-  pasteable after the window closes: handed to an X11 clipboard manager,
-  or served by ilia, running on without a window, until the clipboard
-  holds something else.
+- `clipboard_keeper.rs`: the path copied with Ctrl+Shift+C and the answer
+  confirmed on the Calculator page, which stay pasteable after the window
+  closes: handed to an X11 clipboard manager, or served by ilia, running on
+  without a window, until the clipboard holds something else.
 - `dialog.rs`, `application.rs`: the shell, which also picks the pages the
-  current window manager (i3, sway or other) can show.
+  current window manager (i3, sway or other) can show. With `-a` each page
+  keeps its own entry text: switching pages puts the left page's text away
+  and brings back the new page's.
 
 ## Meson cutover
 
@@ -90,6 +102,16 @@ copies; no desktop or appdata file. The Vala unit-test target retired with the
 Vala sources (its `systemd_escape` and `compare_desktop_apps` vectors live on
 as crate unit tests); `meson test` runs a `-v` smoke test of the built binary.
 `debian/control` builds with `cargo` and `rustc` instead of `valac`.
+
+The Calculator page adds a C++ target: `ilia-calculator`, linked against
+libqalculate (`libqalculate-dev` in `debian/control`) and installed into
+`libexecdir`. It is built as `build/src/ilia-calculator`, beside the launcher,
+which looks for it there first; meson passes the installed path to the crate
+as `ILIA_CALCULATOR_HELPER` (a plain `cargo build` falls back to
+`/usr/libexec/ilia-calculator`). `meson test` also runs
+`test/calculator-helper.sh`, which checks the built helper's replies to the
+expressions the page writes, among them parts with no value that the rest
+of the expression would cancel (`0*(1.5!)`, `(-3)!^0`).
 
 ## Probes
 

@@ -57,6 +57,18 @@ files. The Windows tests require either the exact expected IPC command
 transcript (if one of those clients exists) or the corresponding GLib
 child-process error that names the absent absolute binary; unrelated stderr
 cannot satisfy them.
+`test_calculator.py` covers the Calculator page, ported ahead of upstream
+#172, so no Vala build answers it: Enter prints the answer (also when
+pressed before it arrives) and the launcher, with no clipboard manager on
+the display, serves it on the clipboard until another program copies;
+Enter on text with no answer, among them parts with no value that the rest
+of the expression would cancel (`0*(1.5!)`, `(-3)!^0`), prints nothing,
+copies nothing and keeps the window; the decimal mark follows `LC_ALL`,
+then `LC_NUMERIC`, never `LC_MESSAGES` (when `de_DE.UTF-8` is installed).
+The cases need `ilia-calculator` beside the binary, as meson builds it in
+`build/src`, or installed, and `/usr/bin/xclip`; they are skipped
+otherwise.
+
 Tracker uses the no-miner judgment call and checks nonempty, distribution-
 dependent D-Bus stderr while proving that the UI remains responsive.
 

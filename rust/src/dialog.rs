@@ -24,6 +24,7 @@ const ALL_PAGE_IDS: &[&str] = &[
     "keybindings",
     "windows",
     "tracker",
+    "calculator",
 ];
 
 pub type SharedSeat = Rc<RefCell<Option<gdk::Seat>>>;
@@ -255,9 +256,12 @@ pub fn build(
 
     let pages_for_change = pages.clone();
     let active_for_change = active_page.clone();
-    entry.connect_changed(move |_| {
+    let entry_changed = Rc::new(entry.connect_changed(move |_| {
         pages_for_change[active_for_change.get()].on_entry_changed();
-    });
+    }));
+    // Each page keeps its own text: the entry shows the text of the page in
+    // view, and the other pages' texts wait here.
+    let page_texts = Rc::new(RefCell::new(vec![String::new(); pages.len()]));
     let pages_for_activate = pages.clone();
     let active_for_activate = active_page.clone();
     entry.connect_activate(move |_| {
@@ -278,15 +282,30 @@ pub fn build(
         let pages_for_switch = pages_for_switch.clone();
         let entry_for_switch = entry_for_switch.clone();
         let active_for_switch = active_for_switch.clone();
+        let entry_changed = entry_changed.clone();
+        let page_texts = page_texts.clone();
         notebook_for_switch.connect_switch_page(move |_, _, index| {
             let index = index as usize;
+            let previous = active_for_switch.get();
             if index == pages_for_switch.len() {
                 // The Help page: the filter has nothing to act on.
                 entry_for_switch.set_sensitive(false);
+                pages_for_switch[previous].hide();
             } else if let Some(page) = pages_for_switch.get(index) {
-                active_for_switch.set(index);
+                if index != previous {
+                    pages_for_switch[previous].hide();
+                    // Put the left page's text away and bring back the new
+                    // page's, which is not a change to either page's text.
+                    let mut texts = page_texts.borrow_mut();
+                    texts[previous] = entry_for_switch.text().into();
+                    entry_for_switch.block_signal(&entry_changed);
+                    entry_for_switch.set_text(&texts[index]);
+                    entry_for_switch.unblock_signal(&entry_changed);
+                    entry_for_switch.set_position(-1);
+                    active_for_switch.set(index);
+                }
                 entry_for_switch.set_sensitive(true);
-                // Filter the new page by the text already typed.
+                // Filter the new page by its text.
                 page.on_entry_changed();
             }
             pages_for_switch[active_for_switch.get()].show();
@@ -390,7 +409,8 @@ pub fn build(
         if matches!(
             key,
             gdk::keys::constants::Left | gdk::keys::constants::Right
-        ) {
+        ) && !pages_for_key[active_for_key.get()].edits_with_arrow_keys()
+        {
             notebook_for_key.grab_focus();
             return glib::Propagation::Proceed;
         }
@@ -498,7 +518,8 @@ pub fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
     }
     window.hide();
     window.close();
-    // A path copied from the Applications page stays pasteable.
+    // A path copied from the Applications page, or a confirmed calculator
+    // answer, stays pasteable.
     if !clipboard_keeper::keep_after_close(app) {
         app.quit();
     }

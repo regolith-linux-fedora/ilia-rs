@@ -8,6 +8,7 @@ use gtk::prelude::*;
 
 use crate::apps::{AppListPage, ApplicationsPage};
 use crate::args::Args;
+use crate::calculator::{self, CalculatorPage};
 use crate::filter::{match_fields, query_words, Match};
 use crate::keybindings::KeybindingsPage;
 use crate::notifications::RoficationPage;
@@ -50,6 +51,14 @@ pub trait DialogPage {
     /// The letter that selects the page with Alt.
     fn get_keybinding(&self) -> Option<char>;
     fn show(&self) {}
+    /// Another page (or the Help tab) takes this page's place in the
+    /// notebook.
+    fn hide(&self) {}
+    /// Left and Right move the entry's text cursor rather than the
+    /// notebook's page.
+    fn edits_with_arrow_keys(&self) -> bool {
+        false
+    }
 }
 
 impl DialogPage for Page {
@@ -90,6 +99,7 @@ pub const PAGES: &[Page] = &[
     Page { id: "textlist", name: "TextList", icon: "utilities-terminal", key: 't', help: "This dialog presents a filterable list of items to select from. If no item matches, enter returns the typed text.", bindings: &[("enter", "Select Item")] },
     Page { id: "windows", name: "<u>W</u>indows", icon: "window-new", key: 'w', help: "This dialog allows for navigating between open windows in the desktop environment.  Selecting a window from the list will cause it to be viewed on screen and focused.", bindings: &[("enter", "Navigate to Window")] },
     Page { id: "tracker", name: "<u>F</u>iles", icon: "emblem-documents", key: 'f', help: "This dialog allows for searching for files based on content. Type in a text query, hit enter and select from the list of files which contain the search string to open it.", bindings: &[("enter", "Open File")] },
+    Page { id: "calculator", name: "Ca<u>l</u>culator", icon: "accessories-calculator", key: 'l', help: calculator::HELP, bindings: &[("enter", "Print and Copy Answer")] },
 ];
 
 /// The pages that need i3 or sway, which are not offered under any other
@@ -312,6 +322,7 @@ pub fn create(
             is_wayland,
             quit,
         )),
+        "calculator" => CalculatorPage::new(entry.clone(), quit),
         _ => Rc::new(*page),
     }
 }

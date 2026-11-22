@@ -9,6 +9,7 @@ Build-Depends: debhelper (>= 10),
                libgtk-3-dev (>= 3.22),
                libgtk-layer-shell-dev,
                libxkbcommon-dev,
+               libqalculate-dev,
                meson,
                pkg-config
 Standards-Version: 4.1.2

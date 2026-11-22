@@ -99,6 +99,9 @@ main thread) in one commit, together with a fix for a start-up deadlock it
 brings along and a reader that one stuck desktop file cannot hold up (see
 "In the port but not (known to be) upstream").
 
+Then the open upstream pull request #172 (the calculator page) in one
+commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -175,7 +178,19 @@ program of the highlighted app as its `Exec` line finds it (through
 `env`, the search path and links, or the session-bus name of a
 D-Bus-activatable entry), kept current while the page is shown, and
 Ctrl+Shift+C copies the path so that it can still be pasted after ilia
-closes.
+closes; #172 a Calculator page (`-p calculator`, the last tab with `-a`,
+Alt+l) that works out the typed expression with libqalculate in a helper
+process as it is typed, shows `Too long` after three seconds, prints and
+copies the answer with Enter, and keeps it pasteable after the window
+closes (see [Calculator](#calculator)). The port differs from the Vala pull
+request in a few places: the expression goes to the helper on standard
+input rather than as an argument, the helper is installed as
+`libexecdir/ilia-calculator` and always built (no `calculator` meson
+option), nesting is refused beyond 1000 levels (Vala: 100), the helper has
+no 10 s alarm of its own (ilia kills it after three seconds, and it dies
+with ilia), a part with no value (`0*(1.5!)`, `(-3)!^0`) leaves the whole
+expression without one, and with `-a` each page keeps its own entry text
+(see below).
 
 **Partly ported:**
 
@@ -184,9 +199,9 @@ closes.
 **Not yet ported** (open items):
 
 - #171: window-manager and desktop keys work while ilia is open.
-- Open upstream PRs that will likely land: #164 (notification actions),
-  #172 (calculator page) and #173 (desktop-entry actions). #174, #181 and
-  #184 are already in the port (see above).
+- Open upstream PRs that will likely land: #164 (notification actions)
+  and #173 (desktop-entry actions). #172, #174, #181 and #184 are already
+  in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help tab's
@@ -218,7 +233,11 @@ read outside GLib on reader threads that a stuck read does not hold up
 a file still unreadable ten seconds after start and that entry joins it
 once read; with `-a`, the Windows page shows the generic icon until the
 list arrives instead of waiting in GLib's search, then each window's entry
-icon, found as GLib's search ranks entries.
+icon, found as GLib's search ranks entries. With #172: with `-a` each page
+keeps its own entry text, so switching pages brings back the text last
+typed on the new page (empty at first) instead of filtering it by the
+text typed on the old one, as #145 does upstream; the Calculator page keeps
+its expression, and its answer, while another page is shown.
 
 ## Build
 
@@ -263,7 +282,9 @@ ILIA_BINARY=$PWD/rust/target/release/ilia rust/smoke-cutover.sh
 ```
 
 The parity suite and the probes need Xvfb, xdotool, python3-pytest,
-python3-gi with the AT-SPI typelib, and `dbus-daemon`. The Windows parity
+python3-gi with the AT-SPI typelib, and `dbus-daemon`; the Calculator
+cases also need xclip and the helper meson builds beside the binary
+(`build/src/ilia-calculator`). The Windows parity
 cases expect `/usr/bin/i3-msg` and `/usr/bin/swaymsg` to be absent (see
 `parity/README.md`). In a container that cannot create user
 namespaces, GdkPixbuf's glycin loaders print
@@ -277,7 +298,9 @@ dpkg-buildpackage -b -us -uc
 ```
 
 builds `ilia_<version>_<arch>.deb` with the same payload as the Vala package
-(the binary, the GSettings schema, and the `data/local` and `doc` copies).
+(the binary, the GSettings schema, and the `data/local` and `doc` copies),
+plus the Calculator page's helper, `ilia-calculator`, in meson's
+`libexecdir` (`/usr/lib/<triplet>` with this debhelper compat level).
 cargo needs network access during the build unless the crates were vendored
 as above (or `CARGO_HOME` already holds them and `CARGO_NET_OFFLINE=true` is
 set). `debian/control` lists only what the Rust build and binary use; the
@@ -304,6 +327,7 @@ Ilia provides pages to view and select from the following types of things:
 - Text List (`textlist`)
 - File Search (`tracker`)
 - Open Windows (`windows`)
+- Calculator (`calculator`)
 - Pages defined in files: favourite apps, fixed lines, or the lines a command prints (see [Pages from files](#pages-from-files))
 
 ### Usage
@@ -341,6 +365,18 @@ The `textlist` page supports two additional parameters for more customization:
         -l: page label
         -i: page icon
 ```
+
+#### Calculator
+
+`ilia -p calculator` works out the expression typed in the entry while it is typed, and shows the answer on the line below (style class `calculator_answer`).
+Expressions use numbers (`1.5`, `1,5`, `3e7`), `+ - * / ^`, `!` after an operand, brackets, `sqrt`, `sin`, `cos`, `tan` (radians), `ln`, `exp`, `abs`, `pi` and `e`; `^` groups to the right and `-3^2` is `-9`.
+Text outside that, units and names included, and expressions with no real, finite value (`5/0`, `sqrt(-4)`, `(-3)!`) leave the line empty.
+Answers are rounded to 15 significant digits, whole numbers up to 40 digits are shown in full, values below `0.000001` or from `1e40` are shown as `1.5e-7`, and the decimal mark is the locale's (`LC_NUMERIC`, or `LC_ALL`).
+An answer not worked out within three seconds shows `Too long`.
+Enter prints the answer on standard output, copies it to the clipboard and closes the window; pressed while the answer is still being worked out, it waits for it.
+The answer stays pasteable after ilia closes: an X11 clipboard manager takes it, and without one (always on Wayland) ilia keeps running without a window until something else is copied, so a caller that waits for `ilia -p calculator` to exit waits until then.
+On this page Left and Right move the cursor in the entry instead of switching pages.
+The answers come from `ilia-calculator`, a helper built against libqalculate and installed in `libexecdir`.
 
 #### Pages from files
 
