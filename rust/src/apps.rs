@@ -1,9 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gio::prelude::*;
 use gtk::atk::prelude::AtkObjectExt;
@@ -13,12 +13,14 @@ use gtk::prelude::*;
 
 use crate::add_app_form::AddAppForm;
 use crate::clipboard_keeper;
+use crate::entries::{self, Delivery, DesktopEntry};
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
 use crate::keybindings::navigate;
 use crate::launch::launch_desktop_app;
 use crate::page_files::{PageFile, Rows};
 use crate::pages::{
-    rebuild_keeping_selection, select_first_row, select_row_near, DialogPage, FUZZY_MATCHING,
+    is_enter_key, rebuild_keeping_selection, select_first_row, select_row_near, DialogPage,
+    FUZZY_MATCHING,
 };
 use crate::program_path;
 
@@ -36,6 +38,145 @@ const MATCH_FIELDS: &str = "match-fields";
 // How often the path strip is worked out again while the page is shown, so
 // that it follows changes to the files it names.
 const PROGRAM_PATH_RECHECK: Duration = Duration::from_millis(500);
+// Icons decoded at the same time on GTK's worker threads.
+const ICON_LOAD_PARALLELISM: usize = 4;
+/// From the start on, entries whose read is stuck no longer hold up the
+/// list: it comes without them, and they join it once they have been read.
+const LIST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A desktop entry read on a worker thread, on its way to the main thread.
+struct ReadEntry(DesktopEntry);
+
+// SAFETY: a reader thread creates the entry's objects and moves the only
+// references to them to the main thread without using them again, so no
+// object is ever used from two threads at once. GObject reference counting
+// is atomic, and a GDesktopAppInfo is not tied to the thread or main context
+// it was created in.
+unsafe impl Send for ReadEntry {}
+
+/// What the desktop-entry watchers are told.
+pub enum EntriesUpdate<'a> {
+    /// The list has arrived: every entry read so far.
+    Listed(&'a [Rc<DesktopEntry>]),
+    /// An entry read after the list arrived. `all` includes it.
+    Added {
+        entry: &'a Rc<DesktopEntry>,
+        all: &'a [Rc<DesktopEntry>],
+    },
+}
+
+type Watcher = Rc<dyn Fn(EntriesUpdate<'_>)>;
+
+/// The entries read so far, kept on the main thread, and who wants them.
+#[derive(Default)]
+struct Prefetch {
+    started: bool,
+    listed: bool,
+    entries: Vec<Rc<DesktopEntry>>,
+    watchers: Vec<Watcher>,
+}
+
+thread_local! {
+    static PREFETCH: RefCell<Prefetch> = RefCell::default();
+}
+
+/// Starts reading the desktop files on worker threads, once, so that the
+/// parse overlaps with GTK's own start-up (theme CSS, fontconfig). Call it
+/// on the main thread, early: the list deadline counts from here. GLib
+/// translates the entries' names and keywords as it reads them, so the
+/// locale must be set first.
+pub fn prefetch_apps() {
+    if PREFETCH.with(|prefetch| std::mem::replace(&mut prefetch.borrow_mut().started, true)) {
+        return;
+    }
+    let deadline = Instant::now() + LIST_DEADLINE;
+    // Create GIO's default VFS here, before the workers exist. Otherwise a
+    // worker's first GFile (a desktop entry whose Icon= is an absolute path)
+    // may create it while GTK's start-up holds GIO's module lock to choose
+    // the settings backend. The keyfile backend needs the VFS too, and the
+    // VFS needs that lock, so each thread waits for the other and the window
+    // never shows (seen on Wayland, where GDK reads its settings first).
+    let _ = gio::Vfs::default();
+    let spawned = std::thread::Builder::new()
+        .name("ilia-apps".to_owned())
+        .spawn(move || {
+            let files = entries::entry_files(&entries::application_dirs());
+            let build = |file: entries::ReadFile| Some(ReadEntry(file.into_entry()));
+            entries::read_all(files, entries::read_entry, build, deadline, |delivery| {
+                let mut delivery = Some(delivery);
+                glib::idle_add_full(glib::Priority::HIGH, move || {
+                    if let Some(delivery) = delivery.take() {
+                        deliver(delivery);
+                    }
+                    glib::ControlFlow::Break
+                });
+            });
+        });
+    if let Err(error) = spawned {
+        eprintln!("Cannot read the desktop files in the background: {error}");
+        let files = entries::entry_files(&entries::application_dirs());
+        let list = files.into_iter().filter_map(entries::load_entry);
+        deliver(Delivery::List(list.map(ReadEntry).collect()));
+    }
+}
+
+/// Whether the desktop entries are being read, or have been.
+pub fn entries_requested() -> bool {
+    PREFETCH.with(|prefetch| prefetch.borrow().started)
+}
+
+fn deliver(delivery: Delivery<ReadEntry>) {
+    // `Some(None)`: the list. `Some(Some(entry))`: an entry read after it.
+    // `None`: nothing to tell yet.
+    let news = PREFETCH.with(|prefetch| {
+        let mut prefetch = prefetch.borrow_mut();
+        match delivery {
+            Delivery::List(list) => {
+                let list = list.into_iter().map(|ReadEntry(entry)| Rc::new(entry));
+                prefetch.entries.extend(list);
+                prefetch.listed = true;
+                Some(None)
+            }
+            Delivery::Late(ReadEntry(entry)) => {
+                let entry = Rc::new(entry);
+                prefetch.entries.push(entry.clone());
+                // Before the list it simply becomes part of it.
+                prefetch.listed.then_some(Some(entry))
+            }
+        }
+    });
+    let Some(added) = news else {
+        return;
+    };
+    let (entries, watchers) = PREFETCH.with(|prefetch| {
+        let prefetch = prefetch.borrow();
+        (prefetch.entries.clone(), prefetch.watchers.clone())
+    });
+    for watcher in &watchers {
+        watcher(match &added {
+            None => EntriesUpdate::Listed(&entries),
+            Some(entry) => EntriesUpdate::Added {
+                entry,
+                all: &entries,
+            },
+        });
+    }
+}
+
+/// Calls `watcher` with the desktop entries once they have been listed, at
+/// once if they have, and again for each entry read after that.
+pub fn watch_entries(watcher: impl Fn(EntriesUpdate<'_>) + 'static) {
+    prefetch_apps();
+    let watcher: Watcher = Rc::new(watcher);
+    let listed = PREFETCH.with(|prefetch| {
+        let mut prefetch = prefetch.borrow_mut();
+        prefetch.watchers.push(watcher.clone());
+        prefetch.listed.then(|| prefetch.entries.clone())
+    });
+    if let Some(entries) = listed {
+        watcher(EntriesUpdate::Listed(&entries));
+    }
+}
 
 pub struct ApplicationsPage {
     entry: gtk::Entry,
@@ -57,7 +198,16 @@ pub struct ApplicationsPage {
     icon_size: i32,
     settings: gio::Settings,
     launch_history: Rc<RefCell<Vec<String>>>,
+    // Launches per desktop id, from the history as it was at start.
+    launch_counts: HashMap<String, usize>,
     apps: Rc<AppList>,
+    // Set once the desktop entries are in the model.
+    apps_loaded: Cell<bool>,
+    // The search text of the first Enter pressed before the list arrived:
+    // its best match is launched once the list has.
+    pending_enter: RefCell<Option<String>>,
+    // Decodes the icons of rows added after the list arrived.
+    icon_loader: RefCell<Option<Rc<IconLoader>>>,
     // The desktop ids this run's Ctrl+Delete hides appended to
     // `hidden-apps`, latest last, less those Ctrl+z has reversed.
     hides: RefCell<Vec<String>>,
@@ -85,12 +235,9 @@ impl ApplicationsPage {
             gio::DesktopAppInfo::static_type(),
             u32::static_type(),
         ]);
-        // Hidden apps get rows too, which the filter leaves out: one that
-        // stops being hidden while the launcher runs comes back as it was.
-        let apps = Rc::new(AppList::new(
-            load_apps(&model, icon_size, &launch_counts),
-            AppSettings::read(&settings),
-        ));
+        // The rows come once the desktop entries have been read (see
+        // `finish_loading`); the window is built and shown in the meantime.
+        let apps = Rc::new(AppList::new(Vec::new(), AppSettings::read(&settings)));
         let filter = gtk::TreeModelFilter::new(&model, None);
         let apps_for_filter = apps.clone();
         filter.set_visible_func(move |tree_model, iter| {
@@ -136,7 +283,11 @@ impl ApplicationsPage {
             icon_size,
             settings,
             launch_history: Rc::new(RefCell::new(launch_history)),
+            launch_counts,
             apps,
+            apps_loaded: Cell::new(false),
+            pending_enter: RefCell::default(),
+            icon_loader: RefCell::default(),
             hides: RefCell::default(),
             quit,
             launched: Cell::new(false),
@@ -146,10 +297,123 @@ impl ApplicationsPage {
         page.connect_program_path();
         page.follow_settings();
         page.set_selection();
-        if icon_size > 0 {
-            load_icons_in_background(&page.model, icon_size);
-        }
+
+        // The window is built and shown while the desktop files are still
+        // being read.
+        let weak = Rc::downgrade(&page);
+        watch_entries(move |update| {
+            let Some(page) = weak.upgrade() else {
+                return;
+            };
+            match update {
+                EntriesUpdate::Listed(entries) => page.finish_loading(entries),
+                EntriesUpdate::Added { entry, .. } => page.add_late_entry(entry),
+            }
+        });
         page
+    }
+
+    /// Lists the desktop entries read in time for the list: a row for each
+    /// app to show, hidden ones included, which the filter leaves out (one
+    /// that stops being hidden while the launcher runs comes back as it
+    /// was). The rows are the objects GLib read: creating new ones from
+    /// their ids would parse each desktop file a second time.
+    fn finish_loading(self: &Rc<Self>, entries: &[Rc<DesktopEntry>]) {
+        let blank = blank_icon(self.icon_size);
+        // An app added with the form before the list arrived is listed
+        // already.
+        let mut listed: HashSet<String> = (0..self.apps.len())
+            .map(|index| self.apps.id(index))
+            .collect();
+        for desktop in entries.iter().filter_map(|entry| entry.app.as_ref()) {
+            if let Some(id) = shown_id(desktop).filter(|id| listed.insert(id.clone())) {
+                self.add_row(id, desktop, blank.as_ref());
+            }
+        }
+        self.set_selection();
+        self.apps_loaded.set(true);
+        // That Enter acts once, on this list, for the text typed before it,
+        // whatever the search box holds now. When nothing matches that text
+        // nothing is started and the window stays open.
+        let pending = self.pending_enter.take();
+        if let Some(index) = pending.and_then(|text| self.apps.best_match(&text)) {
+            if let Some(app) = self.app_at(index) {
+                self.execute(&app);
+            }
+        }
+
+        // Icons once the list is on screen. The model must only be accessed
+        // from the GTK main thread: walking it from another thread races with
+        // the re-sort done on every keystroke.
+        if self.icon_size > 0 {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_once(move || {
+                if let Some(page) = weak.upgrade() {
+                    let loader = IconLoader::start(&page.model, &page.filter, page.icon_size);
+                    *page.icon_loader.borrow_mut() = loader;
+                }
+            });
+        }
+    }
+
+    /// Adds an entry that could only be read after the list arrived. The
+    /// sorted model puts it in its place; the highlighted row, the search
+    /// text and the filter stay as they are, and an Enter pressed before the
+    /// list arrived has already been handled.
+    fn add_late_entry(&self, entry: &DesktopEntry) {
+        let Some(desktop) = entry.app.as_ref() else {
+            return;
+        };
+        let Some(id) = shown_id(desktop).filter(|id| self.apps.index_of(id).is_none()) else {
+            return;
+        };
+        let row = self.add_row(id, desktop, blank_icon(self.icon_size).as_ref());
+        // Before the loader starts, it finds the row in the model itself.
+        if let Some(loader) = self.icon_loader.borrow().as_ref() {
+            loader.enqueue(row);
+        }
+    }
+
+    /// Adds the app `desktop`, whose desktop id is `id`, to the list and a
+    /// row for it to the model, and returns the row.
+    fn add_row(
+        &self,
+        id: String,
+        desktop: &gio::DesktopAppInfo,
+        blank: Option<&Pixbuf>,
+    ) -> gtk::TreeIter {
+        let launches = self.launch_counts.get(&id).copied().unwrap_or_default();
+        let index = self.apps.push(App::new(id, desktop, launches));
+        insert_row(&self.model, desktop, index, blank)
+    }
+
+    /// The app of the row whose INDEX is `index`.
+    fn app_at(&self, index: usize) -> Option<gio::DesktopAppInfo> {
+        let iter = self.model.iter_first()?;
+        loop {
+            if index_value(&self.model, &iter) == index {
+                return app_value(&self.model, &iter);
+            }
+            if !self.model.iter_next(&iter) {
+                return None;
+            }
+        }
+    }
+
+    /// Whether Enter has to wait for the list: it has not arrived, and no
+    /// row is highlighted. Before the list only an app added with the form
+    /// can have a row.
+    fn waits_for_list(&self) -> bool {
+        !self.apps_loaded.get() && self.view.selection().selected().is_none()
+    }
+
+    /// Enter before the list arrived: keeps the search text of the first
+    /// such Enter for when the list arrives.
+    fn defer_activation(&self) {
+        let mut pending = self.pending_enter.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(self.entry.text().to_string());
+        }
     }
 
     fn connect_activation(self: &Rc<Self>) {
@@ -563,6 +827,10 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn on_entry_activated(&self) {
+        if self.waits_for_list() {
+            self.defer_activation();
+            return;
+        }
         self.execute_selected();
     }
 
@@ -595,6 +863,10 @@ impl DialogPage for ApplicationsPage {
     }
 
     fn key_event(&self, event: &gdk::EventKey) -> bool {
+        if is_enter_key(&event.keyval()) && self.waits_for_list() {
+            self.defer_activation();
+            return true;
+        }
         if is_add_app_shortcut(event) {
             self.open_form();
             return true;
@@ -1019,33 +1291,15 @@ fn app_value(
         .ok()
 }
 
-/// Adds a row to `model` for each app to show, hidden ones included, and
-/// returns the apps by the INDEX of their rows. There is one app per desktop
-/// id: GIO takes each id from the first directory of the Desktop Entry
+/// The desktop id of an entry the Applications page lists, or `None` for
+/// one it leaves out. There is one entry per desktop id: like GIO, the
+/// readers take each id from the first directory of the Desktop Entry
 /// search order that has it, `XDG_DATA_HOME` and then `XDG_DATA_DIRS`.
-fn load_apps(
-    model: &gtk::ListStore,
-    icon_size: i32,
-    launch_counts: &HashMap<String, usize>,
-) -> Vec<App> {
-    let blank = blank_icon(icon_size);
-
-    let mut apps = Vec::new();
-    for app in gio::AppInfo::all() {
-        let Some(id) = app.id() else {
-            continue;
-        };
-        let Some(desktop) = gio::DesktopAppInfo::new(id.as_str()) else {
-            continue;
-        };
-        if !desktop.should_show() {
-            continue;
-        }
-        insert_row(model, &desktop, apps.len(), blank.as_ref());
-        let launches = launch_counts.get(id.as_str()).copied().unwrap_or_default();
-        apps.push(App::new(id.into(), &desktop, launches));
+fn shown_id(desktop: &gio::DesktopAppInfo) -> Option<String> {
+    if !desktop.should_show() {
+        return None;
     }
-    apps
+    desktop.id().map(String::from)
 }
 
 /// Adds a row for `desktop` whose INDEX is `index`, and returns it.
@@ -1381,6 +1635,10 @@ impl AppList {
         self.apps.borrow()[index].id.clone()
     }
 
+    fn len(&self) -> usize {
+        self.apps.borrow().len()
+    }
+
     /// Adds an app after the others, matched, hidden and grouped as they
     /// are, and returns its index.
     fn push(&self, mut app: App) -> usize {
@@ -1467,19 +1725,45 @@ impl AppList {
     /// name; with one, the group, launches, the folded name, and the desktop
     /// id.
     fn compare(&self, a: usize, b: usize) -> Ordering {
+        compare_apps(&self.apps.borrow(), self.tiers.borrow().as_deref(), a, b)
+    }
+
+    /// The index of the app listed first for the filter text `text`, with
+    /// the settings applied now, whatever the filter text is now; `None`
+    /// when no app is listed for it.
+    fn best_match(&self, text: &str) -> Option<usize> {
+        let words = query_words(text);
         let apps = self.apps.borrow();
-        let (app_a, app_b) = (&apps[a], &apps[b]);
-        match self.tiers.borrow().as_ref() {
-            None => app_b
-                .launches
-                .cmp(&app_a.launches)
-                .then_with(|| app_a.lowercase_name.cmp(&app_b.lowercase_name)),
-            Some(tiers) => tiers[a]
-                .cmp(&tiers[b])
-                .then(app_b.launches.cmp(&app_a.launches))
-                .then_with(|| app_a.text.name.cmp(&app_b.text.name))
-                .then_with(|| app_a.id.cmp(&app_b.id)),
-        }
+        let subsequence = self.settings.borrow().subsequence;
+        let tiers: Option<Vec<Option<AppTier>>> = (!words.is_empty()).then(|| {
+            apps.iter()
+                .map(|app| app.text.tier(&words, subsequence))
+                .collect()
+        });
+        let hidden = self.hidden.borrow();
+        (0..apps.len())
+            .filter(|&index| {
+                !hidden[index] && tiers.as_ref().is_none_or(|tiers| tiers[index].is_some())
+            })
+            .min_by(|&a, &b| compare_apps(&apps, tiers.as_deref(), a, b))
+    }
+}
+
+/// The order of the apps with the indexes `a` and `b`, for the groups
+/// `tiers` of the filter text (`None` while it is empty). See
+/// [`AppList::compare`].
+fn compare_apps(apps: &[App], tiers: Option<&[Option<AppTier>]>, a: usize, b: usize) -> Ordering {
+    let (app_a, app_b) = (&apps[a], &apps[b]);
+    match tiers {
+        None => app_b
+            .launches
+            .cmp(&app_a.launches)
+            .then_with(|| app_a.lowercase_name.cmp(&app_b.lowercase_name)),
+        Some(tiers) => tiers[a]
+            .cmp(&tiers[b])
+            .then(app_b.launches.cmp(&app_a.launches))
+            .then_with(|| app_a.text.name.cmp(&app_b.text.name))
+            .then_with(|| app_a.id.cmp(&app_b.id)),
     }
 }
 
@@ -1582,11 +1866,134 @@ fn load_icon(theme: &gtk::IconTheme, app: &gio::DesktopAppInfo, icon_size: i32) 
     None
 }
 
+/// Decodes the Applications page's icons on GTK's worker threads, a few at
+/// a time, so that neither the PNG inflate nor the SVG render runs on the
+/// main thread between keystrokes.
+struct IconLoader {
+    model: gtk::ListStore,
+    theme: gtk::IconTheme,
+    icon_size: i32,
+    queue: RefCell<VecDeque<gtk::TreeIter>>,
+    // Icons being decoded.
+    loading: Cell<usize>,
+}
+
+impl IconLoader {
+    /// Queues every row, the ones visible through the filter first and in
+    /// the order shown, so the visible rows get their icons first and rows
+    /// hidden by text typed before the list arrived still get theirs.
+    fn start(
+        model: &gtk::ListStore,
+        filter: &gtk::TreeModelFilter,
+        icon_size: i32,
+    ) -> Option<Rc<Self>> {
+        let theme = gtk::IconTheme::default()?;
+        let mut visible = Vec::new();
+        if let Some(iter) = filter.iter_first() {
+            loop {
+                let child = filter.convert_iter_to_child_iter(&iter);
+                if let Some(path) = model.path(&child) {
+                    visible.extend(path.indices().first().map(|&index| index as usize));
+                }
+                if !filter.iter_next(&iter) {
+                    break;
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        if let Some(iter) = model.iter_first() {
+            loop {
+                rows.push(iter);
+                if !model.iter_next(&iter) {
+                    break;
+                }
+            }
+        }
+        let queue = icon_queue_order(&visible, rows.len())
+            .into_iter()
+            .map(|index| rows[index])
+            .collect();
+        let loader = Rc::new(Self {
+            model: model.clone(),
+            theme,
+            icon_size,
+            queue: RefCell::new(queue),
+            loading: Cell::new(0),
+        });
+        for _ in 0..ICON_LOAD_PARALLELISM {
+            loader.load_next();
+        }
+        Some(loader)
+    }
+
+    /// Queues the icon of a row added later.
+    fn enqueue(self: &Rc<Self>, iter: gtk::TreeIter) {
+        self.queue.borrow_mut().push_back(iter);
+        if self.loading.get() < ICON_LOAD_PARALLELISM {
+            self.load_next();
+        }
+    }
+
+    /// Starts decoding the next queued icon that the theme can find.
+    fn load_next(self: &Rc<Self>) {
+        loop {
+            let Some(iter) = self.queue.borrow_mut().pop_front() else {
+                return;
+            };
+            let Some(info) = app_value(&self.model, &iter).and_then(|app| self.lookup(&app)) else {
+                continue;
+            };
+            self.loading.set(self.loading.get() + 1);
+            let loader = self.clone();
+            info.load_icon_async(None::<&gio::Cancellable>, move |result| {
+                match result {
+                    // GtkListStore iterators persist across re-sorting and
+                    // rows are never removed.
+                    Ok(pixbuf) => loader.model.set(&iter, &[(ICON, &pixbuf)]),
+                    Err(error) => glib::g_debug!("ilia", "Icon not loaded: {}", error.message()),
+                }
+                loader.loading.set(loader.loading.get() - 1);
+                loader.load_next();
+            });
+            return;
+        }
+    }
+
+    fn lookup(&self, app: &gio::DesktopAppInfo) -> Option<gtk::IconInfo> {
+        let icon = app.icon()?;
+        let flags = gtk::IconLookupFlags::FORCE_SIZE;
+        // Themed icons go by their plain name: looking up the GIcon also
+        // tries the "-symbolic" variant GLib adds to the icon's names, which
+        // the theme chain can find (grey, in Adwaita) before the colour icon.
+        if icon.is::<gio::ThemedIcon>() {
+            let name = gio::prelude::IconExt::to_string(&icon)?;
+            self.theme.lookup_icon(name.as_str(), self.icon_size, flags)
+        } else {
+            self.theme.lookup_by_gicon(&icon, self.icon_size, flags)
+        }
+    }
+}
+
+/// The order icons are loaded in: the rows shown, in the order shown, then
+/// every other row in model order. `visible` holds model row indices.
+fn icon_queue_order(visible: &[usize], row_count: usize) -> Vec<usize> {
+    let mut queued = vec![false; row_count];
+    let mut order = Vec::with_capacity(row_count);
+    for &index in visible {
+        if index < row_count && !queued[index] {
+            queued[index] = true;
+            order.push(index);
+        }
+    }
+    order.extend((0..row_count).filter(|&index| !queued[index]));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        append_last, fits_pattern, is_hidden, push_capped, remove_last, App, AppList, AppSettings,
-        AppText, AppTier, MatchFields,
+        append_last, fits_pattern, icon_queue_order, is_hidden, push_capped, remove_last, App,
+        AppList, AppSettings, AppText, AppTier, MatchFields,
     };
     use crate::filter::{fold_text, query_words};
 
@@ -2090,6 +2497,48 @@ mod tests {
             &["other.desktop".to_owned(), "vendor-*".to_owned()]
         ));
         assert!(!is_hidden("vendor-tool.desktop", &[]));
+    }
+
+    #[test]
+    fn an_early_enter_launches_what_the_list_would_show_first_for_its_text() {
+        let list = AppList::new(
+            vec![
+                app("calc.desktop", 0, named("Calculator")),
+                app("office.desktop", 3, text("LibreOffice Calc", "", "", "")),
+                app("hidden-calc.desktop", 9, named("Calc")),
+                app("term.desktop", 1, text("Terminal", "", "shell", "")),
+            ],
+            settings(false, &["hidden-calc.desktop"]),
+        );
+        let best = |text: &str| list.best_match(text).map(|index| list.id(index));
+        // The text at the press decides, not the filter text now.
+        list.rank("term");
+        assert_eq!(best("calc").as_deref(), Some("calc.desktop"));
+        // An empty or blank text: the first row of the unfiltered list.
+        assert_eq!(best("").as_deref(), Some("office.desktop"));
+        assert_eq!(best("   ").as_deref(), Some("office.desktop"));
+        // Hidden apps are never chosen; other fields count as in the list.
+        assert_eq!(best("shell").as_deref(), Some("term.desktop"));
+        assert_eq!(best("zzz"), None);
+        // Subsequences only with fuzzy matching.
+        assert_eq!(best("clcltr"), None);
+        list.apply_settings(settings(true, &["hidden-calc.desktop"]));
+        assert_eq!(best("clcltr").as_deref(), Some("calc.desktop"));
+        // Each candidate agrees with the order the list sorts by.
+        for query in ["calc", "", "shell", "c", "l"] {
+            list.rank(query);
+            assert_eq!(rows(&list).first().cloned(), best(query), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn icons_load_for_visible_rows_first_then_the_rest_in_model_order() {
+        assert_eq!(icon_queue_order(&[3, 1], 5), vec![3, 1, 0, 2, 4]);
+        assert_eq!(icon_queue_order(&[], 3), vec![0, 1, 2]);
+        assert_eq!(icon_queue_order(&[2, 0, 1], 3), vec![2, 0, 1]);
+        // Out-of-range and repeated indices are ignored.
+        assert_eq!(icon_queue_order(&[1, 1, 7], 2), vec![1, 0]);
+        assert!(icon_queue_order(&[], 0).is_empty());
     }
 
     #[test]

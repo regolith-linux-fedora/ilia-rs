@@ -39,18 +39,7 @@ pub fn launch_desktop_app(
 
 /// Runs the entry's Exec line directly, never through a shell.
 fn spawn_desktop_app(desktop: &gio::DesktopAppInfo) -> Result<(), String> {
-    let exec = desktop.string("Exec").unwrap_or_default();
-    let fields = FieldValues {
-        name: desktop.name().to_string(),
-        icon: desktop
-            .locale_string("Icon")
-            .map(|icon| icon.to_string())
-            .filter(|icon| !icon.is_empty()),
-        desktop_file: desktop
-            .filename()
-            .map(|path| path.to_string_lossy().into_owned()),
-    };
-    let argv = exec_argv(&exec, &fields)?;
+    let argv = command_line(desktop)?;
     let working_dir = desktop
         .string("Path")
         .filter(|path| !path.is_empty())
@@ -75,6 +64,23 @@ fn spawn_desktop_app(desktop: &gio::DesktopAppInfo) -> Result<(), String> {
     }
     // ilia closes right away; the program is not waited for.
     command.spawn().map(drop).map_err(|error| error.to_string())
+}
+
+/// The program and arguments the entry's Exec line runs, with its field
+/// codes filled in from the entry.
+pub(crate) fn command_line(desktop: &gio::DesktopAppInfo) -> Result<Vec<String>, String> {
+    let exec = desktop.string("Exec").unwrap_or_default();
+    let fields = FieldValues {
+        name: desktop.name().to_string(),
+        icon: desktop
+            .locale_string("Icon")
+            .map(|icon| icon.to_string())
+            .filter(|icon| !icon.is_empty()),
+        desktop_file: desktop
+            .filename()
+            .map(|path| path.to_string_lossy().into_owned()),
+    };
+    exec_argv(&exec, &fields)
 }
 
 /// What the field codes of an Exec line stand for.
@@ -153,7 +159,7 @@ fn find_program(program: &str, working_dir: Option<&Path>) -> Option<PathBuf> {
 
 /// The well-known bus name `desktop` is activated at: its id without
 /// `.desktop`, for an entry with `DBusActivatable=true` whose id is one.
-fn bus_name(desktop: &gio::DesktopAppInfo) -> Option<String> {
+pub(crate) fn bus_name(desktop: &gio::DesktopAppInfo) -> Option<String> {
     if !desktop.boolean("DBusActivatable") {
         return None;
     }

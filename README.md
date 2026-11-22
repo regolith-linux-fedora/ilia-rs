@@ -20,9 +20,8 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
   Most of the smaller ones are in this port (fixed here independently, or
-  ported), but some large ones still need porting: window-manager and
-  desktop keys while ilia is open (#171), and faster apps start-up (#162).
-  See
+  ported), but one large one still needs porting: window-manager and
+  desktop keys while ilia is open (#171). See
   [Differences from upstream](#differences-from-upstream). That list was
   made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
   running both builds side by side under i3 and sway.
@@ -95,6 +94,11 @@ commit.
 Then #170 (the keybindings page shows the keys the window manager binds)
 in one commit.
 
+Then #162 (desktop files read during GTK start-up, icons decoded off the
+main thread) in one commit, together with a fix for a start-up deadlock it
+brings along and a reader that one stuck desktop file cannot hold up (see
+"In the port but not (known to be) upstream").
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -148,7 +152,13 @@ the keys each documented binding is left with after resources retune it
 (i3's own reply, sway's configuration with the resource service's values,
 key codes through the first layout), keeps the comment's key text while a
 row is bound as it is with no resource set, filters on the keys shown, and
-runs a row bound only with `bindcode` or standing before a `mode` block.
+runs a row bound only with `bindcode` or standing before a `mode` block;
+#162 with no `-p`, `-p apps` or `-a` the desktop files are read on worker
+threads started before GTK, the window is shown while they are read and
+the list fills in when they are, the rows use the objects read (no second
+parse per entry), icons are decoded on GTK's worker threads with the
+visible rows first, and Enter pressed before the list arrives launches,
+once, the best match for the text typed when it was pressed.
 
 **Ported ahead of upstream** (open upstream pull requests): #174 pages
 defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
@@ -173,8 +183,6 @@ closes.
 
 **Not yet ported** (open items):
 
-- #162: read the desktop files during GTK start-up and decode icons off the
-  main thread (the apps page opens about 20–30 % later than ilia's).
 - #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions),
   #172 (calculator page) and #173 (desktop-entry actions). #174, #181 and
@@ -200,7 +208,17 @@ list stays sorted while PATH is scanned. Files shows up to 1000 results
 start-up), keeping the highlighted row when the list is rebuilt; a
 `hidden-apps` entry starting with `!` lists again what it matches, the last
 fitting entry deciding; Ctrl+z undoes this run's Ctrl+Delete hides, latest
-first.
+first. With #162: GIO's default VFS is created before the reader threads
+start, because a reader creating it (for an entry whose `Icon` is a full
+path) while GTK picks the keyfile settings backend deadlocks GIO and the
+window never shows (sway with `GSETTINGS_BACKEND=keyfile` or no dconf;
+ilia 0.20.1 starts its reader thread the same way); each desktop file is
+read outside GLib on reader threads that a stuck read does not hold up
+(GLib reads entries under one process-wide lock), the list comes without
+a file still unreadable ten seconds after start and that entry joins it
+once read; with `-a`, the Windows page shows the generic icon until the
+list arrives instead of waiting in GLib's search, then each window's entry
+icon, found as GLib's search ranks entries.
 
 ## Build
 

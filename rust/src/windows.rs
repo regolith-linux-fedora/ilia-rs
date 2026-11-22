@@ -8,6 +8,8 @@ use gtk::gdk;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::prelude::*;
 
+use crate::apps::{self, EntriesUpdate};
+use crate::entries::{self, DesktopEntry};
 use crate::filter::fold_text;
 use crate::icons::load_icon_from_name;
 use crate::ipc::{self, TreeReply};
@@ -55,7 +57,7 @@ impl WindowsPage {
         });
 
         match ipc::get_tree(&wm_name) {
-            Ok(tree) => add_tree(&model, &tree, is_wayland, icon_size),
+            Ok(tree) => add_windows(&model, &tree, is_wayland, icon_size),
             Err(error) => {
                 eprintln!("Failed to read or parse window tree from {wm_name}: {error}")
             }
@@ -199,20 +201,29 @@ fn string_value(
         .unwrap_or_default()
 }
 
-fn add_tree(model: &gtk::ListStore, node: &TreeReply, is_wayland: bool, icon_size: i32) {
-    if navigable_window(node, is_wayland) {
-        let row = model.append();
-        let icon_name = node
+/// Lists the navigable windows under `tree` with their icons.
+///
+/// When the desktop entries are being read for the Applications page (with
+/// `-a`), GLib's own search would wait for that read, or forever for a file
+/// that never becomes readable: GLib reads entry files under one lock. The
+/// rows then start with the generic application icon and get their own
+/// icons from the entries read, once they are listed.
+fn add_windows(model: &gtk::ListStore, tree: &TreeReply, is_wayland: bool, icon_size: i32) {
+    let mut windows = Vec::new();
+    collect_windows(tree, is_wayland, &mut windows);
+    let deferred = apps::entries_requested();
+    let mut rows = Vec::new();
+    for node in windows {
+        let app_name = node
             .window_properties
             .as_ref()
             .and_then(|properties| properties.instance.as_deref())
             .or(node.app_id.as_deref());
-        let icon = load_icon_from_app_name(icon_name, icon_size).or_else(|| {
-            // The app has no icon, or it cannot be loaded.
-            gtk::IconTheme::default().and_then(|theme| {
-                load_icon_from_name(&theme, "application-x-executable", icon_size)
-            })
-        });
+        let icon = if deferred {
+            generic_icon(icon_size)
+        } else {
+            window_icon(app_name, icon_size, search_glib)
+        };
         let folded_title = fold_text(&node.name);
         let mut values: Vec<(u32, &dyn ToValue)> = vec![
             (TITLE, &node.name),
@@ -222,14 +233,48 @@ fn add_tree(model: &gtk::ListStore, node: &TreeReply, is_wayland: bool, icon_siz
         if let Some(icon) = icon.as_ref() {
             values.push((ICON, icon));
         }
+        let row = model.append();
         model.set(&row, &values);
+        rows.push((row, app_name.map(str::to_owned)));
     }
-    for child in &node.nodes {
-        add_tree(model, child, is_wayland, icon_size);
+    if !deferred || rows.is_empty() {
+        return;
     }
-    for child in &node.floating_nodes {
-        add_tree(model, child, is_wayland, icon_size);
+    let model = model.clone();
+    apps::watch_entries(move |update| {
+        let (EntriesUpdate::Listed(all) | EntriesUpdate::Added { all, .. }) = update;
+        for (row, app_name) in &rows {
+            let icon = window_icon(app_name.as_deref(), icon_size, |name| {
+                search_entries(all, name)
+            });
+            if let Some(icon) = icon {
+                model.set(row, &[(ICON, &icon)]);
+            }
+        }
+    });
+}
+
+fn collect_windows<'a>(node: &'a TreeReply, is_wayland: bool, windows: &mut Vec<&'a TreeReply>) {
+    if navigable_window(node, is_wayland) {
+        windows.push(node);
     }
+    for child in node.nodes.iter().chain(&node.floating_nodes) {
+        collect_windows(child, is_wayland, windows);
+    }
+}
+
+fn window_icon(
+    app_name: Option<&str>,
+    icon_size: i32,
+    find_entry: impl Fn(&str) -> Option<Option<gio::DesktopAppInfo>>,
+) -> Option<Pixbuf> {
+    // The app has no icon, or it cannot be loaded.
+    load_icon_from_app_name(app_name, icon_size, find_entry).or_else(|| generic_icon(icon_size))
+}
+
+fn generic_icon(icon_size: i32) -> Option<Pixbuf> {
+    gtk::IconTheme::default()
+        .and_then(|theme| load_icon_from_name(&theme, "application-x-executable", icon_size))
 }
 
 /// Whether the windows page lists a tree node. Every window the window
@@ -251,23 +296,43 @@ pub fn navigable_window(node: &TreeReply, is_wayland: bool) -> bool {
         && class != Some("i3bar")
 }
 
-fn load_icon_from_app_name(name: Option<&str>, icon_size: i32) -> Option<Pixbuf> {
+/// A window's icon: that of the desktop entry `find_entry` matches to its
+/// app name, else the themed icon of that name, else the generic emblem.
+/// `find_entry` returns `None` when no entry matches and `Some(None)` when
+/// the best match cannot be loaded, which leaves the window without an icon.
+fn load_icon_from_app_name(
+    name: Option<&str>,
+    icon_size: i32,
+    find_entry: impl Fn(&str) -> Option<Option<gio::DesktopAppInfo>>,
+) -> Option<Pixbuf> {
     if icon_size == 0 {
         return None;
     }
     let theme = gtk::IconTheme::default()?;
     if let Some(name) = name {
-        if let Some(group) = gio::DesktopAppInfo::search(name).first() {
-            if let Some(id) = group.first() {
-                return gio::DesktopAppInfo::new(id)
-                    .and_then(|app| load_icon_from_info(&theme, &app, icon_size));
-            }
+        if let Some(app) = find_entry(name) {
+            return app.and_then(|app| load_icon_from_info(&theme, &app, icon_size));
         }
         if let Some(pixbuf) = load_icon_name(&theme, name, icon_size) {
             return Some(pixbuf);
         }
     }
     load_icon_name(&theme, "emblem-generic", icon_size)
+}
+
+/// GLib's best search match for a window's app name.
+fn search_glib(name: &str) -> Option<Option<gio::DesktopAppInfo>> {
+    let id = gio::DesktopAppInfo::search(name)
+        .into_iter()
+        .next()?
+        .into_iter()
+        .next()?;
+    Some(gio::DesktopAppInfo::new(&id))
+}
+
+/// The same match among the entries the Applications page has read.
+fn search_entries(entries: &[Rc<DesktopEntry>], name: &str) -> Option<Option<gio::DesktopAppInfo>> {
+    entries::best_match(entries.iter().map(Rc::as_ref), name).map(|entry| entry.app.clone())
 }
 
 fn load_icon_from_info(

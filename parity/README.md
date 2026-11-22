@@ -41,6 +41,16 @@ it is bound as with no resource set (upstream #170); the cases see it
 through the filter, which matches that text. A comment before a `mode`
 block and a row bound only with `bindcode` run their bindings too.
 
+`test_entries_read_early.py` checks that the entries read during
+start-up (upstream #162, read outside GLib in the port) keep what GLib's own
+entries give: `%k` is the desktop file, a `DBusActivatable=true` entry is
+activated over the private session bus (`fakes/bus_app.py` records the
+call) and its Exec line does not run, and the Windows page shows the icon
+of the entry GLib's search ranks first for a hyphenated app name of several
+words (pixels of the window, read through GDK). Each case runs with a fake
+i3 and a fake sway, alone on its page and with `-a`; GDK uses X11 here, so
+the sway windows carry a window type.
+
 For the Windows page this harness chooses the deterministic absent-binary behavior for the absolute
 `/usr/bin/i3-msg` and `/usr/bin/swaymsg` paths rather than modifying system
 files. The Windows tests require either the exact expected IPC command

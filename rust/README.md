@@ -12,7 +12,10 @@ file's command with its whole process group and reap it, one
 `faccessat(2)` in `program_path.rs` that checks a program is executable,
 one GTK call in `clipboard_keeper.rs` that gtk-rs has no binding for, and
 the libxkbcommon calls in `xkb.rs` that build sway's keymap for the
-Keybindings page (libxkbcommon is linked; GTK already depends on it).
+Keybindings page (libxkbcommon is linked; GTK already depends on it),
+`setlocale` in `application.rs` before the desktop files are read, GLib's
+search tokenizer in `entries.rs`, which gtk-rs does not wrap, and the
+hand-over of the entries read on worker threads in `apps.rs`.
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -29,6 +32,12 @@ Module map:
   and the notifications page.
 - `sparql.rs`, `tracker.rs`: the run-time SPARQL binding and the Files page,
   which searches on worker threads once typing pauses.
+- `entries.rs`: reading the desktop entries as GLib lists them (desktop
+  ids, directory precedence, hidden entries) on reader threads that a
+  stuck file does not hold up, and GLib's search ranking over them, for
+  the Windows page's icons while the Applications page reads them. The
+  Applications page starts the read before GTK (`apps.rs`) and fills in
+  its list when it arrives.
 - `launch.rs`: starting an Applications-page entry as its desktop file
   describes it (Exec field codes, Path, `Terminal=true`, the scope, and
   `DBusActivatable=true` activation over the session bus).

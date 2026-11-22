@@ -4,6 +4,7 @@ mod apps;
 mod args;
 mod clipboard_keeper;
 mod dialog;
+mod entries;
 mod filter;
 mod icons;
 mod input_sources;
