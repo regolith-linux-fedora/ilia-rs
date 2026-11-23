@@ -222,6 +222,21 @@ impl AddAppForm {
         true
     }
 
+    /// Whether the form acts on a key beyond the dialog's own keys: Tab and
+    /// Shift+Tab, which move between its controls.
+    pub fn uses_key(&self, event: &gdk::EventKey) -> bool {
+        matches!(
+            event.keyval(),
+            gdk::keys::constants::Tab
+                | gdk::keys::constants::KP_Tab
+                | gdk::keys::constants::ISO_Left_Tab
+        ) && !event.state().intersects(
+            gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::MOD1_MASK
+                | gdk::ModifierType::SUPER_MASK,
+        )
+    }
+
     fn window(&self) -> Option<gtk::Window> {
         self.root.toplevel().and_downcast::<gtk::Window>()
     }

@@ -26,7 +26,10 @@ def _finish_after_activation(app):
 
 def _assert_config_request(server, transcript):
     records = [json.loads(line) for line in transcript.read_text().splitlines()]
-    assert records[0] == {
+    # Leave out the binding-state queries and event subscriptions with which
+    # ilia follows the window manager's own bindings (upstream #171).
+    requests = [record for record in records if record["message_type"] not in (2, 12)]
+    assert requests[0] == {
         "message_type": 9, "payload_hex": "",
     }
     return records

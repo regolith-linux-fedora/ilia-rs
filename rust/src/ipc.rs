@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -11,9 +11,19 @@ const IPC_MAGIC: &[u8; 6] = b"i3-ipc";
 const HEADER_SIZE: usize = 14;
 
 pub const RUN_COMMAND: u32 = 0;
+pub const SUBSCRIBE: u32 = 2;
 pub const GET_TREE: u32 = 4;
 pub const GET_VERSION: u32 = 7;
 pub const GET_CONFIG: u32 = 9;
+pub const GET_BINDING_STATE: u32 = 12;
+
+/// Events carry their type with the highest bit set; replies do not.
+const EVENT_FLAG: u32 = 1 << 31;
+/// The event sent when the window manager runs a binding.
+pub const BINDING_EVENT: u32 = EVENT_FLAG | 5;
+
+/// How long a request waits for the window manager, unless the caller says.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Json {
@@ -328,29 +338,85 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 }
 
 fn request(wm_name: &str, command: u32, payload: &str) -> Result<Json, String> {
-    let socket_path = socket_path(
+    Connection::open(&wm_socket(wm_name)?, REQUEST_TIMEOUT)?.request(command, payload)
+}
+
+/// The socket the window manager is reached on, as the session names it.
+pub fn wm_socket(wm_name: &str) -> Result<OsString, String> {
+    socket_path(
         wm_name,
         std::env::var_os("I3SOCK"),
         std::env::var_os("SWAYSOCK"),
-    )?;
-    let mut stream = UnixStream::connect(&socket_path).map_err(|error| error.to_string())?;
-    let timeout = Some(Duration::from_secs(3));
-    stream
-        .set_read_timeout(timeout)
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(timeout)
-        .map_err(|error| error.to_string())?;
+    )
+}
 
-    stream
-        .write_all(&encode_request(command, payload)?)
-        .map_err(|error| error.to_string())?;
+/// One connection to the window manager, for any number of requests in
+/// turn.
+pub struct Connection {
+    stream: UnixStream,
+}
 
-    let payload = read_reply(&mut stream)?;
-    if payload.is_empty() {
-        return Err("No Response".to_owned());
+impl Connection {
+    /// Connects to the socket at `path`. Every later read or write gives up
+    /// after `timeout`, so a window manager that accepts the connection but
+    /// never answers is an error, not a hang.
+    pub fn open(path: &OsStr, timeout: Duration) -> Result<Self, String> {
+        let stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| error.to_string())?;
+        Ok(Self { stream })
     }
-    JsonParser::new(&payload).parse()
+
+    /// Sends one request and reads its reply.
+    pub fn request(&mut self, command: u32, payload: &str) -> Result<Json, String> {
+        self.stream
+            .write_all(&encode_request(command, payload)?)
+            .map_err(|error| error.to_string())?;
+        let payload = read_reply(&mut self.stream)?;
+        if payload.is_empty() {
+            return Err("No Response".to_owned());
+        }
+        JsonParser::new(&payload).parse()
+    }
+
+    /// Subscribes the connection to `events` (such as `"binding"`); from
+    /// then on it carries only events, read with
+    /// [`next_event`](Self::next_event), which waits for as long as it takes.
+    pub fn subscribe(mut self, events: &[&str]) -> Result<Self, String> {
+        let reply = self.request(SUBSCRIBE, &subscribe_payload(events))?;
+        if !subscribe_succeeded(&reply) {
+            return Err("the subscription was refused".to_owned());
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|error| error.to_string())?;
+        Ok(self)
+    }
+
+    /// The next event on a subscribed connection: its type and its payload.
+    pub fn next_event(&mut self) -> Result<(u32, Json), String> {
+        loop {
+            let (message_type, payload) = read_message(&mut self.stream)?;
+            if message_type & EVENT_FLAG != 0 && !payload.is_empty() {
+                return Ok((message_type, JsonParser::new(&payload).parse()?));
+            }
+        }
+    }
+}
+
+/// The payload of a subscription: the event names as a JSON array. Event
+/// names are plain words, so they need no escaping.
+fn subscribe_payload(events: &[&str]) -> String {
+    let names: Vec<String> = events.iter().map(|name| format!("\"{name}\"")).collect();
+    format!("[{}]", names.join(","))
+}
+
+fn subscribe_succeeded(reply: &Json) -> bool {
+    matches!(reply, Json::Object(object) if object.get("success") == Some(&Json::Bool(true)))
 }
 
 /// One request: the fixed header, with the payload's length in bytes, then
@@ -385,6 +451,11 @@ fn socket_path(
 /// announces. Large replies arrive in several reads, and even the header may
 /// be split.
 fn read_reply(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    read_message(reader).map(|(_, payload)| payload)
+}
+
+/// Reads one message, a reply or an event: its type and its payload.
+fn read_message(reader: &mut impl Read) -> Result<(u32, Vec<u8>), String> {
     let mut header = [0u8; HEADER_SIZE];
     reader
         .read_exact(&mut header)
@@ -392,13 +463,14 @@ fn read_reply(reader: &mut impl Read) -> Result<Vec<u8>, String> {
     if &header[..IPC_MAGIC.len()] != IPC_MAGIC {
         return Err("invalid reply header".to_owned());
     }
-    // The window manager writes the length in its native byte order.
+    // The window manager writes the length and type in its native byte order.
     let length = u32::from_ne_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    let message_type = u32::from_ne_bytes([header[10], header[11], header[12], header[13]]);
     let mut payload = vec![0; length];
     reader
         .read_exact(&mut payload)
         .map_err(|error| format!("reading the {length}-byte reply failed: {error}"))?;
-    Ok(payload)
+    Ok((message_type, payload))
 }
 
 #[allow(dead_code)]
@@ -458,7 +530,34 @@ pub fn get_config(wm_name: &str) -> Result<Config, String> {
     config_from_reply(reply, wm_name, path)
 }
 
-fn config_from_reply(reply: Json, wm_name: &str, path: Option<PathBuf>) -> Result<Config, String> {
+/// The binding mode the window manager is in (`"default"` outside any
+/// mode), from its binding-state reply.
+pub fn binding_state_from_reply(reply: &Json) -> Result<String, String> {
+    Ok(member(reply.object()?, "name")?.string()?.to_owned())
+}
+
+/// The command of the binding a binding event reports as run, as the window
+/// manager holds it; `None` for an event about anything else.
+pub fn command_from_binding_event(event: &Json) -> Result<Option<String>, String> {
+    let object = event.object()?;
+    if let Some(change) = object.get("change") {
+        if change.string()? != "run" {
+            return Ok(None);
+        }
+    }
+    let binding = member(object, "binding")?.object()?;
+    match binding.get("command") {
+        Some(Json::String(command)) => Ok(Some(command.clone())),
+        None | Some(Json::Null) => Ok(Some(String::new())),
+        Some(_) => Err("expected JSON string for command".to_owned()),
+    }
+}
+
+pub(crate) fn config_from_reply(
+    reply: Json,
+    wm_name: &str,
+    path: Option<PathBuf>,
+) -> Result<Config, String> {
     let object = reply.object()?;
     if wm_name == "sway" {
         let main = member(object, "config")?.string()?.to_owned();

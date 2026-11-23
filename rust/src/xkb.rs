@@ -64,6 +64,12 @@ pub fn keysym(name: &str) -> Option<u32> {
     keysym_from_name(name, KEYSYM_NO_FLAGS).or_else(|| keysym_ignoring_case(name))
 }
 
+/// The keysym `name` spells exactly, read the way i3 reads key names: case
+/// counts, and hexadecimal (`0x1008ff13`) and Unicode (`U20AC`) names work.
+pub fn keysym_exact(name: &str) -> Option<u32> {
+    keysym_from_name(name, KEYSYM_NO_FLAGS)
+}
+
 fn keysym_from_name(name: &str, flags: c_int) -> Option<u32> {
     let name = CString::new(name).ok()?;
     // SAFETY: the name outlives the call, which does not keep it.

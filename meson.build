@@ -15,6 +15,10 @@ dependency('gtk-layer-shell-0')
 # The Keybindings page links libxkbcommon directly: it builds sway's keymap
 # to show the keys of key codes.
 dependency('xkbcommon')
+# Xlib and XTEST, linked directly: on X11 the keys ilia does not use are
+# passed on to the programs that grab them.
+dependency('x11')
+dependency('xtst')
 
 meson.add_install_script(join_paths(meson.current_source_dir(),'meson_scripts','install_data.sh'),join_paths(get_option('prefix'),get_option('datadir'),'ilia'),join_paths(meson.current_source_dir(),'data/local','','*'))
 

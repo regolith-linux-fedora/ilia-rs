@@ -14,8 +14,10 @@ one GTK call in `clipboard_keeper.rs` that gtk-rs has no binding for, and
 the libxkbcommon calls in `xkb.rs` that build sway's keymap for the
 Keybindings page (libxkbcommon is linked; GTK already depends on it),
 `setlocale` in `application.rs` before the desktop files are read, GLib's
-search tokenizer in `entries.rs`, which gtk-rs does not wrap, and the
-hand-over of the entries read on worker threads in `apps.rs`.
+search tokenizer in `entries.rs`, which gtk-rs does not wrap, the
+hand-over of the entries read on worker threads in `apps.rs`, and the Xlib
+and XTEST calls in `x11.rs` that pass the desktop's keys on (libX11 and
+libXtst are linked).
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -60,6 +62,17 @@ Module map:
   Right move the entry's text cursor instead of switching pages.
 - `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
   open (gnome-flashback's input-source D-Bus service on X11).
+- `wm_keys.rs`, `wm_bindings.rs`, `x11.rs`: window-manager and desktop keys
+  while ilia is open. On X11 the keys ilia does not use itself (the
+  dialog's own in `dialog.rs`, and those a page names with
+  `DialogPage::uses_key`) are matched against i3's bindings in its current
+  mode (read over IPC at each press, so mode changes and reloads count) and
+  the binding is run over IPC once the grab is released; the desktop's
+  media, brightness, calculator and Print keys are pressed again through
+  XTEST for the program that grabs them. On sway a `binding` event
+  subscription closes ilia, unless the binding only switches the keyboard
+  layout. A window-manager socket that cannot be used is reported once on
+  stderr and then left alone.
 - `keybindings.rs`: the Keybindings page, which runs the chosen binding's
   command over IPC (`ipc.rs`) as the window manager holds it. i3 reports its
   configuration with the variables applied; sway's is read in `ipc.rs` as

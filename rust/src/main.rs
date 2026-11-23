@@ -24,6 +24,9 @@ mod terminal;
 mod textlist;
 mod tracker;
 mod windows;
+mod wm_bindings;
+mod wm_keys;
+mod x11;
 mod xkb;
 
 use std::ffi::OsString;

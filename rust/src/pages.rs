@@ -48,6 +48,13 @@ pub trait DialogPage {
     fn capture_key_event(&self, _event: &gdk::EventKey) -> bool {
         false
     }
+    /// Whether the page acts on a key that is not one of the dialog's own
+    /// (Escape, Enter, typing, navigation, the shared Ctrl and Alt keys).
+    /// On X11 such a key stays with ilia even when the window manager binds
+    /// it.
+    fn uses_key(&self, _event: &gdk::EventKey) -> bool {
+        false
+    }
     /// The letter that selects the page with Alt.
     fn get_keybinding(&self) -> Option<char>;
     fn show(&self) {}

@@ -19,12 +19,12 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   0.19.0. It prints `ilia version 0.19`, like ilia; the package version is
   `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
-  Most of the smaller ones are in this port (fixed here independently, or
-  ported), but one large one still needs porting: window-manager and
+  All of those merged by 2026-11-09 are in this port, fixed here
+  independently or ported; the last large one was window-manager and
   desktop keys while ilia is open (#171). See
   [Differences from upstream](#differences-from-upstream). That list was
-  made on 2026-11-09 against upstream `main` at `b075ac2`, and checked by
-  running both builds side by side under i3 and sway.
+  made against upstream `main` at `b075ac2`, and checked by running both
+  builds side by side under i3 and sway.
 - **Very deep testing is needed** before anyone considers this port as a
   replacement for the Vala ilia.
 - **No deep code reviews yet.** The port has not yet been reviewed in depth
@@ -102,6 +102,9 @@ brings along and a reader that one stuck desktop file cannot hold up (see
 Then the open upstream pull request #172 (the calculator page) in one
 commit.
 
+Then the rest of #171 (window-manager and desktop keys while ilia is open)
+in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -161,7 +164,15 @@ threads started before GTK, the window is shown while they are read and
 the list fills in when they are, the rows use the objects read (no second
 parse per entry), icons are decoded on GTK's worker threads with the
 visible rows first, and Enter pressed before the list arrives launches,
-once, the best match for the text typed when it was pressed.
+once, the best match for the text typed when it was pressed; #171
+window-manager and desktop keys while ilia is open: on X11 a key ilia does
+not use itself closes ilia when i3 binds the key in its current mode, and
+i3 then runs the binding (matched as i3 matches it: layouts, Shift
+fallback, `bindcode`, exact modifiers, `--release`); the desktop's Print,
+volume, mute, brightness, calculator and playback keys reach the program
+that grabs them, with their modifiers; on sway ilia closes when sway runs
+a binding, except one that only switches the keyboard layout; an unusable
+window-manager socket is reported once on standard error.
 
 **Ported ahead of upstream** (open upstream pull requests): #174 pages
 defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
@@ -192,13 +203,8 @@ with ilia), a part with no value (`0*(1.5!)`, `(-3)!^0`) leaves the whole
 expression without one, and with `-a` each page keeps its own entry text
 (see below).
 
-**Partly ported:**
-
-- #171: only its Ctrl+$ fix (see below).
-
 **Not yet ported** (open items):
 
-- #171: window-manager and desktop keys work while ilia is open.
 - Open upstream PRs that will likely land: #164 (notification actions)
   and #173 (desktop-entry actions). #172, #174, #181 and #184 are already
   in the port (see above).
@@ -237,7 +243,13 @@ icon, found as GLib's search ranks entries. With #172: with `-a` each page
 keeps its own entry text, so switching pages brings back the text last
 typed on the new page (empty at first) instead of filtering it by the
 text typed on the old one, as #145 does upstream; the Calculator page keeps
-its expression, and its answer, while another page is shown.
+its expression, and its answer, while another page is shown. With #171:
+on X11 the keys a page acts on beyond the dialog's own stay with ilia even
+when i3 binds them (on the Applications page Ctrl+Shift+C, Ctrl+= and
+Ctrl+z, and Tab in its form; upstream's #181 and #184 leave them to i3),
+and i3's key names are read with libxkbcommon as i3 reads them, so a
+binding written with a hexadecimal or Unicode key name (`0x1008ff13`,
+`U00E9`) is matched too (upstream reads them with GDK, which knows neither).
 
 ## Build
 

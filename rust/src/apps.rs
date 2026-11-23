@@ -901,6 +901,21 @@ impl DialogPage for ApplicationsPage {
         self.form.is_open() && self.form.handle_key(event)
     }
 
+    fn uses_key(&self, event: &gdk::EventKey) -> bool {
+        if self.form.is_open() {
+            return self.form.uses_key(event);
+        }
+        // Ctrl+z and the add-app shortcut with neither Alt nor Super, as for
+        // the dialog's own Ctrl keys.
+        let ctrl_only = event.state().contains(gdk::ModifierType::CONTROL_MASK)
+            && !event
+                .state()
+                .intersects(gdk::ModifierType::MOD1_MASK | gdk::ModifierType::SUPER_MASK);
+        (is_copy_program_path_key(event) && self.root.is_mapped())
+            || (ctrl_only
+                && (is_add_app_shortcut(event) || event.keyval() == gdk::keys::constants::z))
+    }
+
     fn show(&self) {
         if self.form.is_open() {
             self.form.take_focus();

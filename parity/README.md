@@ -41,6 +41,24 @@ it is bound as with no resource set (upstream #170); the cases see it
 through the filter, which matches that text. A comment before a `mode`
 block and a row bound only with `bindcode` run their bindings too.
 
+`test_wm_keys.py` covers window-manager and desktop keys while the window
+is open (upstream #171). The fake window manager serves several requests
+per connection and connections side by side, as i3 and sway do, answers
+the binding state (the `default` mode unless a case sets another), an
+empty configuration unless a case gives one, and event subscriptions, and
+can send binding events. With `I3SOCK` a key i3 binds in its current mode
+closes ilia and reaches the socket once as RUN_COMMAND, exactly as written
+(also a `--release` binding, on the release, and one written with a
+hexadecimal key name); the keys ilia uses itself stay with it even when
+bound, among them the Applications page's Ctrl+Shift+C, Ctrl+= and Ctrl+z
+and Tab in its form. A volume key with Control held reaches a program
+grabbing it on the root window (`fakes/key_grabber.py`) once, with
+Control. With `SWAYSOCK` ilia subscribes to binding events and closes on
+one without running anything, unless the binding only switches the
+keyboard layout. A socket that cannot be used is named once on standard
+error. The cases that list what ilia asked the window manager leave out
+these binding-state queries and subscriptions.
+
 `test_entries_read_early.py` checks that the entries read during
 start-up (upstream #162, read outside GLib in the port) keep what GLib's own
 entries give: `%k` is the desktop file, a `DBusActivatable=true` entry is

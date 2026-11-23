@@ -13,6 +13,8 @@ use crate::clipboard_keeper;
 use crate::input_sources::InputSourceSwitcher;
 use crate::page_files::{self, PageFile};
 use crate::pages::{create, create_from_file, find, is_enter_key, DialogPage, Page, PAGES};
+use crate::wm_bindings::{LOCK_MASK, REAL_MODIFIERS, SHIFT_MASK};
+use crate::wm_keys::{self, X11KeyForwarder};
 
 const MIN_WINDOW_WIDTH: i32 = 160;
 const MIN_WINDOW_HEIGHT: i32 = 100;
@@ -321,6 +323,28 @@ pub fn build(
     // released on its own.
     let exit_on_super_release = Rc::new(Cell::new(false));
 
+    // ilia's keyboard grab keeps every key from i3's bindings and from the
+    // desktop on X11: the forwarder hands on the keys ilia does not use. sway
+    // runs its bindings itself; ilia only gets out of the way.
+    let window_for_release = window.clone();
+    let seat_for_release = seat.clone();
+    let release: Rc<dyn Fn()> =
+        Rc::new(move || release_input(&window_for_release, &seat_for_release));
+    let key_forwarder: Option<Rc<X11KeyForwarder>> = (!is_wayland && wm_name != "sway")
+        .then(|| {
+            X11KeyForwarder::new(
+                &WidgetExt::display(&window),
+                wm_name,
+                release,
+                page_quit.clone(),
+            )
+        })
+        .flatten()
+        .map(Rc::new);
+    if wm_name == "sway" {
+        wm_keys::watch_sway_bindings(page_quit.clone());
+    }
+
     let app_for_key = app.clone();
     let window_for_key = window.clone();
     let seat_for_key = seat.clone();
@@ -330,6 +354,7 @@ pub fn build(
     let active_for_key = active_page.clone();
     let settings_for_key = settings.clone();
     let super_release_for_key = exit_on_super_release.clone();
+    let forwarder_for_key = key_forwarder.clone();
     window.connect_key_press_event(move |window, event| {
         let key = event.keyval();
         let keyval = *key;
@@ -342,8 +367,24 @@ pub fn build(
                 return glib::Propagation::Stop;
             }
             if super_release_for_key.get() && !event.is_modifier() {
-                // Super did not start a layout switch after all.
-                quit(&window_for_key, &app_for_key, &seat_for_key);
+                // Super did not start a layout switch after all. The key goes
+                // on to the window manager, with the modifiers now held, as if
+                // Super had closed ilia when it was pressed.
+                super_release_for_key.set(false);
+                if !forwarder_for_key
+                    .as_ref()
+                    .is_some_and(|forwarder| forwarder.key_pressed(event))
+                {
+                    quit(&window_for_key, &app_for_key, &seat_for_key);
+                }
+                return glib::Propagation::Stop;
+            }
+        }
+        if let Some(forwarder) = forwarder_for_key.as_ref() {
+            if !is_own_key(key, state, &shortcuts, forwarder.numlock_mask())
+                && !pages_for_key[active_for_key.get()].uses_key(event)
+                && forwarder.key_pressed(event)
+            {
                 return glib::Propagation::Stop;
             }
         }
@@ -449,6 +490,12 @@ pub fn build(
     let window_for_release = window.clone();
     let seat_for_release = seat.clone();
     window.connect_key_release_event(move |_, event| {
+        if key_forwarder
+            .as_ref()
+            .is_some_and(|forwarder| forwarder.key_released(event))
+        {
+            return glib::Propagation::Stop;
+        }
         if exit_on_super_release.get() && is_super_key(&event.keyval()) {
             quit(&window_for_release, &app_for_release, &seat_for_release);
         }
@@ -490,6 +537,68 @@ pub fn build(
     Ok(window)
 }
 
+/// The keys that ilia uses itself, which never go to the window manager or
+/// the desktop: Escape, Backspace, Delete, list and page navigation (the
+/// keypad's too) and Super, whatever else is held; Enter without Super;
+/// ilia's Control and Alt shortcuts, the Alt+letter of a loaded page among
+/// them; and keys that type a character with Shift as the only modifier.
+/// `key` and `state` are the press's key and modifiers, `shortcuts` the
+/// loaded pages' letters, `numlock_mask` the real modifier that carries Num
+/// Lock.
+fn is_own_key(
+    key: gdk::keys::Key,
+    state: gdk::ModifierType,
+    shortcuts: &[Option<char>],
+    numlock_mask: u32,
+) -> bool {
+    use gdk::keys::constants as keys;
+    let control = state.contains(gdk::ModifierType::CONTROL_MASK);
+    let alt = state.contains(gdk::ModifierType::MOD1_MASK);
+    let super_held = state.contains(gdk::ModifierType::SUPER_MASK);
+    if matches!(
+        key,
+        keys::Escape
+            | keys::BackSpace
+            | keys::Delete
+            | keys::Super_L
+            | keys::Super_R
+            | keys::Up
+            | keys::Down
+            | keys::Left
+            | keys::Right
+            | keys::Page_Up
+            | keys::Page_Down
+            | keys::Home
+            | keys::End
+            | keys::KP_Up
+            | keys::KP_Down
+            | keys::KP_Left
+            | keys::KP_Right
+            | keys::KP_Page_Up
+            | keys::KP_Page_Down
+            | keys::KP_Home
+            | keys::KP_End
+    ) {
+        return true;
+    }
+    if is_enter_key(&key) {
+        return !super_held;
+    }
+    if control && !alt && !super_held {
+        return matches!(
+            char::from_u32(*key),
+            Some('h' | 'l' | 'j' | 'k' | 'n' | 'p' | '0' | '$' | 'a' | 'w' | 'b' | 'c' | 'v' | 'x')
+        );
+    }
+    if alt && !control && !super_held {
+        return *key == u32::from('+')
+            || *key == u32::from('-')
+            || alt_switch_target(shortcuts, *key).is_some();
+    }
+    let other_modifiers = state.bits() & REAL_MODIFIERS & !(SHIFT_MASK | LOCK_MASK | numlock_mask);
+    other_modifiers == 0 && !super_held && key.to_unicode().is_some_and(|typed| !typed.is_control())
+}
+
 fn is_super_key(key: &gdk::keys::Key) -> bool {
     matches!(
         *key,
@@ -510,6 +619,16 @@ fn keyval_in_first_layout(window: &gtk::Window, event: &gdk::EventKey) -> u32 {
             keymap.translate_keyboard_state(u32::from(event.hardware_keycode()), event.state(), 0)
         })
         .map_or(*event.keyval(), |(keyval, ..)| keyval)
+}
+
+/// Gives up the keyboard and pointer and hides the window, and waits until
+/// the X server has done so: what runs next may take the keyboard itself.
+fn release_input(window: &gtk::Window, seat: &SharedSeat) {
+    if let Some(seat) = seat.borrow_mut().take() {
+        seat.ungrab();
+    }
+    window.hide();
+    WidgetExt::display(window).sync();
 }
 
 pub fn quit(window: &gtk::Window, app: &gtk::Application, seat: &SharedSeat) {
@@ -780,7 +899,10 @@ fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
 
 #[cfg(test)]
 mod tests {
-    use super::{alt_switch_target, backward_word, forward_word, resized, size_change_allowed};
+    use super::{
+        alt_switch_target, backward_word, forward_word, is_own_key, resized, size_change_allowed,
+    };
+    use gtk::gdk;
 
     #[test]
     fn resize_respects_minimum_and_monitor_cap() {
@@ -846,5 +968,109 @@ mod tests {
         // The end of the text is a character position, not a byte offset.
         assert_eq!(forward_word("añejo", 1), 5);
         assert_eq!(forward_word("über", 0), 4);
+    }
+
+    fn owned(name: &str, state: gdk::ModifierType, pages: &[Option<char>]) -> bool {
+        let key = gdk::keys::Key::from_name(name);
+        assert_ne!(*key, *gdk::keys::constants::VoidSymbol, "{name}");
+        is_own_key(key, state, pages, gdk::ModifierType::MOD2_MASK.bits())
+    }
+
+    #[test]
+    fn own_keys_stay_with_ilia_whatever_the_window_manager_binds() {
+        use gdk::ModifierType as M;
+        let none = M::empty();
+        let pages = [Some('a'), Some('k'), None];
+        let every = M::SHIFT_MASK | M::CONTROL_MASK | M::MOD1_MASK | M::SUPER_MASK;
+        for name in [
+            "Escape",
+            "BackSpace",
+            "Delete",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Page_Up",
+            "Page_Down",
+            "Home",
+            "End",
+            "KP_Up",
+            "KP_Down",
+            "KP_Left",
+            "KP_Right",
+            "KP_Page_Up",
+            "KP_Page_Down",
+            "KP_Home",
+            "KP_End",
+            "Super_L",
+            "Super_R",
+        ] {
+            assert!(owned(name, none, &pages), "{name}");
+            assert!(owned(name, every, &pages), "{name} with every modifier");
+        }
+        for name in ["Return", "KP_Enter", "ISO_Enter"] {
+            assert!(
+                owned(name, M::CONTROL_MASK | M::MOD1_MASK, &pages),
+                "{name}"
+            );
+            assert!(!owned(name, M::SUPER_MASK, &pages), "Super+{name}");
+        }
+        // Typing, with Shift and the locks only.
+        let locks = M::SHIFT_MASK | M::LOCK_MASK | M::MOD2_MASK;
+        for name in ["t", "T", "dollar", "space", "eacute", "KP_1", "KP_Multiply"] {
+            assert!(owned(name, none, &pages), "{name}");
+            assert!(owned(name, locks, &pages), "{name} with Shift and locks");
+            assert!(
+                !owned(name, M::CONTROL_MASK | M::MOD1_MASK, &pages),
+                "Ctrl+Alt+{name}"
+            );
+            assert!(!owned(name, M::SUPER_MASK, &pages), "Super+{name}");
+        }
+        assert!(!owned("t", M::MOD3_MASK, &pages));
+        for name in ["Tab", "F9", "Print", "XF86AudioRaiseVolume", "Insert"] {
+            assert!(!owned(name, none, &pages), "{name}");
+        }
+    }
+
+    #[test]
+    fn own_ctrl_and_alt_keys_exclude_the_other_modifiers() {
+        use gdk::ModifierType as M;
+        let pages = [Some('a'), Some('k'), None];
+        let ctrl = M::CONTROL_MASK;
+        for name in [
+            "h", "l", "j", "k", "n", "p", "0", "dollar", "a", "w", "b", "c", "v", "x",
+        ] {
+            assert!(owned(name, ctrl, &pages), "Ctrl+{name}");
+            assert!(
+                owned(name, ctrl | M::LOCK_MASK | M::MOD2_MASK, &pages),
+                "Ctrl+{name}"
+            );
+            assert!(!owned(name, ctrl | M::MOD1_MASK, &pages), "Ctrl+Alt+{name}");
+            assert!(
+                !owned(name, ctrl | M::SUPER_MASK, &pages),
+                "Ctrl+Super+{name}"
+            );
+        }
+        // Shift changes the character: Ctrl+Shift+4 is Ctrl+$, Ctrl+Shift+h
+        // is Ctrl+H, which ilia does not use.
+        assert!(owned("dollar", ctrl | M::SHIFT_MASK, &pages));
+        assert!(!owned("H", ctrl | M::SHIFT_MASK, &pages));
+        for name in ["q", "t", "z", "4"] {
+            assert!(!owned(name, ctrl, &pages), "Ctrl+{name}");
+        }
+        let alt = M::MOD1_MASK;
+        for name in ["plus", "minus", "a", "k", "A"] {
+            assert!(owned(name, alt, &pages), "Alt+{name}");
+            assert!(!owned(name, alt | ctrl, &pages), "Ctrl+Alt+{name}");
+            assert!(
+                !owned(name, alt | M::SUPER_MASK, &pages),
+                "Alt+Super+{name}"
+            );
+        }
+        // Only the letters of the pages loaded.
+        for name in ["c", "n", "w", "f", "l", "F9", "t"] {
+            assert!(!owned(name, alt, &pages), "Alt+{name}");
+        }
+        assert!(owned("l", alt, &[Some('l')]));
     }
 }
