@@ -59,6 +59,20 @@ keyboard layout. A socket that cannot be used is named once on standard
 error. The cases that list what ilia asked the window manager leave out
 these binding-state queries and subscriptions.
 
+`test_favourites.py` covers favourite applications and Ctrl+Enter
+(upstream #180, ported ahead of upstream). The memory settings backend
+cannot be read from outside, so the pins are read through the rows'
+order: Enter launches the first row once the filter is empty, and Down
+reaches the row below. Ctrl+f pins without editing the filter and again
+unpins; Alt+Up moves a pin ahead of the one above it; Alt+Down stores
+nothing while the filter has words. Ctrl+Enter (and Ctrl with the keypad
+Enter) asks the fake window manager for its workspaces, switches to the
+lowest free number (`2:web` takes 2) quoted as i3 or sway reads it, and
+starts the app only after the switch was answered; under i3 the name comes
+from an `xrdb` resource holding quotes and backslashes (skipped without
+`/usr/bin/xrdb`). With no row, or from the Help tab, Ctrl+Enter does
+nothing.
+
 `test_entries_read_early.py` checks that the entries read during
 start-up (upstream #162, read outside GLib in the port) keep what GLib's own
 entries give: `%k` is the desktop file, a `DBusActivatable=true` entry is

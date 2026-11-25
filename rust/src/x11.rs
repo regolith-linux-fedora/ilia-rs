@@ -1,8 +1,9 @@
 //! The few Xlib and XTEST calls the X11 key forwarding needs, behind a safe
 //! API: the modifier that carries Num Lock, and pressing a key again for the
-//! program that grabs it.
+//! program that grabs it. Also the display's X resource database.
 
-use std::os::raw::{c_int, c_uint, c_ulong, c_void};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 use std::ptr::NonNull;
 
 use glib::translate::ToGlibPtr;
@@ -15,10 +16,21 @@ const NUM_LOCK_KEYSYM: c_ulong = 0xff7f;
 /// Where Num Lock usually is, when the server does not say.
 const DEFAULT_NUMLOCK_MASK: u32 = 1 << 4;
 
+/// Xlib's predefined STRING atom.
+const XA_STRING: c_ulong = 31;
+/// The most of the RESOURCE_MANAGER property read, in 32-bit units.
+const RESOURCE_PROPERTY_LENGTH: c_long = 1 << 24;
+
 #[repr(C)]
 struct XModifierKeymap {
     max_keypermod: c_int,
     modifiermap: *mut u8,
+}
+
+#[repr(C)]
+struct XrmValue {
+    size: c_uint,
+    addr: *mut c_char,
 }
 
 // GDK's X11 backend, part of the GDK library already linked.
@@ -49,6 +61,33 @@ extern "C" {
     fn XGrabServer(display: *mut c_void) -> c_int;
     fn XUngrabServer(display: *mut c_void) -> c_int;
     fn XSync(display: *mut c_void, discard: c_int) -> c_int;
+    fn XInternAtom(display: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+    #[allow(clippy::too_many_arguments)]
+    fn XGetWindowProperty(
+        display: *mut c_void,
+        window: c_ulong,
+        property: c_ulong,
+        long_offset: c_long,
+        long_length: c_long,
+        delete: c_int,
+        req_type: c_ulong,
+        actual_type_return: *mut c_ulong,
+        actual_format_return: *mut c_int,
+        nitems_return: *mut c_ulong,
+        bytes_after_return: *mut c_ulong,
+        prop_return: *mut *mut c_uchar,
+    ) -> c_int;
+    fn XFree(data: *mut c_void) -> c_int;
+    fn XrmInitialize();
+    fn XrmGetStringDatabase(data: *const c_char) -> *mut c_void;
+    fn XrmGetResource(
+        database: *mut c_void,
+        name: *const c_char,
+        class: *const c_char,
+        type_return: *mut *mut c_char,
+        value_return: *mut XrmValue,
+    ) -> c_int;
+    fn XrmDestroyDatabase(database: *mut c_void);
 }
 
 #[link(name = "Xtst")]
@@ -166,6 +205,81 @@ impl X11Display {
             .is_some_and(|byte| byte & (1 << (code % 8)) != 0)
     }
 
+    /// The value of the resource `name` (such as `wm.workspace.03.name`) in
+    /// the display's resource database, the RESOURCE_MANAGER property of the
+    /// root window as it is now, which `xrdb` loads. `None` when the resource
+    /// is not set. The value is decoded as i3 decodes it, so a backslash that
+    /// starts no escape stays (`C:\work`).
+    pub fn resource(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        let text = self.resource_manager()?;
+        let text = CString::new(with_xcb_xrm_escapes(text.as_bytes())).ok()?;
+        // SAFETY: a NUL-terminated database text and resource name. The value
+        // points into the database, so it is copied before the database is
+        // destroyed, once.
+        unsafe {
+            XrmInitialize();
+            let database = NonNull::new(XrmGetStringDatabase(text.as_ptr()))?;
+            let mut kind: *mut c_char = std::ptr::null_mut();
+            let mut value = XrmValue {
+                size: 0,
+                addr: std::ptr::null_mut(),
+            };
+            let found = XrmGetResource(
+                database.as_ptr(),
+                name.as_ptr(),
+                name.as_ptr(),
+                &mut kind,
+                &mut value,
+            ) != 0;
+            let result = (found && !value.addr.is_null())
+                .then(|| CStr::from_ptr(value.addr).to_string_lossy().into_owned());
+            XrmDestroyDatabase(database.as_ptr());
+            result
+        }
+    }
+
+    /// The text of the root window's RESOURCE_MANAGER property.
+    fn resource_manager(&self) -> Option<CString> {
+        let xdisplay = self.xdisplay.as_ptr();
+        let (mut kind, mut format, mut items, mut after) = (0, 0, 0, 0);
+        let mut data: *mut c_uchar = std::ptr::null_mut();
+        // SAFETY: a valid connection, a NUL-terminated atom name and pointers
+        // to locals. The property data, NUL-terminated by Xlib and holding
+        // `items` bytes for format 8, is copied and freed once.
+        unsafe {
+            let atom = XInternAtom(xdisplay, c"RESOURCE_MANAGER".as_ptr(), 1);
+            if atom == 0 {
+                return None;
+            }
+            let status = XGetWindowProperty(
+                xdisplay,
+                XDefaultRootWindow(xdisplay),
+                atom,
+                0,
+                RESOURCE_PROPERTY_LENGTH,
+                0,
+                XA_STRING,
+                &mut kind,
+                &mut format,
+                &mut items,
+                &mut after,
+                &mut data,
+            );
+            let data = NonNull::new(data)?;
+            let text = (status == 0 && kind == XA_STRING && format == 8).then(|| {
+                let bytes = std::slice::from_raw_parts(data.as_ptr(), items as usize);
+                let end = bytes
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(bytes.len());
+                CString::new(&bytes[..end]).ok()
+            });
+            XFree(data.as_ptr().cast());
+            text.flatten()
+        }
+    }
+
     /// Presses and releases the key with code `keycode` through XTEST, as if
     /// typed, with the real modifiers `mods` held for it: a modifier already
     /// let go of is pressed again around the key, one still held stays as it
@@ -228,5 +342,107 @@ impl X11Display {
             gdk_x11_display_error_trap_pop_ignored(gdk_display);
         }
         Ok(())
+    }
+}
+
+/// The resource database text `text` rewritten so that Xlib decodes every
+/// value the way xcb-xrm, which i3 reads resources with, decodes it. Both
+/// take `\\`, `\n` and a three-digit octal escape, and a backslash ending a
+/// line continues the value on the next; but where Xlib drops a backslash
+/// before anything else, xcb-xrm keeps it. Such a backslash is doubled here.
+/// Comment (`!`) and directive (`#`) lines, and resource names, stay as
+/// they are.
+fn with_xcb_xrm_escapes(text: &[u8]) -> Vec<u8> {
+    let line_end = |from: usize| {
+        text[from..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(text.len(), |offset| from + offset + 1)
+    };
+    let mut rewritten = Vec::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let first = text[at..]
+            .iter()
+            .find(|&&byte| !matches!(byte, b' ' | b'\t'));
+        let colon = text[at..]
+            .iter()
+            .position(|&byte| matches!(byte, b':' | b'\n'))
+            .map(|offset| at + offset)
+            .filter(|&colon| text[colon] == b':');
+        let Some(colon) = colon.filter(|_| !matches!(first, Some(b'!' | b'#'))) else {
+            let end = line_end(at);
+            rewritten.extend_from_slice(&text[at..end]);
+            at = end;
+            continue;
+        };
+        rewritten.extend_from_slice(&text[at..=colon]);
+        at = colon + 1;
+        // The value, up to the first newline no backslash continues.
+        while let Some(&byte) = text.get(at) {
+            if byte != b'\\' {
+                rewritten.push(byte);
+                at += 1;
+                if byte == b'\n' {
+                    break;
+                }
+                continue;
+            }
+            let escape = match &text[at + 1..] {
+                [b'\\' | b'n' | b'\n', ..] => 2,
+                [a, b, c, ..] if [a, b, c].iter().all(|digit| (b'0'..=b'7').contains(digit)) => 4,
+                _ => {
+                    rewritten.extend_from_slice(b"\\\\");
+                    at += 1;
+                    continue;
+                }
+            };
+            rewritten.extend_from_slice(&text[at..at + escape]);
+            at += escape;
+        }
+    }
+    rewritten
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_xcb_xrm_escapes;
+
+    fn rewritten(text: &str) -> String {
+        String::from_utf8(with_xcb_xrm_escapes(text.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn backslashes_starting_no_escape_survive_xlib() {
+        assert_eq!(
+            rewritten("wm.workspace.03.name:\t3: C:\\work\n"),
+            "wm.workspace.03.name:\t3: C:\\\\work\n"
+        );
+        assert_eq!(rewritten("a:\tx\\ty\\x41\\\n"), "a:\tx\\\\ty\\\\x41\\\n");
+        assert_eq!(rewritten("a:\tend\\"), "a:\tend\\\\");
+        assert_eq!(rewritten("a:\t\\12x"), "a:\t\\\\12x");
+    }
+
+    #[test]
+    fn escapes_both_libraries_share_stay() {
+        let text = "a:\tback\\\\slash new\\nline \\101 \\777\n";
+        assert_eq!(rewritten(text), text);
+        assert_eq!(
+            rewritten("a:\tone\\\n\ttwo\\w\nb:\t\\w\n"),
+            "a:\tone\\\n\ttwo\\\\w\nb:\t\\\\w\n"
+        );
+    }
+
+    #[test]
+    fn names_comments_and_directives_stay() {
+        let text = "! C:\\w: x\n# include \"a\\b\"\nno colon \\w\nwm\\x.name:\tv\\w\n";
+        assert_eq!(
+            rewritten(text),
+            "! C:\\w: x\n# include \"a\\b\"\nno colon \\w\nwm\\x.name:\tv\\\\w\n"
+        );
+        assert_eq!(
+            rewritten("a:\t3: say \"hi\" $x\n"),
+            "a:\t3: say \"hi\" $x\n"
+        );
     }
 }

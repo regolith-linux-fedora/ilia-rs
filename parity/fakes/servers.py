@@ -84,6 +84,7 @@ def _read_exact(conn, size):
 
 
 RUN_COMMAND = 0
+GET_WORKSPACES = 1
 SUBSCRIBE = 2
 GET_CONFIG = 9
 GET_BINDING_STATE = 12

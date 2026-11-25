@@ -16,8 +16,8 @@ Keybindings page (libxkbcommon is linked; GTK already depends on it),
 `setlocale` in `application.rs` before the desktop files are read, GLib's
 search tokenizer in `entries.rs`, which gtk-rs does not wrap, the
 hand-over of the entries read on worker threads in `apps.rs`, and the Xlib
-and XTEST calls in `x11.rs` that pass the desktop's keys on (libX11 and
-libXtst are linked).
+and XTEST calls in `x11.rs` that pass the desktop's keys on and read the
+display's resource database (libX11 and libXtst are linked).
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
@@ -82,6 +82,15 @@ Module map:
   otherwise.
 - `xkb.rs`: the key a key code gives in a layout, from libxkbcommon, for
   sway's configured keymap.
+- `new_workspace.rs`: Ctrl+Enter on the Applications page. The next free
+  workspace number comes from GET_WORKSPACES (`ipc.rs`), its name from the
+  `wm.workspace.NN.name` resource (under X11 the root window's resource
+  database, read in `x11.rs` and decoded as i3 decodes it; under sway the
+  resource service, as `keybindings.rs` reads it), and the switch command
+  quotes the name so that i3 or sway reads it back verbatim. The page
+  starts the app once the window manager has answered the switch. The
+  favourites themselves (`favorite-apps`, Ctrl+f, Alt+Up/Alt+Down, the star
+  column and their place in the order) live in `apps.rs`.
 - `page_files.rs`: pages defined in key files (`ilia/pages/*.page` under
   the XDG configuration directories): discovery, precedence and parsing.
   Their pages live in `apps.rs` (`Apps` rows, launched like the

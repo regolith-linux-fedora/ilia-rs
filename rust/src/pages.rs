@@ -66,6 +66,11 @@ pub trait DialogPage {
     fn edits_with_arrow_keys(&self) -> bool {
         false
     }
+    /// Whether the page is starting an app and closes the window itself
+    /// once it has: losing the keyboard focus meanwhile does not close it.
+    fn is_launching(&self) -> bool {
+        false
+    }
 }
 
 impl DialogPage for Page {
@@ -99,7 +104,7 @@ impl DialogPage for Page {
 }
 
 pub const PAGES: &[Page] = &[
-    Page { id: "apps", name: "<u>A</u>pplications", icon: "view-app-grid-symbolic", key: 'a', help: "This dialog allows for the launching of desktop applications. Initially all desktop apps are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it.", bindings: &[("enter", "Launch Application"), ("ctrl+=", "Add Application"), ("ctrl+shift+c", "Copy Program Path"), ("ctrl+delete", "Hide Application"), ("ctrl+z", "Undo Hide")] },
+    Page { id: "apps", name: "<u>A</u>pplications", icon: "view-app-grid-symbolic", key: 'a', help: "This dialog allows for the launching of desktop applications. Initially all desktop apps are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it.", bindings: &[("enter", "Launch Application"), ("ctrl+=", "Add Application"), ("ctrl+shift+c", "Copy Program Path"), ("ctrl+delete", "Hide Application"), ("ctrl+z", "Undo Hide"), ("ctrl+f", "Add or Remove Favorite"), ("alt+up", "Move Favorite Up"), ("alt+down", "Move Favorite Down"), ("ctrl+enter", "Launch on a New Workspace")] },
     Page { id: "terminal", name: "<u>C</u>ommands", icon: "utilities-terminal", key: 'c', help: "This dialog allows for the executing commands on the user path. Initially all commands are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will launch it. If no item matches, enter runs the typed command line, including any arguments.", bindings: &[("enter", "Execute Command")] },
     Page { id: "notifications", name: "<u>N</u>otifications", icon: "mail-message-new", key: 'n', help: "This dialog manages desktop notifications. Initially all desktop apps are presented. The user may filter the list in the top text box.", bindings: &[("del", "Delete Notification"), ("shift del", "Delete All Notifications")] },
     Page { id: "keybindings", name: "<u>K</u>eybindings", icon: "input-keyboard", key: 'k', help: "This dialog allows for viewing desktop keybindings. Initially all keybindings are presented. The user may filter the list in the top text box. The arrow keys may be used to select from the list, and enter or clicking on an item will perform the keybinding action.", bindings: &[("enter", "Invoke Keybinding")] },
@@ -311,7 +316,7 @@ pub fn create(
     is_wayland: bool,
 ) -> Rc<dyn DialogPage> {
     match page.id {
-        "apps" => ApplicationsPage::new(settings.clone(), entry.clone(), quit),
+        "apps" => ApplicationsPage::new(settings.clone(), entry.clone(), wm_name, quit),
         "terminal" => Rc::new(CommandPage::new(entry.clone(), args.has("-q"), quit)),
         "keybindings" => Rc::new(KeybindingsPage::new(
             settings.clone(),

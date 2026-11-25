@@ -759,7 +759,7 @@ fn unquote(word: &str) -> &str {
 /// The values `set_from_resource` reads under sway: those of the desktop's
 /// resource service on the session bus. Empty when the service is not
 /// running, in which case every `set_from_resource` takes its default.
-fn service_resources() -> HashMap<String, String> {
+pub fn service_resources() -> HashMap<String, String> {
     gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
         .and_then(|bus| {
             bus.call_sync(

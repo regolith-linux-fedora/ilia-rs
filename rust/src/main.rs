@@ -13,6 +13,7 @@ mod ipc;
 mod keybindings;
 mod launch;
 mod new_entry;
+mod new_workspace;
 mod notifications;
 mod page_files;
 mod pages;

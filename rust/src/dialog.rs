@@ -405,6 +405,18 @@ pub fn build(
                 change_size(window, &settings_for_key, -128, is_wayland);
                 return glib::Propagation::Stop;
             }
+            // The page's own Alt keys on its list, such as moving a
+            // favorite, before the arrows move the highlight.
+            if matches!(
+                key,
+                gdk::keys::constants::Up
+                    | gdk::keys::constants::Down
+                    | gdk::keys::constants::KP_Up
+                    | gdk::keys::constants::KP_Down
+            ) && pages_for_key[active_for_key.get()].key_event(event)
+            {
+                return glib::Propagation::Stop;
+            }
         } else if state.contains(gdk::ModifierType::CONTROL_MASK) {
             if let Some(handled) = entry_editing(
                 &entry_for_key,
@@ -504,12 +516,19 @@ pub fn build(
     let app_for_focus = app.clone();
     let window_for_focus = window.clone();
     let seat_for_focus = seat.clone();
+    let pages_for_focus = pages.clone();
+    let active_for_focus = active_page.clone();
     window.connect_focus_out_event(move |window, _| {
         // Removing the seat's last keyboard (one wtype run, a virtual or
         // Bluetooth keyboard going away) also takes the keyboard focus on
         // Wayland, though it went nowhere; the next keyboard to appear
         // focuses ilia again.
         if is_wayland && !seat_has_keyboard(window) {
+            return glib::Propagation::Proceed;
+        }
+        // A switch to another workspace for the launch can take the focus
+        // under sway; the page closes the window once the app has started.
+        if pages_for_focus[active_for_focus.get()].is_launching() {
             return glib::Propagation::Proceed;
         }
         quit(&window_for_focus, &app_for_focus, &seat_for_focus);

@@ -105,6 +105,9 @@ commit.
 Then the rest of #171 (window-manager and desktop keys while ilia is open)
 in one commit.
 
+Then the open upstream pull request #180 (favourite applications, and
+Ctrl+Enter on the next free workspace) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -201,12 +204,30 @@ option), nesting is refused beyond 1000 levels (Vala: 100), the helper has
 no 10 s alarm of its own (ilia kills it after three seconds, and it dies
 with ilia), a part with no value (`0*(1.5!)`, `(-3)!^0`) leaves the whole
 expression without one, and with `-a` each page keeps its own entry text
-(see below).
+(see below); #180 favourite applications on the Applications page
+(`favorite-apps`): Ctrl+f pins the highlighted app at the end of the list
+or unpins it, pinned apps come first in their stored order and lead each
+group of matches when text is typed, a ★ cell follows their names, Alt+Up
+and Alt+Down move a pinned app past the pinned app shown above or below it
+while the filter is empty, and changes another program makes apply while
+ilia runs; Ctrl+Enter (or Ctrl with the keypad Enter) switches the window
+manager to the next free workspace, named by its `wm.workspace.NN.name`
+resource, and starts the app there once the switch is confirmed (see
+[Desktop Apps](#desktop-apps)). The port differs from that pull request in
+a few places: a switch that fails starts nothing and leaves the window open
+(the Vala change starts the app on the current workspace); Ctrl+Enter
+pressed before the list arrives acts once it has, as Enter does; Ctrl+f and
+Ctrl+Enter do nothing from the Help tab; under X11 the resource is read
+from the root window's `RESOURCE_MANAGER` as it is at the key press and
+decoded as i3 decodes it, so a backslash that starts no escape stays (the
+Vala change takes Xlib's copy from when the display was opened, decoded by
+Xlib); and under sway a name holding both quote kinds, a backslash before a
+quote, or `$` reaches sway verbatim (sway expands variables in commands).
 
 **Not yet ported** (open items):
 
 - Open upstream PRs that will likely land: #164 (notification actions)
-  and #173 (desktop-entry actions). #172, #174, #181 and #184 are already
+  and #173 (desktop-entry actions). #172, #174, #180, #181 and #184 are already
   in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
@@ -365,6 +386,16 @@ The new application is listed and highlighted at once. Escape or Cancel closes t
 
 The same line under the list shows where the highlighted app's program is on disk, as its `Exec` line finds it on `PATH` (through `env`, with the target of a symbolic link after `→`), or `D-Bus: ` and the bus name for an entry started over the session bus. It follows the highlight and changes on disk while ilia is open. Ctrl+Shift+C copies that path, and the copy stays on the clipboard after ilia closes: an X11 clipboard manager takes it, and without one ilia keeps running without a window until something else is copied. The path has the style class `app_path`.
 
+Ctrl+f pins the highlighted application, or unpins it; pinned applications have a ★ after their name.
+With an empty filter they come first, in the order of the `favorite-apps` setting, and the other applications follow by launch count.
+With text typed, the groups of matches keep their order and pinned applications lead within each group, so an application whose name starts with the text still comes before a pinned one found through a keyword.
+While the filter is empty, Alt+Up moves the highlighted pinned application before the pinned one shown above it, and Alt+Down after the one shown below it.
+Changes another program makes to `favorite-apps` (`gsettings set`, dconf-editor) show at once.
+
+Ctrl+Enter (or Ctrl with the keypad Enter) opens the highlighted application on the next free workspace: the lowest positive number no workspace has, where a name such as `2:web` takes 2.
+The workspace is named by the resource `wm.workspace.NN.name` (`NN` the number with at least two digits) when it is set and not empty, read from the X resource database under i3 and from trawl under sway, and is the number otherwise.
+ilia switches to the workspace, waits for the window manager to confirm, and then starts the application as Enter does.
+
 #### Text List
 
 The `textlist` page is a bit different than the others pages.
@@ -452,8 +483,11 @@ Ilia supports the following configuration via gsettings under the namespace `org
   never listed; an entry starting with `!` lists again what it matches.
   Ctrl+Delete on the Applications page adds the highlighted app, Ctrl+z
   takes it out again (default `[]`)
+- favorite-apps: desktop ids of the applications pinned at the head of the
+  Applications page, in their order. Ctrl+f adds or removes the highlighted
+  app, Alt+Up and Alt+Down move it (default `[]`)
 
-Changes to these three keys apply while ilia runs.
+Changes to these four keys apply while ilia runs.
 
 #### Example: Resetting screen width
 

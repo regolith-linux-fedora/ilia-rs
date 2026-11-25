@@ -57,5 +57,12 @@
         Desktop file ids of applications never listed on the applications page, for example "org.gnome.Seahorse.Application.desktop". An entry may be a pattern, in which * stands for any run of characters and ? for exactly one character. An entry starting with ! lists again what the rest of it matches; when several entries match an id, the last one decides. Changes apply while the launcher runs. Ctrl+Delete on the applications page adds the highlighted application's id at the end, and Ctrl+z takes the latest id it added out again.
       </description>
     </key>
+    <key name="favorite-apps" type="as">
+      <default>[]</default>
+      <summary>Favorite applications</summary>
+      <description>
+        Desktop file ids of the applications listed first on the applications page, in this order, each marked with a star. With filter text they lead within each group of matches. Ids of applications that are not listed stay here but are not shown. Changes apply while the launcher runs. Ctrl+f on the applications page adds the highlighted application at the end or takes it out, and Alt+Up and Alt+Down move it among the favorites shown.
+      </description>
+    </key>
 	</schema>
 </schemalist>

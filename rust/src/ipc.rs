@@ -11,6 +11,7 @@ const IPC_MAGIC: &[u8; 6] = b"i3-ipc";
 const HEADER_SIZE: usize = 14;
 
 pub const RUN_COMMAND: u32 = 0;
+pub const GET_WORKSPACES: u32 = 1;
 pub const SUBSCRIBE: u32 = 2;
 pub const GET_TREE: u32 = 4;
 pub const GET_VERSION: u32 = 7;
@@ -1079,6 +1080,20 @@ pub fn run_command(wm_name: &str, command: &str) -> Result<(), String> {
     command_outcome(&request(wm_name, RUN_COMMAND, command)?)
 }
 
+/// The names of the workspaces the window manager knows about, on every
+/// output, empty ones included.
+pub fn get_workspace_names(wm_name: &str) -> Result<Vec<String>, String> {
+    workspace_names_from_reply(&request(wm_name, GET_WORKSPACES, "")?)
+}
+
+fn workspace_names_from_reply(reply: &Json) -> Result<Vec<String>, String> {
+    reply
+        .array()?
+        .iter()
+        .map(|workspace| Ok(member(workspace.object()?, "name")?.string()?.to_owned()))
+        .collect()
+}
+
 /// The outcome of a run request. The reply holds one result per command
 /// run, and a failed one says why.
 fn command_outcome(reply: &Json) -> Result<(), String> {
@@ -1183,8 +1198,8 @@ mod tests {
     use super::{
         command_outcome, config_from_reply, encode_request, expand_glob, expand_path_vars,
         include_paths, read_config_files, read_reply, replace_i3_variables, socket_path,
-        split_words, version_from_reply, wildcard_matches, Config, JsonParser, TreeReply,
-        IPC_MAGIC, RUN_COMMAND,
+        split_words, version_from_reply, wildcard_matches, workspace_names_from_reply, Config,
+        JsonParser, TreeReply, IPC_MAGIC, RUN_COMMAND,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1390,6 +1405,23 @@ mod tests {
             Err("unknown error".to_owned())
         );
         assert!(outcome(br#"{"success":true}"#).is_err());
+    }
+
+    #[test]
+    fn workspace_names_come_from_every_workspace_reported() {
+        let names =
+            |reply: &[u8]| workspace_names_from_reply(&JsonParser::new(reply).parse().unwrap());
+        assert_eq!(
+            names(
+                br#"[{"num":1,"name":"1","focused":false},
+                     {"num":2,"name":"2:web","focused":true,"output":"HDMI-1"},
+                     {"num":-1,"name":"music","focused":false}]"#
+            ),
+            Ok(vec!["1".to_owned(), "2:web".to_owned(), "music".to_owned()])
+        );
+        assert_eq!(names(b"[]"), Ok(Vec::new()));
+        assert!(names(br#"[{"num":1}]"#).is_err());
+        assert!(names(br#"{"name":"1"}"#).is_err());
     }
 
     #[test]

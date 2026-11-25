@@ -17,6 +17,7 @@ use crate::entries::{self, Delivery, DesktopEntry};
 use crate::filter::{fold_text, query_words, summed_span, words_in_fields};
 use crate::keybindings::navigate;
 use crate::launch::launch_desktop_app;
+use crate::new_workspace;
 use crate::page_files::{PageFile, Rows};
 use crate::pages::{
     is_enter_key, rebuild_keeping_selection, select_first_row, select_row_near, DialogPage,
@@ -29,11 +30,16 @@ const NAME: u32 = 1;
 const APP_INFO: u32 = 2;
 // The index of the row's app in the page's `AppList`.
 const INDEX: u32 = 3;
+// On the Applications page: the star of a favorite, empty for other apps.
+const FAVORITE: u32 = 4;
+/// The mark of a favorite's row, in a cell of its own after the name.
+const STAR: &str = "\u{2605}";
 const HISTORY_MAX_LEN: usize = 32;
 /// The launch history the pages share: desktop ids, and the choices on page
 /// files ordered by frequency.
 pub const LAUNCH_HISTORY: &str = "app-launch-counts";
 const HIDDEN_APPS: &str = "hidden-apps";
+const FAVORITE_APPS: &str = "favorite-apps";
 const MATCH_FIELDS: &str = "match-fields";
 // How often the path strip is worked out again while the page is shown, so
 // that it follows changes to the files it names.
@@ -203,21 +209,37 @@ pub struct ApplicationsPage {
     apps: Rc<AppList>,
     // Set once the desktop entries are in the model.
     apps_loaded: Cell<bool>,
-    // The search text of the first Enter pressed before the list arrived:
-    // its best match is launched once the list has.
-    pending_enter: RefCell<Option<String>>,
+    // The search text of the first Enter or Ctrl+Enter pressed before the
+    // list arrived, and where to launch: its best match is launched once the
+    // list has.
+    pending_enter: RefCell<Option<(String, Workspace)>>,
     // Decodes the icons of rows added after the list arrived.
     icon_loader: RefCell<Option<Rc<IconLoader>>>,
     // The desktop ids this run's Ctrl+Delete hides appended to
     // `hidden-apps`, latest last, less those Ctrl+z has reversed.
     hides: RefCell<Vec<String>>,
     quit: Rc<dyn Fn()>,
+    // The window manager Ctrl+Enter asks for a new workspace.
+    wm_name: String,
     // An app was started: ilia is closing. A click can activate a row twice.
     launched: Cell<bool>,
 }
 
+/// Where an app is launched: on the workspace shown (Enter), or on the next
+/// free one (Ctrl+Enter).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Workspace {
+    Current,
+    NextFree,
+}
+
 impl ApplicationsPage {
-    pub fn new(settings: gio::Settings, entry: gtk::Entry, quit: Rc<dyn Fn()>) -> Rc<Self> {
+    pub fn new(
+        settings: gio::Settings,
+        entry: gtk::Entry,
+        wm_name: &str,
+        quit: Rc<dyn Fn()>,
+    ) -> Rc<Self> {
         let launch_history: Vec<String> = settings
             .strv(LAUNCH_HISTORY)
             .iter()
@@ -234,6 +256,7 @@ impl ApplicationsPage {
             String::static_type(),
             gio::DesktopAppInfo::static_type(),
             u32::static_type(),
+            String::static_type(),
         ]);
         // The rows come once the desktop entries have been read (see
         // `finish_loading`); the window is built and shown in the meantime.
@@ -247,7 +270,7 @@ impl ApplicationsPage {
         install_sort(&model, &apps);
         model.set_sort_column_id(gtk::SortColumn::Index(NAME), gtk::SortType::Ascending);
 
-        let (view, scrolled) = app_view(&filter, icon_size);
+        let (view, scrolled) = app_view(&filter, icon_size, true);
 
         // The form covers the list while it is shown; the list stays as it
         // is underneath.
@@ -290,6 +313,7 @@ impl ApplicationsPage {
             icon_loader: RefCell::default(),
             hides: RefCell::default(),
             quit,
+            wm_name: wm_name.to_owned(),
             launched: Cell::new(false),
         });
         page.connect_activation();
@@ -335,10 +359,13 @@ impl ApplicationsPage {
         // That Enter acts once, on this list, for the text typed before it,
         // whatever the search box holds now. When nothing matches that text
         // nothing is started and the window stays open.
-        let pending = self.pending_enter.take();
-        if let Some(index) = pending.and_then(|text| self.apps.best_match(&text)) {
-            if let Some(app) = self.app_at(index) {
-                self.execute(&app);
+        if let Some((text, workspace)) = self.pending_enter.take() {
+            if let Some(app) = self
+                .apps
+                .best_match(&text)
+                .and_then(|index| self.app_at(index))
+            {
+                self.execute_on(&app, workspace);
             }
         }
 
@@ -384,7 +411,9 @@ impl ApplicationsPage {
     ) -> gtk::TreeIter {
         let launches = self.launch_counts.get(&id).copied().unwrap_or_default();
         let index = self.apps.push(App::new(id, desktop, launches));
-        insert_row(&self.model, desktop, index, blank)
+        let row = insert_row(&self.model, desktop, index, blank);
+        set_star(&self.model, &row, self.apps.is_favorite(index));
+        row
     }
 
     /// The app of the row whose INDEX is `index`.
@@ -407,12 +436,13 @@ impl ApplicationsPage {
         !self.apps_loaded.get() && self.view.selection().selected().is_none()
     }
 
-    /// Enter before the list arrived: keeps the search text of the first
-    /// such Enter for when the list arrives.
-    fn defer_activation(&self) {
+    /// Enter or Ctrl+Enter before the list arrived: keeps the search text
+    /// of the first such key, and where it launches, for when the list
+    /// arrives.
+    fn defer_activation(&self, workspace: Workspace) {
         let mut pending = self.pending_enter.borrow_mut();
         if pending.is_none() {
-            *pending = Some(self.entry.text().to_string());
+            *pending = Some((self.entry.text().to_string(), workspace));
         }
     }
 
@@ -601,6 +631,7 @@ impl ApplicationsPage {
             index,
             blank_icon(self.icon_size).as_ref(),
         );
+        set_star(&self.model, &row, self.apps.is_favorite(index));
         if let Some(icon) = gtk::IconTheme::default()
             .filter(|_| self.icon_size > 0)
             .and_then(|theme| load_icon(&theme, &desktop, self.icon_size))
@@ -643,18 +674,37 @@ impl ApplicationsPage {
         );
     }
 
+    /// Launches `app` on `workspace`. For the next free workspace the window
+    /// manager switches to it first, and the app is started as Enter starts
+    /// it once the switch is confirmed. When the switch fails nothing is
+    /// started and the window stays open.
+    fn execute_on(&self, app: &gio::DesktopAppInfo, workspace: Workspace) {
+        if workspace == Workspace::NextFree {
+            if self.launched.get() {
+                return;
+            }
+            if let Err(error) = new_workspace::switch_to_next_free(&self.wm_name) {
+                eprintln!("Failed to open a new workspace: {error}");
+                return;
+            }
+        }
+        self.execute(app);
+    }
+
     /// Highlights the first row: the best match for the text typed.
     fn set_selection(&self) {
         self.view.selection().set_mode(gtk::SelectionMode::Single);
         select_first_row(&self.view);
     }
 
-    fn execute_selected(&self) {
+    /// Launches the highlighted app on `workspace`; with no row highlighted
+    /// nothing happens.
+    fn execute_selected(&self, workspace: Workspace) {
         let Some((model, iter)) = self.view.selection().selected() else {
             return;
         };
         if let Some(app) = app_value(&model, &iter) {
-            self.execute(&app);
+            self.execute_on(&app, workspace);
         }
     }
 
@@ -693,11 +743,12 @@ impl ApplicationsPage {
     }
 
     /// Applies changes another program makes to `fuzzy-matching`,
-    /// `match-fields` and `hidden-apps` while the launcher runs: the rows are
-    /// matched, grouped and sorted again for the same filter text, keeping
-    /// the highlighted app (see [`rebuild_keeping_selection`]).
+    /// `match-fields`, `hidden-apps` and `favorite-apps` while the launcher
+    /// runs: the rows are matched, grouped, starred and sorted again for the
+    /// same filter text, keeping the highlighted app (see
+    /// [`rebuild_keeping_selection`]).
     fn follow_settings(&self) {
-        for key in [FUZZY_MATCHING, MATCH_FIELDS, HIDDEN_APPS] {
+        for key in [FUZZY_MATCHING, MATCH_FIELDS, HIDDEN_APPS, FAVORITE_APPS] {
             let (apps, model, filter, view) = (
                 self.apps.clone(),
                 self.model.clone(),
@@ -706,12 +757,13 @@ impl ApplicationsPage {
             );
             self.settings
                 .connect_changed(Some(key), move |settings, _| {
-                    // The page's own Ctrl+Delete and Ctrl+z writes are applied
-                    // already.
+                    // The page's own Ctrl+Delete, Ctrl+z, Ctrl+f, Alt+Up and
+                    // Alt+Down writes are applied already.
                     let settings = AppSettings::read(settings);
                     if apps.settings() != settings {
                         rebuild_keeping_selection(&view, &filter, || {
                             apps.apply_settings(settings);
+                            update_stars(&model, &apps);
                             install_sort(&model, &apps);
                             filter.refilter();
                         });
@@ -809,6 +861,70 @@ impl ApplicationsPage {
                 .then(|| gtk::TreePath::from_indicesv(&[row]))
         })
     }
+
+    /// The desktop id of the highlighted app, or `None` when no row is
+    /// highlighted.
+    fn selected_id(&self) -> Option<String> {
+        let (model, iter) = self.view.selection().selected()?;
+        Some(self.apps.id(index_value(&model, &iter)))
+    }
+
+    /// The `favorite-apps` setting as stored now.
+    fn stored_favorites(&self) -> Vec<String> {
+        self.settings
+            .strv(FAVORITE_APPS)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Applies the `favorite-apps` entries `favorites` to the rows, keeping
+    /// the highlighted app, then stores them. Applied before it is written,
+    /// the change notification for the write finds nothing new to apply.
+    fn store_favorites(&self, favorites: Vec<String>) {
+        rebuild_keeping_selection(&self.view, &self.filter, || {
+            self.apps.apply_settings(AppSettings {
+                favorites: favorites.clone(),
+                ..self.apps.settings()
+            });
+            update_stars(&self.model, &self.apps);
+            install_sort(&self.model, &self.apps);
+            self.filter.refilter();
+        });
+        match self.settings.set_strv(FAVORITE_APPS, favorites) {
+            Ok(()) => gio::Settings::sync(),
+            Err(error) => eprintln!("Failed to change the favorite applications: {error}"),
+        }
+    }
+
+    /// Ctrl+f: makes the highlighted app a favorite, after the others, or
+    /// takes every entry of it out of the favorites, in the setting as
+    /// stored now. Nothing is written when no row is highlighted.
+    fn toggle_favorite(&self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.store_favorites(toggled_favorite(self.stored_favorites(), &id));
+    }
+
+    /// Alt+Up and Alt+Down: moves the highlighted favorite ahead of the
+    /// favorite shown above it, or behind the one shown below it, while the
+    /// filter text has no words. Nothing is written for the first or last
+    /// favorite shown, nor for an app that is not a favorite.
+    fn move_favorite(&self, direction: Direction) {
+        if self.apps.has_words() {
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let moved = moved_favorite(self.stored_favorites(), &id, direction, |id| {
+            self.apps.is_shown(id)
+        });
+        if let Some(favorites) = moved {
+            self.store_favorites(favorites);
+        }
+    }
 }
 
 impl DialogPage for ApplicationsPage {
@@ -828,10 +944,10 @@ impl DialogPage for ApplicationsPage {
 
     fn on_entry_activated(&self) {
         if self.waits_for_list() {
-            self.defer_activation();
+            self.defer_activation(Workspace::Current);
             return;
         }
-        self.execute_selected();
+        self.execute_selected(Workspace::Current);
     }
 
     fn get_id(&self) -> &'static str {
@@ -857,14 +973,45 @@ impl DialogPage for ApplicationsPage {
             ("ctrl+shift+c", "Copy Program Path"),
             ("ctrl+delete", "Hide Application"),
             ("ctrl+z", "Undo Hide"),
+            ("ctrl+f", "Add or Remove Favorite"),
+            ("alt+up", "Move Favorite Up"),
+            ("alt+down", "Move Favorite Down"),
+            ("ctrl+enter", "Launch on a New Workspace"),
         ]
         .into_iter()
         .collect()
     }
 
     fn key_event(&self, event: &gdk::EventKey) -> bool {
+        if is_new_workspace_key(event) {
+            // Taken with no row too, and from the Help tab, where the filter
+            // is off as for Enter: nothing is launched then.
+            if !self.root.is_mapped() {
+                return true;
+            }
+            if self.waits_for_list() {
+                self.defer_activation(Workspace::NextFree);
+            } else {
+                self.execute_selected(Workspace::NextFree);
+            }
+            return true;
+        }
         if is_enter_key(&event.keyval()) && self.waits_for_list() {
-            self.defer_activation();
+            self.defer_activation(Workspace::Current);
+            return true;
+        }
+        // Ctrl+f is always taken; it pins or unpins only while the page is
+        // shown, and does nothing from the Help tab.
+        if is_favorite_key(event) {
+            if self.root.is_mapped() {
+                // Never edits the filter text, with no row highlighted either.
+                self.toggle_favorite();
+            }
+            return true;
+        }
+        if let Some(direction) = favorite_move_key(event).filter(|_| self.root.is_mapped()) {
+            // Never moves the highlight, even where it moves no favorite.
+            self.move_favorite(direction);
             return true;
         }
         if is_add_app_shortcut(event) {
@@ -911,7 +1058,10 @@ impl DialogPage for ApplicationsPage {
             && !event
                 .state()
                 .intersects(gdk::ModifierType::MOD1_MASK | gdk::ModifierType::SUPER_MASK);
-        (is_copy_program_path_key(event) && self.root.is_mapped())
+        // Ctrl+f also from the Help tab, where it does nothing, so that it
+        // never reaches the window manager.
+        is_favorite_key(event)
+            || (is_copy_program_path_key(event) && self.root.is_mapped())
             || (ctrl_only
                 && (is_add_app_shortcut(event) || event.keyval() == gdk::keys::constants::z))
     }
@@ -922,6 +1072,10 @@ impl DialogPage for ApplicationsPage {
         } else {
             self.view.grab_focus();
         }
+    }
+
+    fn is_launching(&self) -> bool {
+        self.launched.get()
     }
 }
 
@@ -965,6 +1119,36 @@ fn add_app_button() -> gtk::EventBox {
         accessible.set_name("Add application");
     }
     button
+}
+
+/// The modifiers of a key press that select a shortcut: Shift, Control,
+/// Alt and Super, whatever the state of Caps Lock and Num Lock.
+fn shortcut_modifiers(event: &gdk::EventKey) -> gdk::ModifierType {
+    event.state() & gtk::accelerator_get_default_mod_mask()
+}
+
+/// Ctrl+Enter, and Ctrl with the keypad Enter: launch on the next free
+/// workspace.
+fn is_new_workspace_key(event: &gdk::EventKey) -> bool {
+    shortcut_modifiers(event) == gdk::ModifierType::CONTROL_MASK && is_enter_key(&event.keyval())
+}
+
+/// Ctrl+f, whatever the state of Caps Lock: pin or unpin.
+fn is_favorite_key(event: &gdk::EventKey) -> bool {
+    shortcut_modifiers(event) == gdk::ModifierType::CONTROL_MASK
+        && event.keyval().to_lower() == gdk::keys::constants::f
+}
+
+/// Alt+Up and Alt+Down, the keypad's arrows too: move a favorite.
+fn favorite_move_key(event: &gdk::EventKey) -> Option<Direction> {
+    if shortcut_modifiers(event) != gdk::ModifierType::MOD1_MASK {
+        return None;
+    }
+    match event.keyval() {
+        gdk::keys::constants::Up | gdk::keys::constants::KP_Up => Some(Direction::Up),
+        gdk::keys::constants::Down | gdk::keys::constants::KP_Down => Some(Direction::Down),
+        _ => None,
+    }
 }
 
 /// Ctrl and the key bearing + on a US layout, shifted or not, or the
@@ -1110,7 +1294,7 @@ impl AppListPage {
         filter.set_visible_func(move |tree_model, iter| {
             rows_for_filter.is_listed(index_value(tree_model, iter))
         });
-        let (view, root) = app_view(&filter, icon_size);
+        let (view, root) = app_view(&filter, icon_size, false);
 
         let page = Self {
             id: file.id.clone(),
@@ -1225,8 +1409,13 @@ impl DialogPage for AppListPage {
 }
 
 /// A list of apps showing the rows of `filter`, and the scrolled window
-/// holding it.
-fn app_view(filter: &gtk::TreeModelFilter, icon_size: i32) -> (gtk::TreeView, gtk::Widget) {
+/// holding it. With `stars`, a cell after the name shows the FAVORITE
+/// column.
+fn app_view(
+    filter: &gtk::TreeModelFilter,
+    icon_size: i32,
+    stars: bool,
+) -> (gtk::TreeView, gtk::Widget) {
     let view = gtk::TreeView::with_model(filter);
     view.style_context().add_class("item_view");
     view.set_headers_visible(false);
@@ -1244,6 +1433,21 @@ fn app_view(filter: &gtk::TreeModelFilter, icon_size: i32) -> (gtk::TreeView, gt
     let column = gtk::TreeViewColumn::with_attributes("Name", &renderer, &[("text", NAME as i32)]);
     column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
     view.append_column(&column);
+    if stars {
+        // The name takes the width the star leaves.
+        column.set_expand(true);
+        let renderer = gtk::CellRendererText::new();
+        renderer.set_xalign(0.5);
+        let column = gtk::TreeViewColumn::with_attributes(
+            "Favorite",
+            &renderer,
+            &[("text", FAVORITE as i32)],
+        );
+        column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+        let (star_width, _) = view.create_pango_layout(Some(STAR)).pixel_size();
+        column.set_fixed_width(star_width + 4 * renderer.xpad() as i32);
+        view.append_column(&column);
+    }
     view.set_activate_on_single_click(true);
 
     let scrolled = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
@@ -1333,6 +1537,38 @@ fn insert_row(
         values.push((ICON, blank));
     }
     model.insert_with_values(None, &values)
+}
+
+/// Shows the star in the FAVORITE column of `row` when `favorite`, and
+/// nothing otherwise. Only a change is written: every write announces the
+/// row as changed.
+fn set_star(model: &gtk::ListStore, row: &gtk::TreeIter, favorite: bool) {
+    let star = if favorite { STAR } else { "" };
+    let shown = model
+        .value(row, FAVORITE as i32)
+        .get::<String>()
+        .unwrap_or_default();
+    if shown != star {
+        model.set(row, &[(FAVORITE, &star)]);
+    }
+}
+
+/// Stars the rows of the favorites in `apps`, and only them.
+fn update_stars(model: &gtk::ListStore, apps: &AppList) {
+    // Collected first: a row whose value changes may move in the sorted
+    // model, and GtkListStore iterators last across moves.
+    let mut rows = Vec::new();
+    if let Some(iter) = model.iter_first() {
+        loop {
+            rows.push(iter);
+            if !model.iter_next(&iter) {
+                break;
+            }
+        }
+    }
+    for row in rows {
+        set_star(model, &row, apps.is_favorite(index_value(model, &row)));
+    }
 }
 
 fn install_sort(model: &gtk::ListStore, apps: &Rc<AppList>) {
@@ -1569,6 +1805,17 @@ enum AppTier {
     Subsequence(usize),
 }
 
+impl AppTier {
+    /// The group of matches the tier belongs to: the tier itself, or one
+    /// group for every subsequence match, whatever its span.
+    fn group(self) -> Self {
+        match self {
+            Self::Subsequence(_) => Self::Subsequence(0),
+            tier => tier,
+        }
+    }
+}
+
 /// An app on the page.
 #[derive(Debug)]
 struct App {
@@ -1597,12 +1844,16 @@ impl App {
     }
 }
 
-/// The settings that decide which apps are listed and how they match.
+/// The settings that decide which apps are listed, how they match, and
+/// which come first.
 #[derive(Clone, Debug, PartialEq)]
 struct AppSettings {
     subsequence: bool,
     fields: MatchFields,
     hidden: Vec<String>,
+    // Desktop ids, in favorite order. Repeats and ids of apps not listed
+    // may be among them.
+    favorites: Vec<String>,
 }
 
 impl AppSettings {
@@ -1617,16 +1868,81 @@ impl AppSettings {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            favorites: settings
+                .strv(FAVORITE_APPS)
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }
 
+/// The two ways Alt+Up and Alt+Down move a favorite.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Direction {
+    Up,
+    Down,
+}
+
+/// `ids` with every repeated id after its first entry left out, the others
+/// in their order: how `favorite-apps` is always written.
+fn without_repeats(ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// The favorites `stored` after Ctrl+f on the app `id`: every entry of it
+/// taken out when there is one, else `id` appended.
+fn toggled_favorite(mut stored: Vec<String>, id: &str) -> Vec<String> {
+    if stored.iter().any(|entry| entry == id) {
+        stored.retain(|entry| entry != id);
+    } else {
+        stored.push(id.to_owned());
+    }
+    without_repeats(stored)
+}
+
+/// The favorites `stored` after moving the favorite `id` in `direction`:
+/// `id` placed immediately in front of the first entry of the favorite shown
+/// above it, or immediately behind that of the favorite shown below it.
+/// `shown` tells whether an id's app is listed. `None` when there is nothing
+/// to move: `id` is not a favorite shown, or the first or last one.
+fn moved_favorite(
+    stored: Vec<String>,
+    id: &str,
+    direction: Direction,
+    shown: impl Fn(&str) -> bool,
+) -> Option<Vec<String>> {
+    let mut favorites = without_repeats(stored);
+    let order: Vec<&String> = favorites.iter().filter(|entry| shown(entry)).collect();
+    let position = order.iter().position(|entry| *entry == id)?;
+    let neighbour = match direction {
+        Direction::Up => order.get(position.checked_sub(1)?)?,
+        Direction::Down => order.get(position + 1)?,
+    };
+    let neighbour = (*neighbour).clone();
+    favorites.retain(|entry| entry != id);
+    let at = favorites.iter().position(|entry| *entry == neighbour)?;
+    let at = match direction {
+        Direction::Up => at,
+        Direction::Down => at + 1,
+    };
+    favorites.insert(at, id.to_owned());
+    Some(favorites)
+}
+
 /// The apps on the page, by the INDEX of their rows, which of them are
-/// hidden, and the group of each one for the filter text.
+/// hidden, which are favorites, and the group of each one for the filter
+/// text.
 struct AppList {
     apps: RefCell<Vec<App>>,
     settings: RefCell<AppSettings>,
     hidden: RefCell<Vec<bool>>,
+    // The place of each favorite in the favorite order, `None` for the
+    // other apps.
+    favorites: RefCell<Vec<Option<usize>>>,
     // The words of the filter text, `None` while it is empty.
     words: RefCell<Option<Vec<String>>>,
     // `None` while the filter text is empty.
@@ -1637,6 +1953,7 @@ impl AppList {
     fn new(apps: Vec<App>, settings: AppSettings) -> Self {
         let list = Self {
             hidden: RefCell::new(vec![false; apps.len()]),
+            favorites: RefCell::new(vec![None; apps.len()]),
             apps: RefCell::new(apps),
             settings: RefCell::new(settings.clone()),
             words: RefCell::default(),
@@ -1662,6 +1979,9 @@ impl AppList {
         self.hidden
             .borrow_mut()
             .push(is_hidden(&app.id, &settings.hidden));
+        self.favorites
+            .borrow_mut()
+            .push(favorite_place(&app.id, &settings.favorites));
         if let (Some(words), Some(tiers)) = (
             self.words.borrow().as_ref(),
             self.tiers.borrow_mut().as_mut(),
@@ -1676,6 +1996,26 @@ impl AppList {
     /// The index of the app with the desktop id `id`.
     fn index_of(&self, id: &str) -> Option<usize> {
         self.apps.borrow().iter().position(|app| app.id == id)
+    }
+
+    /// Whether the app with the index `index` is a favorite.
+    fn is_favorite(&self, index: usize) -> bool {
+        self.favorites
+            .borrow()
+            .get(index)
+            .is_some_and(Option::is_some)
+    }
+
+    /// Whether the app with the desktop id `id` is listed while the filter
+    /// text has no words: it is on the page and not hidden.
+    fn is_shown(&self, id: &str) -> bool {
+        self.index_of(id)
+            .is_some_and(|index| !self.hidden.borrow()[index])
+    }
+
+    /// Whether the filter text has words.
+    fn has_words(&self) -> bool {
+        self.words.borrow().is_some()
     }
 
     fn settings(&self) -> AppSettings {
@@ -1704,6 +2044,10 @@ impl AppList {
         *self.hidden.borrow_mut() = apps
             .iter()
             .map(|app| is_hidden(&app.id, &settings.hidden))
+            .collect();
+        *self.favorites.borrow_mut() = apps
+            .iter()
+            .map(|app| favorite_place(&app.id, &settings.favorites))
             .collect();
     }
 
@@ -1736,11 +2080,18 @@ impl AppList {
                 .is_none_or(|tiers| tiers[index].is_some())
     }
 
-    /// The order of two apps: without a filter, launches first, then the
-    /// name; with one, the group, launches, the folded name, and the desktop
-    /// id.
+    /// The order of two apps: without a filter, the favorites first in
+    /// their order, then launches, then the name; with one, the group, then
+    /// the favorites first in their order, launches, the folded name, and
+    /// the desktop id.
     fn compare(&self, a: usize, b: usize) -> Ordering {
-        compare_apps(&self.apps.borrow(), self.tiers.borrow().as_deref(), a, b)
+        compare_apps(
+            &self.apps.borrow(),
+            &self.favorites.borrow(),
+            self.tiers.borrow().as_deref(),
+            a,
+            b,
+        )
     }
 
     /// The index of the app listed first for the filter text `text`, with
@@ -1756,26 +2107,50 @@ impl AppList {
                 .collect()
         });
         let hidden = self.hidden.borrow();
+        let favorites = self.favorites.borrow();
         (0..apps.len())
             .filter(|&index| {
                 !hidden[index] && tiers.as_ref().is_none_or(|tiers| tiers[index].is_some())
             })
-            .min_by(|&a, &b| compare_apps(&apps, tiers.as_deref(), a, b))
+            .min_by(|&a, &b| compare_apps(&apps, &favorites, tiers.as_deref(), a, b))
     }
 }
 
-/// The order of the apps with the indexes `a` and `b`, for the groups
-/// `tiers` of the filter text (`None` while it is empty). See
-/// [`AppList::compare`].
-fn compare_apps(apps: &[App], tiers: Option<&[Option<AppTier>]>, a: usize, b: usize) -> Ordering {
+/// The place of the desktop id `id` in the favorite order `favorites`: that
+/// of its first entry, or `None` when it has none.
+fn favorite_place(id: &str, favorites: &[String]) -> Option<usize> {
+    favorites.iter().position(|entry| entry == id)
+}
+
+/// The order of the apps with the indexes `a` and `b`, whose places in the
+/// favorite order are in `favorites`, for the groups `tiers` of the filter
+/// text (`None` while it is empty). See [`AppList::compare`].
+fn compare_apps(
+    apps: &[App],
+    favorites: &[Option<usize>],
+    tiers: Option<&[Option<AppTier>]>,
+    a: usize,
+    b: usize,
+) -> Ordering {
     let (app_a, app_b) = (&apps[a], &apps[b]);
+    // Favorites first, in their order; launches never reorder them.
+    let favorite_order = || match (favorites[a], favorites[b]) {
+        (Some(place_a), Some(place_b)) => place_a.cmp(&place_b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
     match tiers {
-        None => app_b
-            .launches
-            .cmp(&app_a.launches)
+        None => favorite_order()
+            .then(app_b.launches.cmp(&app_a.launches))
             .then_with(|| app_a.lowercase_name.cmp(&app_b.lowercase_name)),
+        // All subsequence matches are one group: the favorites lead it
+        // whatever their span.
         Some(tiers) => tiers[a]
-            .cmp(&tiers[b])
+            .map(AppTier::group)
+            .cmp(&tiers[b].map(AppTier::group))
+            .then_with(favorite_order)
+            .then(tiers[a].cmp(&tiers[b]))
             .then(app_b.launches.cmp(&app_a.launches))
             .then_with(|| app_a.text.name.cmp(&app_b.text.name))
             .then_with(|| app_a.id.cmp(&app_b.id)),
@@ -2007,8 +2382,9 @@ fn icon_queue_order(visible: &[usize], row_count: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_last, fits_pattern, icon_queue_order, is_hidden, push_capped, remove_last, App,
-        AppList, AppSettings, AppText, AppTier, MatchFields,
+        append_last, fits_pattern, icon_queue_order, is_hidden, moved_favorite, push_capped,
+        remove_last, toggled_favorite, without_repeats, App, AppList, AppSettings, AppText,
+        AppTier, Direction, MatchFields,
     };
     use crate::filter::{fold_text, query_words};
 
@@ -2062,6 +2438,18 @@ mod tests {
             subsequence,
             fields: ALL_FIELDS,
             hidden: hidden.iter().map(|entry| entry.to_string()).collect(),
+            favorites: Vec::new(),
+        }
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn with_favorites(settings: AppSettings, favorites: &[&str]) -> AppSettings {
+        AppSettings {
+            favorites: ids(favorites),
+            ..settings
         }
     }
 
@@ -2544,6 +2932,189 @@ mod tests {
             list.rank(query);
             assert_eq!(rows(&list).first().cloned(), best(query), "{query:?}");
         }
+    }
+
+    // Four apps whose names all hold "win", the most launched last.
+    fn win_apps() -> Vec<App> {
+        vec![
+            app("alpha.desktop", 1, named("Alpha Win")),
+            app("beta.desktop", 3, named("Beta Win")),
+            app("delta.desktop", 0, named("Delta Win")),
+            app("gamma.desktop", 0, named("Gamma Win")),
+            app("win.desktop", 0, text("Win", "", "", "")),
+        ]
+    }
+
+    #[test]
+    fn favorites_lead_an_empty_filter_in_their_order() {
+        let list = AppList::new(
+            win_apps(),
+            with_favorites(
+                settings(false, &[]),
+                &[
+                    "gamma.desktop",
+                    "ghost.desktop",
+                    "alpha.desktop",
+                    "gamma.desktop",
+                ],
+            ),
+        );
+        assert_eq!(
+            rows(&list),
+            [
+                "gamma.desktop",
+                "alpha.desktop",
+                "beta.desktop",
+                "delta.desktop",
+                "win.desktop"
+            ]
+        );
+        assert!(list.is_favorite(0) && list.is_favorite(3));
+        assert!(!list.is_favorite(1) && !list.is_favorite(4));
+        // Blank text has no words.
+        list.rank("  ");
+        assert_eq!(rows(&list)[..2], ["gamma.desktop", "alpha.desktop"]);
+        assert!(!list.has_words());
+        // Without favorites, the order of launches and names.
+        assert!(list.apply_settings(settings(false, &[])));
+        assert_eq!(
+            rows(&list),
+            [
+                "beta.desktop",
+                "alpha.desktop",
+                "delta.desktop",
+                "gamma.desktop",
+                "win.desktop"
+            ]
+        );
+    }
+
+    #[test]
+    fn favorites_lead_only_within_their_match_group() {
+        let list = AppList::new(
+            win_apps(),
+            with_favorites(settings(false, &[]), &["delta.desktop", "beta.desktop"]),
+        );
+        list.rank("win");
+        assert!(list.has_words());
+        // The exact match stays first, unpinned; the pins lead the rest.
+        assert_eq!(
+            rows(&list),
+            [
+                "win.desktop",
+                "delta.desktop",
+                "beta.desktop",
+                "alpha.desktop",
+                "gamma.desktop"
+            ]
+        );
+        // A pinned keyword match comes after an unpinned prefix match.
+        let list = AppList::new(
+            vec![
+                app("gamma.desktop", 0, named("Gamma Win")),
+                app("delta.desktop", 0, text("Delta Win", "", "gamma", "")),
+            ],
+            with_favorites(settings(false, &[]), &["delta.desktop"]),
+        );
+        list.rank("gamma");
+        assert_eq!(rows(&list), ["gamma.desktop", "delta.desktop"]);
+        assert_eq!(
+            list.best_match("gamma").map(|index| list.id(index)),
+            Some("gamma.desktop".to_owned())
+        );
+        assert_eq!(
+            list.best_match("").map(|index| list.id(index)),
+            Some("delta.desktop".to_owned())
+        );
+    }
+
+    #[test]
+    fn favorites_lead_every_subsequence_match_whatever_its_span() {
+        let list = AppList::new(
+            win_apps(),
+            with_favorites(settings(true, &[]), &["delta.desktop"]),
+        );
+        // "ewn" spans 7 characters of "beta win" and 8 of "delta win".
+        list.rank("ewn");
+        assert_eq!(rows(&list), ["delta.desktop", "beta.desktop"]);
+        assert!(list.apply_settings(settings(true, &[])));
+        assert_eq!(rows(&list), ["beta.desktop", "delta.desktop"]);
+    }
+
+    #[test]
+    fn hidden_favorites_are_not_shown_and_return_to_their_place() {
+        let list = AppList::new(
+            win_apps(),
+            with_favorites(
+                settings(false, &["gamma.desktop"]),
+                &["gamma.desktop", "alpha.desktop"],
+            ),
+        );
+        assert!(!list.is_shown("gamma.desktop"));
+        assert!(list.is_shown("alpha.desktop"));
+        assert!(!list.is_shown("ghost.desktop"));
+        assert_eq!(rows(&list)[..2], ["alpha.desktop", "beta.desktop"]);
+        assert!(list.apply_settings(with_favorites(
+            settings(false, &["gamma.desktop", "!gamma*"]),
+            &["gamma.desktop", "alpha.desktop"]
+        )));
+        assert_eq!(rows(&list)[..2], ["gamma.desktop", "alpha.desktop"]);
+    }
+
+    #[test]
+    fn favorites_are_written_without_repeats() {
+        assert_eq!(
+            without_repeats(ids(&["a", "b", "a", "c", "b"])),
+            ids(&["a", "b", "c"])
+        );
+        // Ctrl+f appends an id that is not there, and takes out every entry
+        // of one that is; the others keep their order.
+        assert_eq!(
+            toggled_favorite(ids(&["a", "b", "a"]), "c"),
+            ids(&["a", "b", "c"])
+        );
+        assert_eq!(
+            toggled_favorite(ids(&["g", "a", "x", "a", "g", "n", "x"]), "a"),
+            ids(&["g", "x", "n"])
+        );
+        assert_eq!(toggled_favorite(Vec::new(), "a"), ids(&["a"]));
+        assert_eq!(toggled_favorite(ids(&["a"]), "a"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn favorites_move_past_the_neighbour_shown() {
+        let shown = |id: &str| ["a", "b", "g"].contains(&id);
+        let stored = ids(&["ghost", "a", "nodisplay", "g", "a", "tryexec", "b", "ghost"]);
+        assert_eq!(
+            moved_favorite(stored.clone(), "a", Direction::Down, shown),
+            Some(ids(&["ghost", "nodisplay", "g", "a", "tryexec", "b"]))
+        );
+        assert_eq!(
+            moved_favorite(stored.clone(), "b", Direction::Up, shown),
+            Some(ids(&["ghost", "a", "nodisplay", "b", "g", "tryexec"]))
+        );
+        assert_eq!(
+            moved_favorite(stored.clone(), "g", Direction::Up, shown),
+            Some(ids(&["ghost", "g", "a", "nodisplay", "tryexec", "b"]))
+        );
+        // The first and last favorites shown, apps that are not favorites,
+        // and favorites not shown do not move.
+        assert_eq!(
+            moved_favorite(stored.clone(), "a", Direction::Up, shown),
+            None
+        );
+        assert_eq!(
+            moved_favorite(stored.clone(), "b", Direction::Down, shown),
+            None
+        );
+        assert_eq!(
+            moved_favorite(stored.clone(), "z", Direction::Up, shown),
+            None
+        );
+        assert_eq!(
+            moved_favorite(stored, "ghost", Direction::Down, shown),
+            None
+        );
     }
 
     #[test]
