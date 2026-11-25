@@ -39,7 +39,11 @@ main file's relative includes are read beside it. A row's key text is the
 key it is bound to once a resource retuned it, and its comment's text while
 it is bound as with no resource set (upstream #170); the cases see it
 through the filter, which matches that text. A comment before a `mode`
-block and a row bound only with `bindcode` run their bindings too.
+block and a row bound only with `bindcode` run their bindings too. Under
+sway the included files are the ones sway itself reads (upstream #190): an
+`INCLUDE` in capitals, a file name with a quoted space and a variable naming two
+files are followed, a binding continued over several lines runs whole, and
+an include with an unquoted parenthesis reads nothing.
 
 `test_wm_keys.py` covers window-manager and desktop keys while the window
 is open (upstream #171). The fake window manager serves several requests

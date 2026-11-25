@@ -108,6 +108,9 @@ in one commit.
 Then the open upstream pull request #180 (favourite applications, and
 Ctrl+Enter on the next free workspace) in one commit.
 
+Then the open upstream pull request #190 (sway's included files read the
+way sway reads them) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -222,13 +225,29 @@ from the root window's `RESOURCE_MANAGER` as it is at the key press and
 decoded as i3 decodes it, so a backslash that starts no escape stays (the
 Vala change takes Xlib's copy from when the display was opened, decoded by
 Xlib); and under sway a name holding both quote kinds, a backslash before a
-quote, or `$` reaches sway verbatim (sway expands variables in commands).
+quote, or `$` reaches sway verbatim (sway expands variables in commands);
+#190 under sway the Keybindings page reads the files the configuration
+includes the way sway reads them: in every file a line ending in a
+backslash goes on with the next (so a binding written over several lines
+runs whole), `include` and `set` are matched in any letter case, `set`
+variables take the value they have at that line, and the include's
+argument then goes through the word expansion sway gives it (glibc's
+`wordexp`, short of running anything): `~`, environment variables (an
+unset one is empty, an unquoted value splits into several paths), quotes
+and backslashes, wildcards whose matches come sorted and a pattern without
+matches standing for itself, and shell syntax such as `(`, `|` or `{a,b}`
+reading nothing; relative paths start beside the main file as sway reports
+it (not beside a link's target) and beside an included file's real path,
+and each file is read once. The port goes further than that pull request,
+which leaves quotes, backslashes and `${NAME:-word}`-style forms alone: it
+follows glibc in those too, including the rule that a word only becomes a
+pattern at a wildcard written unquoted.
 
 **Not yet ported** (open items):
 
 - Open upstream PRs that will likely land: #164 (notification actions)
-  and #173 (desktop-entry actions). #172, #174, #180, #181 and #184 are already
-  in the port (see above).
+  and #173 (desktop-entry actions). #172, #174, #180, #181, #184 and #190
+  are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help tab's

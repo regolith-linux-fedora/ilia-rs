@@ -76,8 +76,11 @@ Module map:
 - `keybindings.rs`: the Keybindings page, which runs the chosen binding's
   command over IPC (`ipc.rs`) as the window manager holds it. i3 reports its
   configuration with the variables applied; sway's is read in `ipc.rs` as
-  sway reads it (includes in place, variables and resource-service values
-  where they are used). A row shows its comment's key text while its
+  sway reads it (continued lines joined, includes in place, variables and
+  resource-service values where they are used). An include's argument is
+  expanded in Rust the way glibc's `wordexp` expands it for sway, rather
+  than through `wordexp` itself, which reads the process's working
+  directory and can set its environment. A row shows its comment's key text while its
   bindings are what they are with no resource set, and its bound keys
   otherwise.
 - `xkb.rs`: the key a key code gives in a layout, from libxkbcommon, for

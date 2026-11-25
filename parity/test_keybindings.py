@@ -267,3 +267,60 @@ def test_sway_mode_and_key_code_rows_run_their_bindings(isolated_env, run_ilia, 
         assert code == 0
         records = _assert_config_request(server, transcript)
         _assert_wm_activation(records, stdout, stderr, command)
+
+
+def test_sway_includes_are_read_as_sway_reads_them(isolated_env, run_ilia, tmp_path):
+    # Upstream #190: the keyword in capitals, a file name with a space quoted
+    # inside the path, a variable that names two files, and a binding
+    # continued over three lines in an included file, which runs whole. An
+    # unquoted parenthesis makes sway read nothing for its include, so that
+    # file's row is not listed. (sway strips the quotes of a word that starts
+    # with one before it expands the text, so `"parts/with space.conf"`
+    # would name two files.)
+    env, _ = isolated_env
+    config_dir = tmp_path / "sway"
+    parts = config_dir / "parts"
+    parts.mkdir(parents=True)
+    main = (
+        "SET $two parts/b.conf parts/c.conf\n"
+        'INCLUDE parts/"with space.conf"\n'
+        "include $two\n"
+        "include parts/(d).conf\n"
+    )
+    (config_dir / "config").write_text(main)
+    files = {
+        "with space.conf": "## Included // Spaced fixture // <Super>1 ##\n"
+        "bindsym Mod4+1 exec fixture-spaced\n",
+        "b.conf": "## Included // Bravo fixture // <Super>2 ##\n"
+        "bindsym Mod4+2 exec fixture-bravo\n",
+        "c.conf": "## Included // Charlie fixture // <Super>3 ##\n"
+        "bindsym Mod4+3 \\\n    exec fixture-charlie \\\n  joined\n",
+        "(d).conf": "## Included // Delta fixture // <Super>4 ##\n"
+        "bindsym Mod4+4 exec fixture-delta\n",
+    }
+    for name, text in files.items():
+        (parts / name).write_text(text)
+    rows = [
+        ("Spaced fixture", "exec fixture-spaced"),
+        ("Bravo fixture", "exec fixture-bravo"),
+        ("Charlie fixture", "exec fixture-charlie joined"),
+        ("Delta fixture", None),
+    ]
+    for index, (text, command) in enumerate(rows):
+        socket_path = tmp_path / f"sway-{index}.sock"
+        transcript = tmp_path / f"sway-ipc-{index}.jsonl"
+        env["SWAYSOCK"] = str(socket_path)
+        version = _sway_version(config_dir / "config")
+        with I3Server(socket_path, {9: {"config": main}, 7: version}, transcript) as server:
+            app = run_ilia(env, "-p", "keybindings")
+            _wait_request(server)
+            app.type(text)
+            app.key("Return")
+            code, stdout, stderr = _finish_after_activation(app)
+        records = _assert_config_request(server, transcript)
+        if command is None:
+            runs = [record for record in records if record["message_type"] == 0]
+            assert runs == [], records
+        else:
+            assert code == 0
+            _assert_wm_activation(records, stdout, stderr, command)

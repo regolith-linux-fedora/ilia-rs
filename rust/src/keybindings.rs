@@ -829,7 +829,11 @@ where
             let words = ipc::split_words(line);
             match words.first().copied() {
                 None => open = None,
-                Some("set" | "set_from_resource") => {}
+                // The window managers read these keywords without regard to
+                // case.
+                Some(keyword)
+                    if keyword.eq_ignore_ascii_case("set")
+                        || keyword.eq_ignore_ascii_case("set_from_resource") => {}
                 Some("bindsym" | "bindcode") => {
                     let line = binding_line(&words, untrimmed, &blocks, sway);
                     let position = open.map(|(row, ..)| (row, bindings[row].bindings.len()));
@@ -1454,6 +1458,23 @@ mod tests {
         assert_eq!(row_text(&lost, Some(&lost.clone()), &codes), "Mod5 F21");
         lost.bindings[1].removed = true;
         assert_eq!(row_text(&lost, Some(&lost.clone()), &codes), "");
+    }
+
+    #[test]
+    fn sway_rows_take_continued_bindings_whole() {
+        let files = crate::ipc::read_config_files(
+            "## A // Joined // a ##\nSET $x y\nbindsym a \\\n    exec echo 'one\\\n  two' $x\n",
+            None,
+            &HashMap::new(),
+        );
+        let parsed = parse_files(
+            files.iter().map(|file| file.iter().map(String::as_str)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].bindings.len(), 1);
+        assert_eq!(parsed[0].exec.as_deref(), Some("exec echo 'one  two' y"));
     }
 
     #[test]
