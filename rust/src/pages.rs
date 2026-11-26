@@ -58,8 +58,7 @@ pub trait DialogPage {
     /// The letter that selects the page with Alt.
     fn get_keybinding(&self) -> Option<char>;
     fn show(&self) {}
-    /// Another page (or the Help tab) takes this page's place in the
-    /// notebook.
+    /// Another page takes this page's place in the notebook.
     fn hide(&self) {}
     /// Left and Right move the entry's text cursor rather than the
     /// notebook's page.

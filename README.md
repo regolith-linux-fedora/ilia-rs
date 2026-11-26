@@ -20,7 +20,8 @@ runs under i3 (X11) and sway (Wayland, as a layer-shell surface).
   `0.19.0+rs1`.
 - **Upstream has moved on.** ilia has received many fixes since 0.18.0.
   All of those merged by 2026-11-09 are in this port, fixed here
-  independently or ported; the last large one was window-manager and
+  independently or ported, and so is #175 (help as a page, merged on
+  2026-11-10); the last large one was window-manager and
   desktop keys while ilia is open (#171). See
   [Differences from upstream](#differences-from-upstream). That list was
   made against upstream `main` at `b075ac2`, and checked by running both
@@ -41,7 +42,7 @@ entries, history-ranked sorting, `systemd-run` launch wrapper), Commands
 (PATH scan), Notifications (rofication socket client), TextList (stdin
 rows), Files (Tracker/tinysparql full-text search), Keybindings and Windows
 (i3/sway IPC), and the dialog shell (stylesheets, Alt+letter page
-switching, Alt+plus/Alt+minus resizing with persistence, the Help tab,
+switching, Alt+plus/Alt+minus resizing with persistence, the Help page,
 Ctrl entry-editing keys, focus-loss quitting, the X11 seat grab, native
 Wayland layer-shell start-up). The command line, GSettings schema
 (`org.regolith-linux.ilia`), installed files and Debian package name are
@@ -111,6 +112,9 @@ Ctrl+Enter on the next free workspace) in one commit.
 Then the open upstream pull request #190 (sway's included files read the
 way sway reads them) in one commit.
 
+Then #175 (help as a page of its own that scrolls, in single-page and
+all-pages mode) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -178,7 +182,26 @@ fallback, `bindcode`, exact modifiers, `--release`); the desktop's Print,
 volume, mute, brightness, calculator and playback keys reach the program
 that grabs them, with their modifiers; on sway ilia closes when sway runs
 a binding, except one that only switches the keyboard layout; an unusable
-window-manager socket is reported once on standard error.
+window-manager socket is reported once on standard error; #175 (merged on
+2026-11-10, after `b075ac2`) help is a page like the others: the last tab
+with `-p` and with `-a`, with the `help-browser` icon and Alt+h (no letter
+when a page from a file has `h`), describing the page in view before it
+was opened: that page's name as plain text, its help text, and its keys
+ordered by key, then the keys every page shares (Page Up/Page Down and
+← → among them), the Alt+letter of each tab, and Alt -, Alt + and Esc, in
+a list that scrolls in the room the text leaves, so that Alt - shrinks the
+dialog while help is shown. The port differs from that pull request in a
+few places: a name or help text too long for the room scrolls in its own
+region above the Keys heading; the window opens wide enough for the whole
+row of tabs, and once Alt - or Alt + has changed its size the tabs scroll
+rather than hold it that wide (the Vala notebook does not scroll its
+tabs); on the Calculator page Left and Right switch pages from either end
+of the text when nothing is selected; on Help the entry's Ctrl keys do
+nothing, so Ctrl+c leaves the clipboard alone, and Ctrl+f opens no search box over the list (GTK's tree view opens
+one for that key even with searching off); under X11 the keys the
+described page keeps from i3 stay with ilia on Help too, doing nothing;
+and a `-l` label that is not valid markup shows as typed, on its tab as
+well (GTK leaves a label given broken markup empty).
 
 **Ported ahead of upstream** (open upstream pull requests): #174 pages
 defined in key files (`ilia/pages/<name>.page`: favourite apps, fixed lines,
@@ -220,7 +243,7 @@ resource, and starts the app there once the switch is confirmed (see
 a few places: a switch that fails starts nothing and leaves the window open
 (the Vala change starts the app on the current workspace); Ctrl+Enter
 pressed before the list arrives acts once it has, as Enter does; Ctrl+f and
-Ctrl+Enter do nothing from the Help tab; under X11 the resource is read
+Ctrl+Enter do nothing from the Help page; under X11 the resource is read
 from the root window's `RESOURCE_MANAGER` as it is at the key press and
 decoded as i3 decodes it, so a backslash that starts no escape stays (the
 Vala change takes Xlib's copy from when the display was opened, decoded by
@@ -250,8 +273,8 @@ pattern at a wildcard written unquoted.
   are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
-request): tab icons are flat buttons that switch the page; the Help tab's
-heading has the `help_heading` style class and its list fixed row heights;
+request): tab icons are flat buttons that switch the page; the Help page's
+headings have the `help_heading` style class and its list fixed row heights;
 the Commands and TextList help texts say what Enter does when no row
 matches; the list has the focus when the window opens; `-a -p textlist`
 reports the unknown page; Ctrl+$ moves to the end of the entry (the key
@@ -437,8 +460,15 @@ Answers are rounded to 15 significant digits, whole numbers up to 40 digits are 
 An answer not worked out within three seconds shows `Too long`.
 Enter prints the answer on standard output, copies it to the clipboard and closes the window; pressed while the answer is still being worked out, it waits for it.
 The answer stays pasteable after ilia closes: an X11 clipboard manager takes it, and without one (always on Wayland) ilia keeps running without a window until something else is copied, so a caller that waits for `ilia -p calculator` to exit waits until then.
-On this page Left and Right move the cursor in the entry instead of switching pages.
+On this page Left and Right move the cursor in the entry; they switch pages only from either end of the text, with nothing selected.
 The answers come from `ilia-calculator`, a helper built against libqalculate and installed in `libexecdir`.
+
+#### Help
+
+The last tab is Help, with `ilia -p <page>` as with `ilia -a`. Alt+h opens it, and Left and Right walk the tabs, going round at either end.
+It describes the page in view before it was opened: that page's name and help text, then its keys, the keys that work on every page, the Alt+letter of each tab, and Alt -, Alt + and Esc.
+The list scrolls in the room the text leaves; the arrows, Page Up/Page Down, Home/End, Ctrl+n/Ctrl+p and Ctrl+j/Ctrl+k move through it, and Alt - and Alt + resize the dialog as on the other pages.
+When a page from a file takes `h` as its `Key`, Help has no letter.
 
 #### Pages from files
 

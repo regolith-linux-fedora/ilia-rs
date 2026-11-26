@@ -984,7 +984,7 @@ impl DialogPage for ApplicationsPage {
 
     fn key_event(&self, event: &gdk::EventKey) -> bool {
         if is_new_workspace_key(event) {
-            // Taken with no row too, and from the Help tab, where the filter
+            // Taken with no row too, and from the Help page, where the filter
             // is off as for Enter: nothing is launched then.
             if !self.root.is_mapped() {
                 return true;
@@ -1001,7 +1001,7 @@ impl DialogPage for ApplicationsPage {
             return true;
         }
         // Ctrl+f is always taken; it pins or unpins only while the page is
-        // shown, and does nothing from the Help tab.
+        // shown, and does nothing from the Help page.
         if is_favorite_key(event) {
             if self.root.is_mapped() {
                 // Never edits the filter text, with no row highlighted either.
@@ -1018,7 +1018,7 @@ impl DialogPage for ApplicationsPage {
             self.open_form();
             return true;
         }
-        // Only while the page is shown: not from the Help tab.
+        // Only while the page is shown: not from the Help page.
         if is_copy_program_path_key(event) && self.root.is_mapped() {
             self.copy_program_path();
             return true;
@@ -1058,7 +1058,7 @@ impl DialogPage for ApplicationsPage {
             && !event
                 .state()
                 .intersects(gdk::ModifierType::MOD1_MASK | gdk::ModifierType::SUPER_MASK);
-        // Ctrl+f also from the Help tab, where it does nothing, so that it
+        // Ctrl+f also from the Help page, where it does nothing, so that it
         // never reaches the window manager.
         is_favorite_key(event)
             || (is_copy_program_path_key(event) && self.root.is_mapped())

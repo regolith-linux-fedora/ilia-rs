@@ -22,7 +22,7 @@ use evaluation::Evaluation;
 const TIME_LIMIT: Duration = Duration::from_secs(3);
 /// Shown when the answer was given up on.
 const TOO_LONG: &str = "Too long";
-/// The page's text on the Help tab.
+/// The page's text on the Help page.
 pub const HELP: &str = "This dialog works out the expression typed in the top text box as it is typed: numbers, + - * / ^, ! after a number, brackets, sqrt, sin, cos, tan (in radians), ln, exp, abs, pi and e. Enter prints the answer and copies it to the clipboard, where it stays after the dialog closes.";
 
 /// Where the answer to the current text stands.

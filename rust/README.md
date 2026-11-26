@@ -25,7 +25,7 @@ Notifications, TextList, and Files (Tracker) pages. An eighth, the
 Calculator page, is ported ahead of upstream. The dialog shell is
 complete as well: stylesheet modes, Alt+letter page switching, Alt+plus /
 Alt+minus resizing with `window-width`/`window-height` persistence, the Help
-tab and its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
+page and its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
 click-outside quitting, and the seat-grab retry with its failure messages.
 
 Module map:
@@ -59,7 +59,8 @@ Module map:
   seconds), and `answer.rs` rounds and formats the value with the decimal
   mark of the locale's numbers, which the helper reports. Enter prints the
   answer and copies it through `clipboard_keeper.rs`. On this page Left and
-  Right move the entry's text cursor instead of switching pages.
+  Right move the entry's text cursor, and switch pages only from either end
+  of the text with nothing selected.
 - `input_sources.rs`: the desktop's layout-switch shortcut while ilia is
   open (gnome-flashback's input-source D-Bus service on X11).
 - `wm_keys.rs`, `wm_bindings.rs`, `x11.rs`: window-manager and desktop keys
@@ -110,6 +111,10 @@ Module map:
   confirmed on the Calculator page, which stay pasteable after the window
   closes: handed to an X11 clipboard manager, or served by ilia, running on
   without a window, until the clipboard holds something else.
+- `help.rs`: the Help page, the last tab in both modes. It describes the
+  page in view before it was opened (`dialog.rs` tells it which): that
+  page's name, help text and keys, then the keys every page shares, in a
+  list that scrolls in the room the text leaves.
 - `dialog.rs`, `application.rs`: the shell, which also picks the pages the
   current window manager (i3, sway or other) can show. With `-a` each page
   keeps its own entry text: switching pages puts the left page's text away

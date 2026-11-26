@@ -74,8 +74,19 @@ Enter) asks the fake window manager for its workspaces, switches to the
 lowest free number (`2:web` takes 2) quoted as i3 or sway reads it, and
 starts the app only after the switch was answered; under i3 the name comes
 from an `xrdb` resource holding quotes and backslashes (skipped without
-`/usr/bin/xrdb`). With no row, or from the Help tab, Ctrl+Enter does
+`/usr/bin/xrdb`). With no row, or from the Help page, Ctrl+Enter does
 nothing.
+
+`test_help.py` covers the Help page (upstream #175). Enter shows which
+page is up: a list page prints its highlighted row, Help does nothing.
+Alt+h opens Help, and Left and Right go round the tabs at either end; a
+page file holding `Key=h` keeps the letter, and Help stays the second tab.
+On Help, Ctrl+c, Ctrl+x and Ctrl+v leave the clipboard (`/usr/bin/xclip`)
+and the left page's text alone, Ctrl+f opens no search box that would take
+the keys, and under i3 the keys the Applications page keeps from i3
+(Ctrl+f, Ctrl+z, Ctrl+=) stay with ilia while another bound key goes to
+i3. On the Calculator page Left and Right move the text cursor and switch
+pages only from either end of the text with nothing selected.
 
 `test_entries_read_early.py` checks that the entries read during
 start-up (upstream #162, read outside GLib in the port) keep what GLib's own

@@ -10,6 +10,7 @@ use glib::Unichar;
 use crate::apps::is_copy_program_path_key;
 use crate::args::Args;
 use crate::clipboard_keeper;
+use crate::help::{self, HelpPage};
 use crate::input_sources::InputSourceSwitcher;
 use crate::page_files::{self, PageFile};
 use crate::pages::{create, create_from_file, find, is_enter_key, DialogPage, Page, PAGES};
@@ -183,7 +184,7 @@ pub fn build(
     let seat_for_pages = seat.clone();
     let page_quit: Rc<dyn Fn()> =
         Rc::new(move || quit(&window_for_pages, &app_for_pages, &seat_for_pages));
-    let pages: Vec<Rc<dyn DialogPage>> = page_specs
+    let mut pages: Vec<Rc<dyn DialogPage>> = page_specs
         .iter()
         .zip(&letters)
         .map(|(spec, key)| match spec {
@@ -201,8 +202,29 @@ pub fn build(
             }
         })
         .collect();
+    // The tab titles, as markup.
+    let mut names: Vec<String> = pages
+        .iter()
+        .map(|page| {
+            if page.get_id() == "textlist" {
+                args.value("-l").unwrap_or(page.get_name()).to_owned()
+            } else {
+                page.get_name().to_owned()
+            }
+        })
+        .collect();
+    // Help comes last, with its letter unless another page has it.
+    let page_shortcuts: Vec<Option<char>> =
+        pages.iter().map(|page| page.get_keybinding()).collect();
+    let help_key = alt_switch_target(&page_shortcuts, u32::from(help::LETTER))
+        .is_none()
+        .then_some(help::LETTER);
+    let help_page = Rc::new(HelpPage::new(help_key, &pages, &names));
+    let help_index = pages.len();
+    names.push(help_page.get_name().to_owned());
+    pages.push(help_page.clone());
     let shortcuts: Vec<Option<char>> = pages.iter().map(|page| page.get_keybinding()).collect();
-    for page in &pages {
+    for (index, page) in pages.iter().enumerate() {
         page.initialize();
         let tab = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let icon = if page.get_id() == "textlist" {
@@ -223,12 +245,13 @@ pub fn build(
         let page_index = notebook.n_pages();
         button.connect_clicked(move |_| notebook_for_button.set_current_page(Some(page_index)));
         let label = gtk::Label::new(None);
-        let name = if page.get_id() == "textlist" {
-            args.value("-l").unwrap_or(page.get_name())
+        // A title that is not markup (a `-l` label such as `Tools & more`)
+        // shows as typed: GTK would leave the label empty.
+        if gtk::pango::parse_markup(&names[index], '\0').is_ok() {
+            label.set_markup(&names[index]);
         } else {
-            page.get_name()
-        };
-        label.set_markup(name);
+            label.set_text(&names[index]);
+        }
         tab.pack_start(&button, false, false, 0);
         tab.pack_start(&label, false, false, 5);
         // Notebook tab widgets are not reached by the window's show_all().
@@ -249,12 +272,9 @@ pub fn build(
             notebook.set_current_page(Some(index as u32));
             active_page.set(index);
         }
-    } else {
-        notebook.append_page(
-            &help_widget(pages[0].as_ref()),
-            Some(&gtk::Label::new(Some("Help"))),
-        );
     }
+    // The page Help describes: the page in view most recently.
+    let described_page = Rc::new(Cell::new(active_page.get()));
 
     let pages_for_change = pages.clone();
     let active_for_change = active_page.clone();
@@ -286,31 +306,56 @@ pub fn build(
         let active_for_switch = active_for_switch.clone();
         let entry_changed = entry_changed.clone();
         let page_texts = page_texts.clone();
+        let help_for_focus = help_page.clone();
+        notebook_for_switch.connect_page_notify(move |notebook| {
+            // The notebook moves the focus into the page it switches to after
+            // the switch-page handlers have run, and a click on a tab then
+            // focuses the notebook itself: give the help list the focus once
+            // both have.
+            if notebook.current_page() == Some(help_index as u32) {
+                help_for_focus.show();
+                let help = help_for_focus.clone();
+                let notebook = notebook.clone();
+                glib::idle_add_local_once(move || {
+                    if notebook.current_page() == Some(help_index as u32) {
+                        help.show();
+                    }
+                });
+            }
+        });
+        let help_page = help_page.clone();
+        let described_page = described_page.clone();
         notebook_for_switch.connect_switch_page(move |_, _, index| {
             let index = index as usize;
             let previous = active_for_switch.get();
-            if index == pages_for_switch.len() {
-                // The Help page: the filter has nothing to act on.
-                entry_for_switch.set_sensitive(false);
+            let Some(page) = pages_for_switch.get(index) else {
+                return;
+            };
+            if index != previous {
                 pages_for_switch[previous].hide();
-            } else if let Some(page) = pages_for_switch.get(index) {
-                if index != previous {
-                    pages_for_switch[previous].hide();
-                    // Put the left page's text away and bring back the new
-                    // page's, which is not a change to either page's text.
-                    let mut texts = page_texts.borrow_mut();
-                    texts[previous] = entry_for_switch.text().into();
-                    entry_for_switch.block_signal(&entry_changed);
-                    entry_for_switch.set_text(&texts[index]);
-                    entry_for_switch.unblock_signal(&entry_changed);
-                    entry_for_switch.set_position(-1);
-                    active_for_switch.set(index);
-                }
+                // Put the left page's text away and bring back the new
+                // page's, which is not a change to either page's text.
+                let mut texts = page_texts.borrow_mut();
+                texts[previous] = entry_for_switch.text().into();
+                entry_for_switch.block_signal(&entry_changed);
+                entry_for_switch.set_text(&texts[index]);
+                entry_for_switch.unblock_signal(&entry_changed);
+                entry_for_switch.set_position(-1);
+                active_for_switch.set(index);
+            }
+            if index == help_index {
+                // Help describes the page in view before it; the filter has
+                // nothing to act on.
+                let described = described_page.get();
+                help_page.describe(described, &pages_for_switch[described]);
+                entry_for_switch.set_sensitive(false);
+            } else {
+                described_page.set(index);
                 entry_for_switch.set_sensitive(true);
                 // Filter the new page by its text.
                 page.on_entry_changed();
             }
-            pages_for_switch[active_for_switch.get()].show();
+            page.show();
         });
     });
 
@@ -398,11 +443,23 @@ pub fn build(
                 return glib::Propagation::Stop;
             }
             if keyval == u32::from('+') {
-                change_size(window, &settings_for_key, 128, is_wayland);
+                change_size(
+                    window,
+                    &notebook_for_key,
+                    &settings_for_key,
+                    128,
+                    is_wayland,
+                );
                 return glib::Propagation::Stop;
             }
             if keyval == u32::from('-') {
-                change_size(window, &settings_for_key, -128, is_wayland);
+                change_size(
+                    window,
+                    &notebook_for_key,
+                    &settings_for_key,
+                    -128,
+                    is_wayland,
+                );
                 return glib::Propagation::Stop;
             }
             // The page's own Alt keys on its list, such as moving a
@@ -459,10 +516,13 @@ pub fn build(
             quit(&window_for_key, &app_for_key, &seat_for_key);
             return glib::Propagation::Stop;
         }
+        // Left and Right walk the tabs. A page that edits its text with them
+        // keeps them while the text cursor can move that way.
         if matches!(
             key,
             gdk::keys::constants::Left | gdk::keys::constants::Right
-        ) && !pages_for_key[active_for_key.get()].edits_with_arrow_keys()
+        ) && !(pages_for_key[active_for_key.get()].edits_with_arrow_keys()
+            && arrow_moves_cursor(&entry_for_key, &key))
         {
             notebook_for_key.grab_focus();
             return glib::Propagation::Proceed;
@@ -618,6 +678,21 @@ fn is_own_key(
     other_modifiers == 0 && !super_held && key.to_unicode().is_some_and(|typed| !typed.is_control())
 }
 
+/// Whether Left or Right (`key`) moves the text cursor of `entry`: not when
+/// the cursor is already at that end of the text, with nothing selected.
+fn arrow_moves_cursor(entry: &gtk::Entry, key: &gdk::keys::Key) -> bool {
+    if entry.selection_bounds().is_some() {
+        return true;
+    }
+    let position = entry.position();
+    if *key == gdk::keys::constants::Left {
+        position > 0
+    } else {
+        // Entry positions count characters.
+        position < entry.text().chars().count() as i32
+    }
+}
+
 fn is_super_key(key: &gdk::keys::Key) -> bool {
     matches!(
         *key,
@@ -695,10 +770,19 @@ pub fn grab_inputs(window: &gtk::Window) -> Option<gdk::Seat> {
 /// Grows or shrinks the dialog by `delta` in both dimensions, ignoring the
 /// change below the minimum size or at/above the first monitor's size, and
 /// persists the accepted size.
-fn change_size(window: &gtk::Window, settings: &gio::Settings, delta: i32, is_wayland: bool) {
+fn change_size(
+    window: &gtk::Window,
+    notebook: &gtk::Notebook,
+    settings: &gio::Settings,
+    delta: i32,
+    is_wayland: bool,
+) {
     let Some((width, height)) = resized(window.size(), delta, first_monitor_size(window)) else {
         return;
     };
+    // The dialog opens wide enough to show every tab; once resized, the
+    // tabs scroll rather than keep it that wide.
+    notebook.set_scrollable(true);
     if is_wayland {
         // The Wayland window is sized by its size request, which is also
         // its minimum: without updating it the window cannot shrink.
@@ -756,6 +840,10 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
     let length = text.chars().count() as i32;
     let key = char::from_u32(keyval)?;
     match key {
+        'j' | 'n' | 'k' | 'p' => return Some(page.key_event(event)),
+        // The entry is off on the Help page: its keys do nothing there, and
+        // Ctrl+c leaves the clipboard alone.
+        _ if !entry.is_sensitive() && is_entry_key(key) => {}
         'h' => {
             let position = entry.position();
             if position > 0 {
@@ -768,7 +856,6 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
                 entry.set_position(position + 1);
             }
         }
-        'j' | 'n' | 'k' | 'p' => return Some(page.key_event(event)),
         '0' => entry.set_position(0),
         // Ctrl+$, whichever keys type the dollar sign.
         '$' => entry.set_position(-1),
@@ -781,6 +868,15 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
         _ => return None,
     }
     Some(true)
+}
+
+/// Whether Ctrl and `key` edit the entry's text, move its cursor or use the
+/// clipboard.
+fn is_entry_key(key: char) -> bool {
+    matches!(
+        key,
+        'h' | 'l' | '0' | '$' | 'a' | 'w' | 'b' | 'c' | 'v' | 'x'
+    )
 }
 
 /// Words end at white space, punctuation and symbols, Unicode ones
@@ -870,50 +966,6 @@ fn slice_chars(text: &str, start: i32, end: i32) -> String {
         .skip(start.max(0) as usize)
         .take((end - start).max(0) as usize)
         .collect()
-}
-
-fn help_widget(page: &dyn DialogPage) -> gtk::Widget {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    let help = gtk::Label::new(Some(page.get_help()));
-    help.set_line_wrap(true);
-    root.pack_start(&help, false, false, 5);
-    let heading = gtk::Label::new(Some("Keybindings"));
-    heading.style_context().add_class("help_heading");
-    root.pack_start(&heading, false, false, 5);
-
-    let model = gtk::ListStore::new(&[glib::Type::STRING, glib::Type::STRING]);
-    for (key, action) in page.get_keybindings() {
-        let row = model.append();
-        model.set(&row, &[(0, &key), (1, &action)]);
-    }
-    for (key, action) in [
-        ("Alt -", "Decrease Dialog Size"),
-        ("Alt +", "Increase Dialog Size"),
-        ("↑ ↓", "Change Selected Item"),
-        ("Home End", "Select First or Last Item"),
-        ("Ctrl+p Ctrl+n", "Change Selected Item (emacs style)"),
-        ("Ctrl+k Ctrl+j", "Change Selected Item (vim style)"),
-        ("Esc", "Exit"),
-    ] {
-        let row = model.append();
-        model.set(&row, &[(0, &key), (1, &action)]);
-    }
-
-    let bindings = gtk::TreeView::with_model(&model);
-    bindings.set_headers_visible(false);
-    bindings.set_fixed_height_mode(true);
-    bindings.set_enable_search(false);
-    for (column_index, title) in [(0, "Key"), (1, "Function")] {
-        let renderer = gtk::CellRendererText::new();
-        let column =
-            gtk::TreeViewColumn::with_attributes(title, &renderer, &[("text", column_index)]);
-        // A fixed-height list needs fixed-size columns.
-        column.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-        bindings.append_column(&column);
-    }
-    bindings.connect_realize(|view| view.columns_autosize());
-    root.pack_start(&bindings, false, false, 5);
-    root.upcast()
 }
 
 #[cfg(test)]
