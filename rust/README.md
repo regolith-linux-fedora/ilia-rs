@@ -99,7 +99,18 @@ Module map:
   the XDG configuration directories): discovery, precedence and parsing.
   Their pages live in `apps.rs` (`Apps` rows, launched like the
   Applications page) and `textlist.rs` (`Items` and `ItemsCommand` rows,
-  the command read on a background thread in its own process group).
+  the command read on a background thread in its own process group). A
+  page file's `Entries` and `[Entry <id>]` groups are read into a `Menu`
+  here too, with the checks that skip one entry or the whole file.
+- `menu.rs`: menu pages. Rows, submenu navigation, search by path and the
+  `When`/`State` commands, each run directly in its own process group by a
+  watcher thread that stops the group after 2 seconds. Binding rows take
+  their key text and command from the Keybindings page's own rows
+  (`keybindings::page_bindings`), read once per session. A small guardian
+  process, forked the first time a command starts, ends the groups still
+  running when its socket to ilia closes, so they end even when ilia is
+  killed; `application.rs` turns the usual terminating signals into a
+  clean exit that stops them first, then ends as the signal would have.
 - `add_app_form.rs`, `new_entry.rs`: the Applications page's add-application
   form (the `+` button below the list, or Ctrl+=), shown inside the window
   over the list, and the desktop entry it checks and writes to the user's

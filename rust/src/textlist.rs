@@ -345,7 +345,7 @@ impl TextListPage {
         let source = match &file.rows {
             Rows::Items(items) => Source::Items(items.clone()),
             Rows::Command(command) => Source::Command(command.clone()),
-            Rows::Apps(_) => Source::Items(Vec::new()),
+            Rows::Apps(_) | Rows::Menu(_) => Source::Items(Vec::new()),
         };
         let action = match &file.exec {
             Exec::Print => Action::Print,
@@ -813,6 +813,12 @@ pub fn stop_commands() {
             }
         }
     });
+}
+
+/// Keeps a command a choice on another page started, so that the launcher
+/// waits for it like for its own (see [`wait_for_launched`]).
+pub fn remember_launched(child: Child) {
+    LAUNCHED.with(|launched| launched.borrow_mut().push(child));
 }
 
 /// Waits, for at most `LAUNCH_WAIT`, until the commands choices started

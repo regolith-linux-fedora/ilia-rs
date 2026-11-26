@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -16,6 +16,8 @@ const SUMMARY: u32 = 1;
 const EXEC: u32 = 2;
 const FOLDED_SPEC: u32 = 3;
 const FOLDED_SUMMARY: u32 = 4;
+/// The row's place among the documented bindings, as read.
+const INDEX: u32 = 5;
 
 const TRAWL_BUS_NAME: &str = "org.regolith.Trawl";
 const TRAWL_OBJECT_PATH: &str = "/org/regolith/Trawl";
@@ -121,48 +123,23 @@ impl KeybindingsPage {
         wm_name: String,
         quit: Rc<dyn Fn()>,
     ) -> Self {
-        let model = gtk::ListStore::new(&[
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-        ]);
         // Each word may match the description or the key text, by the word
         // rule or by subsequence.
         let row_filter = RowFilter::new(
             &[FOLDED_SUMMARY, FOLDED_SPEC],
             settings.boolean(FUZZY_MATCHING),
         );
+        let bindings = session_rows(&wm_name);
+        if let Err(error) = &bindings {
+            eprintln!("Failed to read config from {wm_name}: {error}");
+        }
+        let rows = bindings.unwrap_or_default();
+        let model = rows_model(&rows, &row_filter);
         let filter = gtk::TreeModelFilter::new(&model, None);
         let row_filter_for_filter = row_filter.clone();
         filter.set_visible_func(move |tree_model, iter| {
             row_filter_for_filter.row_match(tree_model, iter).is_some()
         });
-
-        let bindings = ipc::get_config(&wm_name).and_then(page_rows);
-        match bindings {
-            Ok(bindings) => {
-                for (spec, binding) in bindings {
-                    let row = model.append();
-                    let summary = format!("{} - {}", binding.category, binding.label);
-                    let exec = binding.exec.unwrap_or_default();
-                    model.set(
-                        &row,
-                        &[
-                            (SPEC, &spec),
-                            (SUMMARY, &summary),
-                            (EXEC, &exec),
-                            (FOLDED_SPEC, &fold_text(&spec)),
-                            (FOLDED_SUMMARY, &fold_text(&summary)),
-                        ],
-                    );
-                }
-            }
-            Err(error) => eprintln!("Failed to read config from {wm_name}: {error}"),
-        }
-        row_filter.sort(&model, SUMMARY);
-        model.set_sort_column_id(gtk::SortColumn::Index(SUMMARY), gtk::SortType::Ascending);
 
         let view = gtk::TreeView::with_model(&filter);
         view.style_context().add_class("keybindings");
@@ -302,6 +279,127 @@ impl DialogPage for KeybindingsPage {
     }
 }
 
+/// A row of the Keybindings page, as a menu page's binding rows see it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageBinding {
+    pub category: String,
+    pub label: String,
+    /// The key text the page shows.
+    pub keys: String,
+    /// The command the window manager runs; empty when no binding line
+    /// follows the description.
+    pub exec: String,
+}
+
+/// The documented bindings of a session, each with the key text the page
+/// shows, in reading order.
+type SessionRows = Rc<Vec<(String, Keybinding)>>;
+
+thread_local! {
+    /// The page's rows for this session, read once: the Keybindings page
+    /// and the menu pages' binding rows show the same.
+    static SESSION_ROWS: OnceCell<Result<SessionRows, String>> = const { OnceCell::new() };
+}
+
+/// The documented bindings of the running window manager `wm_name`, each
+/// with the key text the page shows, in reading order.
+fn session_rows(wm_name: &str) -> Result<SessionRows, String> {
+    SESSION_ROWS.with(|rows| {
+        rows.get_or_init(|| ipc::get_config(wm_name).and_then(page_rows).map(Rc::new))
+            .clone()
+    })
+}
+
+/// The page's model of `rows`, sorted as the page lists them before any
+/// text is typed: by description, as `row_filter` sorts.
+fn rows_model(rows: &[(String, Keybinding)], row_filter: &Rc<RowFilter>) -> gtk::ListStore {
+    let model = gtk::ListStore::new(&[
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        u32::static_type(),
+    ]);
+    for (index, (spec, binding)) in rows.iter().enumerate() {
+        let row = model.append();
+        let summary = format!("{} - {}", binding.category, binding.label);
+        let exec = binding.exec.clone().unwrap_or_default();
+        model.set(
+            &row,
+            &[
+                (SPEC, spec),
+                (SUMMARY, &summary),
+                (EXEC, &exec),
+                (FOLDED_SPEC, &fold_text(spec)),
+                (FOLDED_SUMMARY, &fold_text(&summary)),
+                (INDEX, &(index as u32)),
+            ],
+        );
+    }
+    row_filter.sort(&model, SUMMARY);
+    model.set_sort_column_id(gtk::SortColumn::Index(SUMMARY), gtk::SortType::Ascending);
+    model
+}
+
+/// The rows the Keybindings page lists in this session under the window
+/// manager `wm_name`, in the page's order, or why the configuration could
+/// not be read.
+pub fn page_bindings(wm_name: &str) -> Result<Vec<PageBinding>, String> {
+    let rows = session_rows(wm_name)?;
+    let model = rows_model(
+        &rows,
+        &RowFilter::new(&[FOLDED_SUMMARY, FOLDED_SPEC], false),
+    );
+    let mut ordered = Vec::with_capacity(rows.len());
+    if let Some(iter) = model.iter_first() {
+        loop {
+            let index = model
+                .value(&iter, INDEX as i32)
+                .get::<u32>()
+                .unwrap_or_default();
+            if let Some((spec, binding)) = rows.get(index as usize) {
+                ordered.push(PageBinding {
+                    category: binding.category.clone(),
+                    label: binding.label.clone(),
+                    keys: spec.clone(),
+                    exec: binding.exec.clone().unwrap_or_default(),
+                });
+            }
+            if !model.iter_next(&iter) {
+                break;
+            }
+        }
+    }
+    Ok(ordered)
+}
+
+/// The first of `bindings` (in the page's order) that `name` names and
+/// that has a command: `Action`, or `Category // Action`, compared without
+/// regard to letter case or to spaces around the separator and at the ends.
+pub fn find_binding<'a>(bindings: &'a [PageBinding], name: &str) -> Option<&'a PageBinding> {
+    let fold = |text: &str| text.trim().to_lowercase();
+    let (category, label) = match name.split_once("//") {
+        Some((category, label)) => (Some(fold(category)), fold(label)),
+        None => (None, fold(name)),
+    };
+    bindings.iter().find(|binding| {
+        !binding.exec.is_empty()
+            && fold(&binding.label) == label
+            && category
+                .as_ref()
+                .is_none_or(|category| fold(&binding.category) == *category)
+    })
+}
+
+/// Runs a binding's command `exec` in the window manager `wm_name`, as
+/// choosing its row on the page does.
+pub fn run_binding(wm_name: &str, exec: &str) {
+    if let Err(error) = ipc::run_command(wm_name, exec) {
+        eprintln!("Error: execute_keybinding failed: {exec}: {error}");
+    }
+}
+
 fn string_value(
     model: &impl glib::IsA<gtk::TreeModel>,
     iter: &gtk::TreeIter,
@@ -327,6 +425,14 @@ fn clicked_row(view: &gtk::TreeView, event: &gdk::EventButton) -> Option<gtk::Tr
     if event.button() != gdk::BUTTON_PRIMARY || event.state().intersects(modifiers) {
         return None;
     }
+    row_under_pointer(view, event)
+}
+
+/// The row of `view` under the pointer at a button event.
+pub(crate) fn row_under_pointer(
+    view: &gtk::TreeView,
+    event: &gdk::EventButton,
+) -> Option<gtk::TreePath> {
     let rows = view.bin_window()?;
     // The position is relative to the window the event came to, which under
     // the grab need not be the one the rows are drawn in.
@@ -402,9 +508,7 @@ fn execute(wm_name: &str, exec: &str, quit: &Rc<dyn Fn()>, ran: &Cell<bool>) {
     if ran.replace(true) {
         return;
     }
-    if let Err(error) = ipc::run_command(wm_name, exec) {
-        eprintln!("Error: execute_keybinding failed: {exec}: {error}");
-    }
+    run_binding(wm_name, exec);
     quit();
 }
 

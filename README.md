@@ -115,6 +115,9 @@ way sway reads them) in one commit.
 Then #175 (help as a page of its own that scrolls, in single-page and
 all-pages mode) in one commit.
 
+Then the open upstream pull request #187 (menu pages with submenus,
+binding and command rows) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -264,13 +267,33 @@ it (not beside a link's target) and beside an included file's real path,
 and each file is read once. The port goes further than that pull request,
 which leaves quotes, backslashes and `${NAME:-word}`-style forms alone: it
 follows glibc in those too, including the rule that a word only becomes a
-pattern at a wildcard written unquoted.
+pattern at a wildcard written unquoted; #187 menu pages: a page file with
+`Entries` lists a tree of rows that open submenus, run one of the window
+manager's bindings (named by its description on the Keybindings page,
+showing the same key text) or run a command, with `When` and `State`
+commands, BackSpace and Alt+Left back up, search through every level below
+the open one, and `-p <page>/<id>[/<id>...]` opening a submenu (see
+[Menus](#menus)). The port differs from that pull request in a few places:
+a `State` command runs again about 5 seconds after each run ends while its
+row is listed on the tab in view, so a row's `On`/`Off` follows a change
+within about 7 seconds (the Vala change runs it once); a small guardian
+process ends the `When` and `State` commands still running, with their
+process groups, also when ilia is killed by a signal it cannot catch, and
+ilia catches the usual terminating signals to stop them before it ends as
+the signal would have ended it; search follows the `fuzzy-matching`
+setting; a click acts only when the button goes down and comes up on the
+same entry, even if rows arrive in between (the Vala change needs the row
+in the same place); an `Exec` value that cannot be split into words keeps
+its row, which does nothing when chosen, with a warning (the Vala change
+leaves the entry out); `-p unknown/<path>` keeps the usual messages for an
+unknown page, `Unknown page type: unknown` (the Vala change reports that
+the page has no menu).
 
 **Not yet ported** (open items):
 
 - Open upstream PRs that will likely land: #164 (notification actions)
-  and #173 (desktop-entry actions). #172, #174, #180, #181, #184 and #190
-  are already in the port (see above).
+  and #173 (desktop-entry actions). #172, #174, #180, #181, #184, #187 and
+  #190 are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help page's
@@ -403,7 +426,7 @@ Ilia provides pages to view and select from the following types of things:
 - File Search (`tracker`)
 - Open Windows (`windows`)
 - Calculator (`calculator`)
-- Pages defined in files: favourite apps, fixed lines, or the lines a command prints (see [Pages from files](#pages-from-files))
+- Pages defined in files: favourite apps, fixed lines, the lines a command prints, or a menu of actions (see [Pages from files](#pages-from-files))
 
 ### Usage
 
@@ -506,6 +529,7 @@ The keys of the `[Ilia Page]` group:
   - `Apps`: desktop file IDs, listed in the order given. Choosing one launches it as the Applications page does; entries that are not installed or not shown on this desktop are left out.
   - `Items`: lines of text, separated by `;`.
   - `ItemsCommand`: a shell command (`/bin/sh -c`), each line it prints is a row. It runs when the page is first shown, rows appear as they are printed, and it is stopped, with its process group, when ilia closes.
+  - `Entries`: the entries of a menu, see [Menus](#menus).
 - `Exec`: for `Items` and `ItemsCommand`, the command that choosing a row runs, with each `%s` replaced by the row's value as one argument (`%%` is a `%`; without `%s` the value is added as the last argument). The command is not run by a shell; it starts in its own `systemd-run --user --scope` unit when `systemd-run` is available. Without `Exec`, the value is printed, as with `textlist`.
 - `Sort=frequency`: for `Items` and `ItemsCommand`, the rows chosen most often come first. Choices are recorded as `<name>#<value>` in the `app-launch-counts` setting, the launch history the Applications page ranks by, which keeps the latest 32 launches.
 - `OnlyShowIn`, `NotShowIn`: window managers the page is or is not shown under: `i3`, `sway`, or `other` for any other.
@@ -513,6 +537,84 @@ The keys of the `[Ilia Page]` group:
 A row of `Items` or `ItemsCommand` may be `label<tab>value`: the label is shown and searched, and choosing the row uses the value (in a key file, a tab is written `\t`).
 Rows are matched as on the other pages, following the `fuzzy-matching` setting; rows of `Apps` are matched as on the Applications page, following `match-fields` too, but keep their order.
 Files that cannot be used are reported on standard error and skipped.
+
+#### Menus
+
+A page with `Entries` is a menu: a short tree of rows that open submenus, run one of the window manager's bindings, or run a command.
+
+```
+[Ilia Page]
+Name=Actions
+Icon=system-run
+Key=i
+Entries=capture;toggles;system
+
+[Entry capture]
+Name=Capture
+Entries=area;window
+
+[Entry area]
+Name=Screenshot of an area
+Binding=Session // Screenshot Selection
+
+[Entry window]
+Name=Screenshot of a window
+Binding=Window Snapshot
+
+[Entry toggles]
+Name=Toggles
+Entries=banners
+
+[Entry banners]
+Name=Do not disturb
+Exec=dunstctl set-paused toggle
+State=dunstctl is-paused
+
+[Entry system]
+Name=System
+Entries=lock;hibernate
+
+[Entry lock]
+Name=Lock screen
+Binding=Session // Lock Screen
+
+[Entry hibernate]
+Name=Hibernate
+Exec=systemctl hibernate
+When=grep -qw disk /sys/power/state
+```
+
+`Entries` lists the ids of the top-level rows, in order (empty pieces between `;` are skipped); `Sort` and `Exec` of the page are not used.
+Each id (ASCII letters, digits, `-` and `_`) is described by an `[Entry <id>]` group:
+
+- `Name` (required): the row's text, as plain text.
+- `Icon`: the row's icon; the page's icon by default.
+- Exactly one of:
+  - `Entries`: the ids of a submenu's rows, in order. The row shows `›`.
+  - `Binding`: a binding of the window manager, by its description on the Keybindings page: `Action` or `Category // Action`, ignoring letter case and the spaces around `//` and at the ends. The row shows the key text the Keybindings page shows for it, and choosing it sends the binding's command to the window manager, as choosing it on the Keybindings page does; if several bindings have that description, the one the Keybindings page lists first. The row is hidden when no binding with a command has the description, and under window managers other than i3 and sway.
+  - `Exec`: a command, split into words as a shell would do it but not run by a shell; `%%` is a `%`. It runs as `Exec` of a page does, in its own `systemd-run --user --scope` unit when `systemd-run` is available.
+- `When`: a command; the row is shown only once it has exited with status 0.
+- `State`: a command; the first line it prints, `on`, `true` or `1`, or `off`, `false` or `0` (trimmed, in any letter case), shows `On` or `Off` in the row.
+- `OnlyShowIn`, `NotShowIn`: as for a page.
+
+A submenu is shown only if some row below it is shown.
+Binding rows are matched before the page is first displayed, so they never arrive late.
+When the page is first shown (at start-up, or with `-a` when its tab is first selected) all `When` and `State` commands of the tree start, directly (no shell), with standard input from `/dev/null`, each in a process group of its own.
+ilia does not wait for them: rows appear, and `On` or `Off` is filled in, as they finish, and the highlighted row stays highlighted.
+A command still running after 2 seconds is stopped with its process group, which leaves its row hidden (`When`) or its column as it was (`State`).
+`When` runs once; `State` runs again about 5 seconds after each run ends, for as long as its row is listed on the tab in view.
+The commands still running when ilia ends are stopped too, however it ends.
+
+Enter or a click opens a submenu or runs the row. BackSpace, with nothing typed, and Alt+Left go back up, to the row of the submenu that was open.
+Typing searches every row below the open submenu: a row deeper down is shown with its path, such as `Capture › Screenshot of an area`, and matches when every typed word occurs in that text, compared as on the other pages (ignoring letter case and accents, and following `fuzzy-matching`).
+
+`ilia -p <page>/<id>[/<id>...]` opens the menu at a submenu, for example `ilia -p actions/system` from a key binding or a script; `ilia -a -p actions/system` does the same on the menu's tab.
+The ids must be exact, each a submenu of the one before, shown under the current window manager; `When` and bindings are not checked, so such a submenu may open empty.
+For any other path to a page that exists, ilia prints `ilia: page '<page>' has no menu '<path>'` and exits with status 1.
+
+An entry that cannot be used (no group, no `Name` or a blank one, none or several of `Entries`, `Binding` and `Exec`, or an id with other characters) is left out with a warning on standard error, and the rest of the menu works.
+An `Exec` that cannot be split into words is reported too; its row does nothing.
+An id listed twice anywhere in the file, or a submenu that leads back to itself, makes the whole file unusable.
 
 The window manager is sway when `SWAYSOCK` is set to something, else i3 when `I3SOCK` is.
 The `keybindings` and `windows` pages need i3 or sway: under other window managers they are not shown, and `ilia -p keybindings` exits with an error.

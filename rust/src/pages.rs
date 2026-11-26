@@ -11,6 +11,7 @@ use crate::args::Args;
 use crate::calculator::{self, CalculatorPage};
 use crate::filter::{match_fields, query_words, Match};
 use crate::keybindings::KeybindingsPage;
+use crate::menu::MenuPage;
 use crate::notifications::RoficationPage;
 use crate::page_files::{PageFile, Rows};
 use crate::terminal::CommandPage;
@@ -338,15 +339,28 @@ pub fn create(
     }
 }
 
-/// The page a page file defines; `key` is the letter that selects it.
+/// The page a page file defines; `key` is the letter that selects it. A
+/// menu page opens at the submenus `level` (from the top) and runs bindings
+/// of the window manager `wm_name`.
 pub fn create_from_file(
     file: &PageFile,
     key: Option<char>,
     settings: &gio::Settings,
     entry: &gtk::Entry,
     quit: Rc<dyn Fn()>,
+    wm_name: &str,
+    level: Vec<usize>,
 ) -> Rc<dyn DialogPage> {
     match file.rows {
+        Rows::Menu(_) => MenuPage::new(
+            settings.clone(),
+            entry.clone(),
+            file,
+            key,
+            quit,
+            wm_name,
+            level,
+        ),
         Rows::Apps(_) => Rc::new(AppListPage::new(
             settings.clone(),
             entry.clone(),

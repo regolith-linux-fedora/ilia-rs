@@ -13,6 +13,7 @@ mod input_sources;
 mod ipc;
 mod keybindings;
 mod launch;
+mod menu;
 mod new_entry;
 mod new_workspace;
 mod notifications;

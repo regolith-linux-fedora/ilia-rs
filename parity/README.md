@@ -88,6 +88,27 @@ the keys, and under i3 the keys the Applications page keeps from i3
 i3. On the Calculator page Left and Right move the text cursor and switch
 pages only from either end of the text with nothing selected.
 
+`test_menu.py` covers menu pages (upstream #187, with the port's
+additions): each case runs under a fake i3 and a fake sway, and those
+about binding rows or links also with no window manager. The rows are seen
+through what Enter does. A binding row found by a search through two levels
+(`capture region`, matched in any letter case and with spaces around `//`)
+reaches the window manager as one RUN_COMMAND request and closes ilia
+silently; a description with no binding line after it gives no row, and
+with no window manager a submenu holding only binding rows is hidden too.
+An `Exec` row starts in a `systemd-run --user --scope` unit named
+`run_ilia_<page>_<8 hex digits>.scope`, `%%` passed as `%`. BackSpace and
+Alt+Left climb to the submenu that led in, BackSpace at the top does
+nothing, and with text typed it edits the text. `When` hides its row until
+it passes and runs once. `-p page/submenu` opens there (the page in any
+letter case); a path through a non-submenu, a missing id, a built-in page
+or a submenu its `OnlyShowIn` hides prints `ilia: page '<page>' has no menu
+'<path>'` and exits 1, and an unknown page keeps `Unknown page type`.
+Under `-a` the menu keeps its submenu while Help is shown. A `State`
+command is stopped after 2 seconds and runs again about 5 seconds later,
+and it does not outlive ilia ended by SIGTERM or SIGKILL. A repeated id, or
+a loop through submenus no chain reaches, skips the file with one line.
+
 `test_entries_read_early.py` checks that the entries read during
 start-up (upstream #162, read outside GLib in the port) keep what GLib's own
 entries give: `%k` is the desktop file, a `DBusActivatable=true` entry is

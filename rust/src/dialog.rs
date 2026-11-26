@@ -92,7 +92,12 @@ pub fn build(
     wm_name: &str,
     is_wayland: bool,
 ) -> Result<gtk::Window, ()> {
-    let focus_name = args.value("-p").unwrap_or("Apps");
+    // `-p <page>/<entry id>[/<entry id>...]` opens a menu page at a submenu.
+    let asked = args.value("-p").unwrap_or("Apps");
+    let (focus_name, link) = match asked.split_once('/') {
+        Some((page, path)) => (page, Some(path)),
+        None => (asked, None),
+    };
     let all = args.has("-a");
     // Every page file is read at start-up, whichever page is asked for.
     let reserved: Vec<&str> = PAGES.iter().map(|page| page.id).collect();
@@ -117,6 +122,24 @@ pub fn build(
         eprintln!("ilia: page '{focus_name}' is not available under the current window manager");
         return Err(());
     }
+    // The submenus a link opens. When and binding matches play no part.
+    let level = match (link, focus) {
+        (Some(path), Some(spec)) => {
+            let resolved = spec.and_then(|spec| match spec {
+                PageSpec::File(file) => file.menu()?.resolve(path, manager),
+                PageSpec::Builtin(_) => None,
+            });
+            match resolved {
+                Some(level) => level,
+                None => {
+                    eprintln!("ilia: page '{focus_name}' has no menu '{path}'");
+                    return Err(());
+                }
+            }
+        }
+        // An unknown page keeps its usual messages.
+        _ => Vec::new(),
+    };
 
     let settings = gio::Settings::new("org.regolith-linux.ilia");
     let width = settings.int("window-width");
@@ -160,6 +183,8 @@ pub fn build(
 
     // The page asked for, when it can be shown.
     let focus = focus.flatten();
+    let focus_id = focus.map(|spec| spec.id().to_owned());
+    let mut level = Some(level);
     let page_specs: Vec<PageSpec> = if all {
         // The built-in pages this window manager supports, then the page
         // files it shows, by file name.
@@ -198,7 +223,21 @@ pub fn build(
                 is_wayland,
             ),
             PageSpec::File(file) => {
-                create_from_file(file, *key, &settings, &entry, page_quit.clone())
+                // Only the page asked for opens where the link points.
+                let level = if focus_id.as_deref() == Some(file.id.as_str()) {
+                    level.take().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                create_from_file(
+                    file,
+                    *key,
+                    &settings,
+                    &entry,
+                    page_quit.clone(),
+                    wm_name,
+                    level,
+                )
             }
         })
         .collect();

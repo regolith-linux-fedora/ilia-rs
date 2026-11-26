@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::os::fd::RawFd;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use gio::prelude::*;
 use gtk::prelude::*;
@@ -8,6 +10,7 @@ use gtk_layer_shell::LayerShell;
 use crate::apps;
 use crate::args::Args;
 use crate::dialog;
+use crate::menu;
 use crate::textlist;
 
 const DEFAULT_CSS: &str = r#"                .root_box {
@@ -111,12 +114,147 @@ pub fn run(args: Args) -> i32 {
             seat.ungrab();
         }
     });
+    // A terminating signal closes the launcher like any other way out, so
+    // the commands its pages started end with it.
+    let signalled = Rc::new(Cell::new(None::<i32>));
+    if let Some(signals) = catch_terminating_signals() {
+        let (app, signalled) = (app.clone(), signalled.clone());
+        glib::source::unix_fd_add_local(signals, glib::IOCondition::IN, move |fd, _| {
+            if let Some(signal) = read_signal(fd) {
+                signalled.set(signalled.get().or(Some(signal)));
+                app.quit();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     app.run_with_args(&["ilia"]);
     // Page commands still running end with the launcher; a command a
-    // choice started gets a moment to finish.
+    // choice started gets a moment to finish. A signal that came while the
+    // main loop was ending, or comes while the launcher waits here, counts
+    // too.
     textlist::stop_commands();
+    menu::stop_commands();
+    if let Some(signal) = signalled.get().or_else(pending_signal) {
+        end_by_signal(signal);
+    }
     textlist::wait_for_launched();
+    if let Some(signal) = pending_signal() {
+        end_by_signal(signal);
+    }
     exit_status.get()
+}
+
+/// The terminating signals the launcher catches to close cleanly. Others,
+/// SIGKILL among them, end it at once; the commands its menu pages started
+/// still end with it (their guardian stops them, see `menu`). SIGTRAP is
+/// left alone: it is how GLib stops on a fatal error.
+const TERMINATING_SIGNALS: [libc::c_int; 12] = [
+    libc::SIGTERM,
+    libc::SIGINT,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGABRT,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGPROF,
+    libc::SIGVTALRM,
+];
+
+/// The end of the pipe the signal handler writes caught signals to, or -1.
+static SIGNAL_WRITER: AtomicI32 = AtomicI32::new(-1);
+/// The end of that pipe the main loop reads them from, or -1.
+static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_terminating_signal(signal: libc::c_int) {
+    let writer = SIGNAL_WRITER.load(Ordering::Relaxed);
+    if writer < 0 {
+        return;
+    }
+    // SAFETY: only async-signal-safe calls, on a live one-byte buffer;
+    // errno is restored for the code the signal interrupted.
+    unsafe {
+        let errno = *libc::__errno_location();
+        let byte = signal as u8;
+        libc::write(writer, std::ptr::addr_of!(byte).cast(), 1);
+        *libc::__errno_location() = errno;
+    }
+}
+
+/// Catches the terminating signals that still have their default action at
+/// start-up, so that each becomes a byte to read on the returned
+/// descriptor; `None` when they cannot be caught. A signal ignored, or
+/// handled by something loaded before the launcher (a profiler's SIGPROF,
+/// say), is left as it is.
+fn catch_terminating_signals() -> Option<RawFd> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` is a live array of the two descriptors pipe2 fills in.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return None;
+    }
+    SIGNAL_PIPE.store(fds[0], Ordering::Relaxed);
+    SIGNAL_WRITER.store(fds[1], Ordering::Relaxed);
+    for signal in TERMINATING_SIGNALS {
+        // SAFETY: all-zero sigaction structures are valid; sigaction reads
+        // and writes only the live structures passed, and the handler is
+        // async-signal-safe.
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut current) != 0
+                || current.sa_sigaction != libc::SIG_DFL
+            {
+                continue;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_terminating_signal as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+    Some(fds[0])
+}
+
+/// The first caught signal not yet read, if any.
+fn pending_signal() -> Option<i32> {
+    let signals = SIGNAL_PIPE.load(Ordering::Relaxed);
+    if signals < 0 {
+        return None;
+    }
+    read_signal(signals)
+}
+
+/// The first signal waiting on the descriptor `fd`, reading all of them.
+fn read_signal(fd: RawFd) -> Option<i32> {
+    let mut first = None;
+    let mut buffer = [0u8; 16];
+    loop {
+        // SAFETY: `buffer` is a live, writable buffer of the length given.
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        match usize::try_from(read) {
+            Ok(read) if read > 0 => first = first.or(Some(i32::from(buffer[0]))),
+            _ if read < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return first,
+        }
+    }
+}
+
+/// Ends the launcher as `signal` would have ended it, without a core dump.
+fn end_by_signal(signal: i32) {
+    // SAFETY: setrlimit reads the live structure passed; restoring the
+    // default action and raising a signal touch no memory of this process.
+    unsafe {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
 }
 
 /// Whether the dialog shows the Applications page: always with `-a`, and
