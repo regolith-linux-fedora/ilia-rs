@@ -27,6 +27,9 @@ def test_help_contract():
         "\t'windows' - navigate to a window\n"
         "\t'tracker' - search for files by content\n"
         "\t'calculator' - evaluate expressions as you type\n"
+        "\t'wifi' - join or leave a wireless network\n"
+        "\t'bluetooth' - connect or disconnect a Bluetooth device\n"
+        "\t'power' - choose a power profile\n"
     )
     assert (result.returncode, result.stdout, result.stderr) == (0, expected, "")
 

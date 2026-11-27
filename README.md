@@ -118,6 +118,9 @@ all-pages mode) in one commit.
 Then the open upstream pull request #187 (menu pages with submenus,
 binding and command rows) in one commit.
 
+Then the open upstream pull request #188 (Wi-Fi, Bluetooth and power
+profile pages) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -287,13 +290,32 @@ in the same place); an `Exec` value that cannot be split into words keeps
 its row, which does nothing when chosen, with a warning (the Vala change
 leaves the entry out); `-p unknown/<path>` keeps the usual messages for an
 unknown page, `Unknown page type: unknown` (the Vala change reports that
-the page has no menu).
+the page has no menu); #188 Wi-Fi, Bluetooth and power profile pages
+(`-p wifi`, `-p bluetooth`, `-p power`, not part of `-a`) that list what
+NetworkManager, BlueZ and power-profiles-daemon report on the system bus,
+follow their changes while open and act on Enter or a click (see
+[Wi-Fi, Bluetooth and Power](#wi-fi-bluetooth-and-power)). The port
+differs from that pull request in a few places: an OWE ("Enhanced Open")
+network, and the open network of an OWE transition pair, is joined without
+a passphrase, with `key-mgmt` `owe`, and Enter on a WEP network reports
+`WEP is not supported` (the Vala change asks both for a WPA passphrase); a
+WPA3-Enterprise 192-bit network counts as Enterprise; the pages follow
+their service's bus name, so a daemon that starts, stops or restarts while
+the page is open is read again; rows appear as each answer arrives, so an
+object that never answers holds back only its own row, and what a signal
+announces is applied as it comes (the Vala change reads every object
+again, one after the other, after each signal and shows the rows once all
+have answered); an error line is always one line, and never shows the
+passphrase typed, even when the service repeats it; discovery that the
+page started is also stopped when ilia closes for a suspend or a screen
+lock; and a dialog that takes the focus while an action waits (a polkit or
+pairing agent's) leaves the window open.
 
 **Not yet ported** (open items):
 
 - Open upstream PRs that will likely land: #164 (notification actions)
-  and #173 (desktop-entry actions). #172, #174, #180, #181, #184, #187 and
-  #190 are already in the port (see above).
+  and #173 (desktop-entry actions). #172, #174, #180, #181, #184, #187,
+  #188 and #190 are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help page's
@@ -426,6 +448,9 @@ Ilia provides pages to view and select from the following types of things:
 - File Search (`tracker`)
 - Open Windows (`windows`)
 - Calculator (`calculator`)
+- Wi-Fi Networks (`wifi`)
+- Bluetooth Devices (`bluetooth`)
+- Power Profiles (`power`)
 - Pages defined in files: favourite apps, fixed lines, the lines a command prints, or a menu of actions (see [Pages from files](#pages-from-files))
 
 ### Usage
@@ -485,6 +510,21 @@ Enter prints the answer on standard output, copies it to the clipboard and close
 The answer stays pasteable after ilia closes: an X11 clipboard manager takes it, and without one (always on Wayland) ilia keeps running without a window until something else is copied, so a caller that waits for `ilia -p calculator` to exit waits until then.
 On this page Left and Right move the cursor in the entry; they switch pages only from either end of the text, with nothing selected.
 The answers come from `ilia-calculator`, a helper built against libqalculate and installed in `libexecdir`.
+
+#### Wi-Fi, Bluetooth and Power
+
+The `wifi`, `bluetooth` and `power` pages are quick panels for the system services behind them, reached on the system bus (`DBUS_SYSTEM_BUS_ADDRESS` when set).
+Each is shown on its own with `-p` (it is not one of the pages `-a` shows) and lists one row per network, device or profile, with a detail and a state.
+The window opens at once and the rows fill in as the service answers; they follow the service's changes while the page is open, and the highlight stays on the same network, device or profile.
+The filter keeps the rows whose name holds every word typed, ignoring case and accents.
+Enter, or a click, acts on the highlighted row and closes ilia once the service accepts; if the service returns an error, or no reply within five seconds, ilia prints `ilia: <row>: <message>` on standard error and stays open.
+
+- `wifi` (NetworkManager) lists the networks the Wi-Fi devices see, one row per network name with the strength of its strongest access point, connected ones first, then by signal strength. The state reads `Connected`, `Connecting`, `Saved`, `Open`, `Enterprise` or `Secured`. Enter disconnects a connected network, activates a saved one, joins an open or OWE one, and asks for the passphrase of a WPA/WPA3 personal network in the entry, whose text is then hidden (Escape leaves the prompt). Enterprise (802.1X) and WEP networks are listed but not joined from here. Every Wi-Fi device is asked to scan when the page opens.
+- `bluetooth` (BlueZ) lists paired, connected and named devices, with their battery level when known. Enter disconnects a connected device, connects a paired one, and pairs, trusts and connects any other. Discovery runs while the page is open, on the powered adapters that were not already discovering, and is stopped on exactly those when ilia closes.
+- `power` (power-profiles-daemon, at `org.freedesktop.UPower.PowerProfiles` or the older `net.hadess.PowerProfiles`) lists the profiles and marks the active one. Enter makes the highlighted profile active.
+
+When a service is missing, or its radio is off, the page says so in a single row; Enter on the "is off" row turns the Wi-Fi radio or the Bluetooth adapters on.
+A page file named `wifi`, `bluetooth` or `power` is now skipped with a warning, as for the other built-in names.
 
 #### Help
 
@@ -651,6 +691,10 @@ gsettings reset org.regolith-linux.ilia window-width
 #### Notifications
 
 This page communicates with the [Rofication](https://github.com/regolith-linux/regolith-rofication) daemon for managing desktop notifications.
+
+#### Wi-Fi, Bluetooth and Power
+
+These pages talk to [NetworkManager](https://networkmanager.dev/), [BlueZ](https://www.bluez.org/) and [power-profiles-daemon](https://gitlab.freedesktop.org/upower/power-profiles-daemon) over the system bus with GIO; none of them is needed to build or run ilia. Pairing a device that asks for a PIN or a passkey needs a Bluetooth agent from the desktop.
 
 #### Keybindings
 

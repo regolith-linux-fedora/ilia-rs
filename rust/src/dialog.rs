@@ -877,12 +877,19 @@ fn entry_editing(entry: &gtk::Entry, event: &gdk::EventKey, page: &dyn DialogPag
     let text = entry.text();
     // Entry positions count characters.
     let length = text.chars().count() as i32;
+    let hidden = !entry.property::<bool>("visibility");
     let key = char::from_u32(keyval)?;
     match key {
         'j' | 'n' | 'k' | 'p' => return Some(page.key_event(event)),
         // The entry is off on the Help page: its keys do nothing there, and
         // Ctrl+c leaves the clipboard alone.
         _ if !entry.is_sensitive() && is_entry_key(key) => {}
+        // Hidden text, such as a Wi-Fi passphrase, stays off the clipboard,
+        // and word motion does not show where its words end: GTK's own
+        // rules for an entry whose text is not visible.
+        'c' | 'x' if hidden => {}
+        'w' if hidden => entry.set_position(-1),
+        'b' if hidden => entry.set_position(0),
         'h' => {
             let position = entry.position();
             if position > 0 {

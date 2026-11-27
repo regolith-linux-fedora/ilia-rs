@@ -128,6 +128,9 @@ pub fn run(args: Args) -> i32 {
         });
     }
     app.run_with_args(&["ilia"]);
+    // A panel's last requests to its service, such as ending a Bluetooth
+    // discovery, reach the bus before the launcher exits.
+    crate::panels::finish();
     // Page commands still running end with the launcher; a command a
     // choice started gets a moment to finish. A signal that came while the
     // main loop was ending, or comes while the launcher waits here, counts

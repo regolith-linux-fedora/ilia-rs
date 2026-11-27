@@ -21,8 +21,8 @@ display's resource database (libX11 and libXtst are linked).
 
 This is the complete port. All seven pages are real: Applications,
 Keybindings and Windows, and the Commands (terminal),
-Notifications, TextList, and Files (Tracker) pages. An eighth, the
-Calculator page, is ported ahead of upstream. The dialog shell is
+Notifications, TextList, and Files (Tracker) pages. The Calculator page,
+and the Wi-Fi, Bluetooth and power panels, are ported ahead of upstream. The dialog shell is
 complete as well: stylesheet modes, Alt+letter page switching, Alt+plus /
 Alt+minus resizing with `window-width`/`window-height` persistence, the Help
 page and its entry desensitizing, the Ctrl entry-editing keys, focus-loss and
@@ -122,6 +122,19 @@ Module map:
   confirmed on the Calculator page, which stay pasteable after the window
   closes: handed to an X11 clipboard manager, or served by ilia, running on
   without a window, until the clipboard holds something else.
+- `panels/`: the Wi-Fi, Bluetooth and power panels (`-p wifi`,
+  `-p bluetooth`, `-p power`). `mod.rs` holds what they share: the
+  three-cell list with its filter, pinned and followed highlight and
+  passphrase prompt; the system-bus service a panel follows by its bus
+  name (`watch`), with its async reads, five-second actions and signal
+  subscriptions; and the `Journal` that replays signals onto answers that
+  were on their way while the signals came, so an answer never undoes a
+  newer change. `wifi.rs` reads NetworkManager object by object (each
+  answer stands alone, so one object that never answers holds back only its
+  own row), `bluetooth.rs` reads BlueZ through its object manager and
+  starts and stops discovery, and `power.rs` reads power-profiles-daemon
+  under either of its bus names. The listing rules (`networks`,
+  `sorted_devices`, `rows`) are pure functions with unit tests.
 - `help.rs`: the Help page, the last tab in both modes. It describes the
   page in view before it was opened (`dialog.rs` tells it which): that
   page's name, help text and keys, then the keys every page shares, in a

@@ -137,6 +137,18 @@ The cases need `ilia-calculator` beside the binary, as meson builds it in
 `build/src`, or installed, and `/usr/bin/xclip`; they are skipped
 otherwise.
 
+`test_panels.py` covers the Wi-Fi, Bluetooth and power panels (upstream
+#188, ported ahead of upstream). python-dbusmock's own `networkmanager`,
+`bluez5` and `upower_power_profiles_daemon` templates serve the private
+bus, which is also the test's system bus, and the cases read the
+templates' call logs: Enter joins the open network typed into the filter
+(`AddAndActivateConnection` on its device and access point, no `psk`),
+connects a paired device, and makes the typed profile active. With no
+service the panels open, stay quiet and close with Esc; with `-a` they are
+unknown page names. The cases are skipped without python-dbusmock. The
+`bluez5` template of python-dbusmock 0.38 answers `StartDiscovery` with a
+`KeyError`, so no case counts discovery calls.
+
 Tracker uses the no-miner judgment call and checks nonempty, distribution-
 dependent D-Bus stderr while proving that the UI remains responsive.
 

@@ -14,6 +14,7 @@ use crate::keybindings::KeybindingsPage;
 use crate::menu::MenuPage;
 use crate::notifications::RoficationPage;
 use crate::page_files::{PageFile, Rows};
+use crate::panels::{self, bluetooth::BluetoothPage, power::PowerPage, wifi::WifiPage};
 use crate::terminal::CommandPage;
 use crate::textlist::TextListPage;
 use crate::tracker::TrackerPage;
@@ -66,8 +67,9 @@ pub trait DialogPage {
     fn edits_with_arrow_keys(&self) -> bool {
         false
     }
-    /// Whether the page is starting an app and closes the window itself
-    /// once it has: losing the keyboard focus meanwhile does not close it.
+    /// Whether the page is starting an app, or waiting on an action, and
+    /// closes the window itself once it is done: losing the keyboard focus
+    /// meanwhile does not close it.
     fn is_launching(&self) -> bool {
         false
     }
@@ -112,6 +114,9 @@ pub const PAGES: &[Page] = &[
     Page { id: "windows", name: "<u>W</u>indows", icon: "window-new", key: 'w', help: "This dialog allows for navigating between open windows in the desktop environment.  Selecting a window from the list will cause it to be viewed on screen and focused.", bindings: &[("enter", "Navigate to Window")] },
     Page { id: "tracker", name: "<u>F</u>iles", icon: "emblem-documents", key: 'f', help: "This dialog allows for searching for files based on content. Type in a text query, hit enter and select from the list of files which contain the search string to open it.", bindings: &[("enter", "Open File")] },
     Page { id: "calculator", name: "Ca<u>l</u>culator", icon: "accessories-calculator", key: 'l', help: calculator::HELP, bindings: &[("enter", "Print and Copy Answer")] },
+    Page { id: "wifi", name: "<u>W</u>i-Fi", icon: "network-wireless-symbolic", key: 'w', help: panels::wifi::HELP, bindings: &[("enter", "Connect, Disconnect or Switch Wi-Fi On")] },
+    Page { id: "bluetooth", name: "<u>B</u>luetooth", icon: "bluetooth-symbolic", key: 'b', help: panels::bluetooth::HELP, bindings: &[("enter", "Connect, Disconnect or Pair Device")] },
+    Page { id: "power", name: "<u>P</u>ower", icon: "power-profile-balanced-symbolic", key: 'p', help: panels::power::HELP, bindings: &[("enter", "Switch to Profile")] },
 ];
 
 /// The pages that need i3 or sway, which are not offered under any other
@@ -335,6 +340,9 @@ pub fn create(
             quit,
         )),
         "calculator" => CalculatorPage::new(entry.clone(), quit),
+        "wifi" => WifiPage::new(entry.clone(), quit),
+        "bluetooth" => BluetoothPage::new(entry.clone(), quit),
+        "power" => PowerPage::new(entry.clone(), quit),
         _ => Rc::new(*page),
     }
 }
