@@ -121,6 +121,9 @@ binding and command rows) in one commit.
 Then the open upstream pull request #188 (Wi-Fi, Bluetooth and power
 profile pages) in one commit.
 
+Then the open upstream pull request #179 (desktop-entry actions on the
+Applications page; it replaces #173) in one commit.
+
 ## Differences from upstream
 
 Compared with regolith-linux/ilia `main` at `b075ac2` (2026-11-09), merged
@@ -309,13 +312,43 @@ have answered); an error line is always one line, and never shows the
 passphrase typed, even when the service repeats it; discovery that the
 page started is also stopped when ilia closes for a suspend or a screen
 lock; and a dialog that takes the focus while an action waits (a polkit or
-pairing agent's) leaves the window open.
+pairing agent's) leaves the window open; #179 (which replaces #173)
+desktop-entry actions on the Applications page: the row of an app whose
+entry declares actions (its `Actions` key and `[Desktop Action <id>]`
+groups) ends with `›`, which assistive technologies read as expandable,
+and as expanded while the actions are shown; Right shows them beneath the
+app in `Actions` order, Right again highlights the first, Left closes
+them, and a move off them or a new filter text closes them too; with text
+typed, an action is listed on its own as `App: Action` when a word of the
+filter occurs in the action's name but not in the app's, ranked among the
+apps; a filter with a colon lists the actions, whose names hold every word
+after it, of the apps the text before it finds; Enter (or a double click
+under X11) starts an action as its app starts, in the app's `Path`, its
+terminal and its scope, or with `ActivateAction` over the session bus for
+a D-Bus-activated app; each action has a launch count of its own, and
+Ctrl+Delete hides one action, both under `<desktop id>#<action id>`; a
+click on `›` under X11 opens or closes the actions (see
+[Desktop Apps](#desktop-apps)). The port differs from that pull request in
+a few places: while an app's actions are shown, typed characters narrow
+them to those whose names hold every typed word, and Backspace widens them
+again until that text is empty (the Vala change edits the filter, which
+closes them); Alt+Enter shows the actions as Right does and never starts
+anything (not in the Vala change); names follow the first of `LANGUAGE`,
+`LC_ALL`, `LC_MESSAGES` and `LANG` that is set, in the Desktop Entry
+specification's key order, and an action whose translated name is empty
+is left out (the Vala change uses GLib's lookup); the `App: ` part is
+drawn halfway between the text and background colours of a plain row (the
+Vala change uses the theme's insensitive colour), and action rows are set
+in 16 pixels (Vala: 24); Ctrl+z brings back a hidden action as it does an
+app; and, with #180, Ctrl+Enter starts the highlighted action on the next
+free workspace, an action's own row is never lifted with its pinned app,
+and Ctrl+f, Alt+Up and Alt+Down do nothing on an action's row.
 
 **Not yet ported** (open items):
 
-- Open upstream PRs that will likely land: #164 (notification actions)
-  and #173 (desktop-entry actions). #172, #174, #180, #181, #184, #187,
-  #188 and #190 are already in the port (see above).
+- Open upstream PRs that will likely land: #164 (notification actions).
+  #172, #174, #179 (which replaces #173), #180, #181, #184, #187, #188 and
+  #190 are already in the port (see above).
 
 **Dialog details brought in line with ilia** (port bugs, no upstream pull
 request): tab icons are flat buttons that switch the page; the Help page's
@@ -485,6 +518,16 @@ Changes another program makes to `favorite-apps` (`gsettings set`, dconf-editor)
 Ctrl+Enter (or Ctrl with the keypad Enter) opens the highlighted application on the next free workspace: the lowest positive number no workspace has, where a name such as `2:web` takes 2.
 The workspace is named by the resource `wm.workspace.NN.name` (`NN` the number with at least two digits) when it is set and not empty, read from the X resource database under i3 and from trawl under sway, and is the number otherwise.
 ilia switches to the workspace, waits for the window manager to confirm, and then starts the application as Enter does.
+
+Many desktop entries declare actions besides starting the application, such as a browser's private window or a mail client's new message.
+An application with actions has `›` at the end of its row.
+Right (or Alt+Enter) on that row shows its actions beneath it, in the entry's order; Right again highlights the first one, and Left closes them, as do moving the highlight off them and changing the filter.
+While they are shown, typing narrows them to the actions whose names hold every typed word, without touching the filter, and Backspace widens them again.
+Under X11 a click on `›` opens or closes them, and a double click on an action starts it.
+With text typed, a word of the application's name and one of the action's list the action on its own, as `Application: Action`; the application's name alone lists only the application.
+A colon picks actions directly: the text before it finds the applications, the text after it their actions (`term:pref`, or `:private` for every application).
+Enter starts an action the way its application starts, in the same directory, terminal and scope, or over the session bus for an application started there.
+Ctrl+Delete hides the highlighted action and Ctrl+z brings it back; each action keeps its own launch count.
 
 #### Text List
 
@@ -671,9 +714,10 @@ Ilia supports the following configuration via gsettings under the namespace `org
 - match-fields: application fields searched besides the name, any of
   `generic-name`, `keywords` and `comment` (default: all three)
 - hidden-apps: desktop ids, or patterns with `*` and `?`, of applications
-  never listed; an entry starting with `!` lists again what it matches.
-  Ctrl+Delete on the Applications page adds the highlighted app, Ctrl+z
-  takes it out again (default `[]`)
+  never listed, or `<desktop id>#<action id>` for one action of an
+  application; an entry starting with `!` lists again what it matches.
+  Ctrl+Delete on the Applications page adds the highlighted app or action,
+  Ctrl+z takes it out again (default `[]`)
 - favorite-apps: desktop ids of the applications pinned at the head of the
   Applications page, in their order. Ctrl+f adds or removes the highlighted
   app, Alt+Up and Alt+Down move it (default `[]`)

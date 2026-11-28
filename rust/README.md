@@ -15,7 +15,11 @@ the libxkbcommon calls in `xkb.rs` that build sway's keymap for the
 Keybindings page (libxkbcommon is linked; GTK already depends on it),
 `setlocale` in `application.rs` before the desktop files are read, GLib's
 search tokenizer in `entries.rs`, which gtk-rs does not wrap, the
-hand-over of the entries read on worker threads in `apps.rs`, and the Xlib
+hand-over of the entries read on worker threads in `apps.rs`, two calls in
+`apps.rs` for desktop-entry actions (the theme's `horizontal-separator`,
+which gtk-rs reads into a value GTK refuses, and a state-set hook on GTK's
+text-cell accessibles that reports an app's row whose open actions are all
+narrowed away as expandable and expanded), and the Xlib
 and XTEST calls in `x11.rs` that pass the desktop's keys on and read the
 display's resource database (libX11 and libXtst are linked).
 
@@ -38,12 +42,16 @@ Module map:
 - `entries.rs`: reading the desktop entries as GLib lists them (desktop
   ids, directory precedence, hidden entries) on reader threads that a
   stuck file does not hold up, and GLib's search ranking over them, for
-  the Windows page's icons while the Applications page reads them. The
-  Applications page starts the read before GTK (`apps.rs`) and fills in
-  its list when it arrives.
+  the Windows page's icons while the Applications page reads them, and the
+  actions each entry declares (its `Actions` key and `[Desktop Action]`
+  groups, named in the user's language). The Applications page starts the
+  read before GTK (`apps.rs`) and fills in its list when it arrives; there
+  an app's actions are rows beneath its own, shown with Right, and rows of
+  their own for the filter.
 - `launch.rs`: starting an Applications-page entry as its desktop file
   describes it (Exec field codes, Path, `Terminal=true`, the scope, and
-  `DBusActivatable=true` activation over the session bus).
+  `DBusActivatable=true` activation over the session bus), and its actions
+  the same way, with the action's Exec line or an `ActivateAction` call.
 - `terminal.rs`: the Commands page (asynchronous PATH scan, launches through
   the `systemd-run` wrapper in `runner.rs`).
 - `textlist.rs`: the TextList page (stdin read on a background thread, so
@@ -117,7 +125,8 @@ Module map:
   applications directory.
 - `program_path.rs`: the program behind a desktop entry, as the
   Applications page's strip names it (the `Exec` words, `env` wrappers,
-  the search path, links, and session-bus entries).
+  the search path, links, and session-bus entries), also for an action's
+  Exec line.
 - `clipboard_keeper.rs`: the path copied with Ctrl+Shift+C and the answer
   confirmed on the Calculator page, which stay pasteable after the window
   closes: handed to an X11 clipboard manager, or served by ilia, running on

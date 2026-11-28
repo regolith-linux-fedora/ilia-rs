@@ -149,6 +149,21 @@ unknown page names. The cases are skipped without python-dbusmock. The
 `bluez5` template of python-dbusmock 0.38 answers `StartDiscovery` with a
 `KeyError`, so no case counts discovery calls.
 
+`test_desktop_actions.py` covers desktop-entry actions on the Applications
+page (upstream #179, which replaces #173, ported ahead of upstream). The
+cases read the rows through what Enter starts, logged by the fake runner
+and program: a word of the action's name lists it and Enter starts it in
+its own scope; the app's name alone lists the app alone; Right shows the
+actions beneath their app in `Actions` order (repeated, empty and unknown
+identifiers and unlisted groups give no row), Right again highlights the
+first, Left closes them, and Alt+Enter does what Right does but starts
+nothing on an app without actions; typing narrows the open actions and
+Backspace widens them; `quo:priv` lists one action. With #180, Ctrl+f on
+an action pins nothing, pinning the open app keeps its actions shown, and
+Ctrl+Enter starts an action only after the fake window manager has
+answered the switch. An action of a D-Bus-activated app is sent to
+`fakes/bus_app.py` as `ActivateAction` with its name, and no Exec line runs.
+
 Tracker uses the no-miner judgment call and checks nonempty, distribution-
 dependent D-Bus stderr while proving that the UI remains responsive.
 

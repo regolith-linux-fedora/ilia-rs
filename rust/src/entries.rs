@@ -130,7 +130,173 @@ pub struct DesktopEntry {
     /// `None` when GLib does not accept the entry as an application (its
     /// program is missing, for one). GLib still finds it by search.
     pub app: Option<gio::DesktopAppInfo>,
+    /// The actions the entry declares, read with the file.
+    pub actions: Vec<DesktopAction>,
     search_terms: Vec<SearchTerm>,
+}
+
+/// One of the actions a desktop entry declares: an identifier its
+/// `Actions` key names, with a `[Desktop Action <id>]` group behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub id: String,
+    /// The name in the user's language; never empty.
+    pub name: String,
+    /// The group's Exec line, the key file escapes undone; `None` when it
+    /// is missing or empty.
+    pub exec: Option<String>,
+}
+
+/// The actions `keyfile` declares, in the order of its `Actions` key: each
+/// identifier at its first position, with a group of its own and a name.
+/// Empty identifiers, identifiers without a group, groups without a name
+/// or with an empty one, and groups the key does not name are skipped.
+/// Whether an action needs an Exec line depends on how its application is
+/// started, so that is left to the caller.
+pub fn desktop_actions(keyfile: &glib::KeyFile) -> Vec<DesktopAction> {
+    desktop_actions_for(keyfile, user_locales())
+}
+
+/// [`desktop_actions`], with names in the language of `locales` (see
+/// [`locale_forms`]).
+fn desktop_actions_for(keyfile: &glib::KeyFile, locales: &[Vec<String>]) -> Vec<DesktopAction> {
+    let Ok(ids) = keyfile.string_list(GROUP, "Actions") else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut actions = Vec::new();
+    for id in ids.iter().map(|id| id.as_str()) {
+        if id.is_empty() || !seen.insert(id) {
+            continue;
+        }
+        let group = format!("Desktop Action {id}");
+        if !keyfile.has_group(&group) {
+            continue;
+        }
+        // A translation that is there but empty counts as no name.
+        let Some(name) = localized("Name", locales, |key| {
+            keyfile.string(&group, key).ok().map(String::from)
+        })
+        .filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let exec = keyfile
+            .string(&group, "Exec")
+            .ok()
+            .filter(|exec| !exec.is_empty());
+        actions.push(DesktopAction {
+            id: id.to_owned(),
+            name,
+            exec: exec.map(String::from),
+        });
+    }
+    actions
+}
+
+/// The variables that can name the user's language, in the order they are
+/// consulted: the first one set and not empty is the only one used.
+const LOCALE_VARIABLES: [&str; 4] = ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"];
+
+/// The locales localized names are looked up for, in order, each as the
+/// key suffixes to try for it (see [`key_forms`]). `variable` gives the
+/// value of an environment variable. `LANGUAGE` holds a colon-separated
+/// list; the other variables hold one locale.
+fn locale_forms(variable: impl Fn(&str) -> Option<String>) -> Vec<Vec<String>> {
+    let Some((name, value)) = LOCALE_VARIABLES.into_iter().find_map(|name| {
+        variable(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| (name, value))
+    }) else {
+        return Vec::new();
+    };
+    let locales: Vec<&str> = if name == "LANGUAGE" {
+        value.split(':').collect()
+    } else {
+        vec![value.as_str()]
+    };
+    locales
+        .into_iter()
+        .map(key_forms)
+        .filter(|forms| !forms.is_empty())
+        .collect()
+}
+
+/// The key suffixes for the locale `locale`, as the Desktop Entry
+/// specification orders them: `lang_COUNTRY@MODIFIER`, `lang_COUNTRY`,
+/// `lang@MODIFIER`, `lang`, each only when the locale has its parts. The
+/// `.ENCODING` part plays no role.
+fn key_forms(locale: &str) -> Vec<String> {
+    let (rest, modifier) = match locale.split_once('@') {
+        Some((rest, modifier)) => (rest, Some(modifier).filter(|m| !m.is_empty())),
+        None => (locale, None),
+    };
+    let rest = rest.split('.').next().unwrap_or_default();
+    let (language, country) = match rest.split_once('_') {
+        Some((language, country)) => (language, Some(country).filter(|c| !c.is_empty())),
+        None => (rest, None),
+    };
+    if language.is_empty() {
+        return Vec::new();
+    }
+    let mut forms = Vec::new();
+    if let Some(country) = country {
+        if let Some(modifier) = modifier {
+            forms.push(format!("{language}_{country}@{modifier}"));
+        }
+        forms.push(format!("{language}_{country}"));
+    }
+    if let Some(modifier) = modifier {
+        forms.push(format!("{language}@{modifier}"));
+    }
+    forms.push(language.to_owned());
+    forms
+}
+
+/// The user's locales (see [`locale_forms`]), read from the environment
+/// once.
+fn user_locales() -> &'static [Vec<String>] {
+    static LOCALES: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
+    LOCALES.get_or_init(|| locale_forms(|name| std::env::var(name).ok()))
+}
+
+/// The value of the localized key `key` for `locales`: the first of
+/// `key[<form>]` present, trying every form of one locale before the next
+/// locale, and the plain `key` after the last. `value` gives a key's value,
+/// `None` when the key is missing. A value that is present but empty ends
+/// the search too.
+fn localized(
+    key: &str,
+    locales: &[Vec<String>],
+    value: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    locales
+        .iter()
+        .flatten()
+        .find_map(|form| value(&format!("{key}[{form}]")))
+        .or_else(|| value(key))
+}
+
+/// The name of the app `desktop` in the user's language, looked up as the
+/// names of actions are; GLib's name when that gives none.
+pub fn app_name(desktop: &gio::DesktopAppInfo) -> String {
+    use gio::prelude::AppInfoExt;
+    localized("Name", user_locales(), |key| {
+        desktop.string(key).map(String::from)
+    })
+    .filter(|name| !name.is_empty())
+    .or_else(|| desktop.string("Name").map(String::from))
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| desktop.name().into())
+}
+
+/// The actions the desktop file at `path` declares (see
+/// [`desktop_actions`]); none when it cannot be read.
+pub fn desktop_actions_of_file(path: &Path) -> Vec<DesktopAction> {
+    let keyfile = glib::KeyFile::new();
+    match keyfile.load_from_file(path, glib::KeyFileFlags::KEEP_TRANSLATIONS) {
+        Ok(()) => desktop_actions(&keyfile),
+        Err(_) => Vec::new(),
+    }
 }
 
 impl DesktopEntry {
@@ -160,6 +326,7 @@ impl DesktopEntry {
 /// A desktop file read and parsed outside GLib, on a reader thread.
 pub struct ReadFile {
     file: EntryFile,
+    actions: Vec<DesktopAction>,
     search_terms: Vec<SearchTerm>,
 }
 
@@ -170,13 +337,21 @@ pub fn read_entry(file: EntryFile) -> Option<ReadFile> {
     let bytes = read_regular_file(&file.path)?;
     let keyfile = glib::KeyFile::new();
     keyfile
-        .load_from_bytes(&glib::Bytes::from_owned(bytes), glib::KeyFileFlags::NONE)
+        .load_from_bytes(
+            &glib::Bytes::from_owned(bytes),
+            glib::KeyFileFlags::KEEP_TRANSLATIONS,
+        )
         .ok()?;
     if keyfile.boolean(GROUP, "Hidden").unwrap_or(false) {
         return None;
     }
     let search_terms = search_terms(&keyfile);
-    Some(ReadFile { file, search_terms })
+    let actions = desktop_actions(&keyfile);
+    Some(ReadFile {
+        file,
+        actions,
+        search_terms,
+    })
 }
 
 impl ReadFile {
@@ -189,6 +364,7 @@ impl ReadFile {
         DesktopEntry {
             id: self.file.id,
             app,
+            actions: self.actions,
             search_terms: self.search_terms,
         }
     }
@@ -462,8 +638,9 @@ pub fn read_all<I, R, T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        application_dirs, best_match, entry_files, exec_program, load_entry, read_all,
-        search_terms, Delivery, DesktopEntry, EntryFile,
+        application_dirs, best_match, desktop_actions, desktop_actions_for, entry_files,
+        exec_program, key_forms, load_entry, locale_forms, read_all, search_terms, Delivery,
+        DesktopEntry, EntryFile,
     };
     use crate::launch::{bus_name, command_line};
     use gio::prelude::*;
@@ -536,14 +713,148 @@ mod tests {
         keyfile
             .load_from_data(
                 &format!("[Desktop Entry]\nType=Application\n{lines}"),
-                glib::KeyFileFlags::NONE,
+                glib::KeyFileFlags::KEEP_TRANSLATIONS,
             )
             .unwrap();
         DesktopEntry {
             id: id.to_owned(),
             app: None,
+            actions: desktop_actions(&keyfile),
             search_terms: search_terms(&keyfile),
         }
+    }
+
+    fn actions(lines: &str) -> Vec<(String, String, Option<String>)> {
+        entry("actions.desktop", lines)
+            .actions
+            .into_iter()
+            .map(|action| (action.id, action.name, action.exec))
+            .collect()
+    }
+
+    fn action(id: &str, name: &str, exec: Option<&str>) -> (String, String, Option<String>) {
+        (id.to_owned(), name.to_owned(), exec.map(str::to_owned))
+    }
+
+    #[test]
+    fn actions_follow_the_actions_key_and_need_a_group_and_a_name() {
+        let found = actions(
+            "Name=App\nExec=app\nActions=z;;ghost;a;z;noname;empty;bare;\n\
+             [Desktop Action a]\nName=Alpha\nExec=app --a\n\
+             [Desktop Action z]\nName=Zulu\nExec=app --z\n\
+             [Desktop Action noname]\nExec=app\n\
+             [Desktop Action empty]\nName=\nExec=app\n\
+             [Desktop Action bare]\nName=Bare\nExec=\n\
+             [Desktop Action unlisted]\nName=Unlisted\nExec=app\n",
+        );
+        assert_eq!(
+            found,
+            [
+                action("z", "Zulu", Some("app --z")),
+                action("a", "Alpha", Some("app --a")),
+                action("bare", "Bare", None),
+            ]
+        );
+        assert!(actions("Name=App\nExec=app\n").is_empty());
+        // Key file escapes in Exec are undone, as for the entry's own line.
+        assert_eq!(
+            actions("Name=App\nActions=x;\n[Desktop Action x]\nName=X\nExec=app\\sa\\\\b\n"),
+            [action("x", "X", Some("app a\\b"))]
+        );
+    }
+
+    fn locales(variables: &[(&str, &str)]) -> Vec<Vec<String>> {
+        locale_forms(|name| {
+            variables
+                .iter()
+                .find(|(variable, _)| *variable == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn locale_forms_follow_the_desktop_entry_specification() {
+        assert_eq!(
+            key_forms("sr_RS.UTF-8@latin"),
+            ["sr_RS@latin", "sr_RS", "sr@latin", "sr"]
+        );
+        assert_eq!(key_forms("de_AT.UTF-8"), ["de_AT", "de"]);
+        assert_eq!(key_forms("sr@latin"), ["sr@latin", "sr"]);
+        assert_eq!(key_forms("de"), ["de"]);
+        assert!(key_forms("").is_empty());
+        // The first variable set and not empty decides alone.
+        assert_eq!(
+            locales(&[("LANGUAGE", ""), ("LC_ALL", "de_AT.UTF-8"), ("LANG", "fr")]),
+            [["de_AT", "de"]]
+        );
+        assert_eq!(locales(&[("LC_MESSAGES", "sr"), ("LANG", "fr")]), [["sr"]]);
+        // LANGUAGE is a list; empty items are skipped.
+        assert_eq!(
+            locales(&[("LANGUAGE", "zz::de_AT:sr"), ("LC_ALL", "fr")]),
+            [vec!["zz"], vec!["de_AT", "de"], vec!["sr"]]
+        );
+        assert!(locales(&[]).is_empty());
+    }
+
+    fn names_for(variables: &[(&str, &str)]) -> Vec<String> {
+        let keyfile = glib::KeyFile::new();
+        keyfile
+            .load_from_data(
+                "[Desktop Entry]\nName=App\nActions=full;country;language;empty;\n\
+                 [Desktop Action full]\nName=Default Full\nName[sr]=Language Full\n\
+                 Name[sr@latin]=Modifier Full\nName[sr_RS]=Country Full\n\
+                 Name[sr_RS@latin]=Full Full\nName[de_AT]=Austria Full\nExec=app\n\
+                 [Desktop Action country]\nName=Default Country\nName[sr@latin]=Modifier Country\n\
+                 Name[sr_RS]=Country Country\nExec=app\n\
+                 [Desktop Action language]\nName=Default Language\nName[sr]=Language Language\n\
+                 Exec=app\n\
+                 [Desktop Action empty]\nName=Default Empty\nName[sr_RS@latin]=\n\
+                 Name[sr]=Serbian Empty\nExec=app\n",
+                glib::KeyFileFlags::KEEP_TRANSLATIONS,
+            )
+            .unwrap();
+        desktop_actions_for(&keyfile, &locales(variables))
+            .into_iter()
+            .map(|action| action.name)
+            .collect()
+    }
+
+    #[test]
+    fn action_names_follow_the_locale_order() {
+        // The country outranks the modifier; an empty translation drops
+        // the action.
+        assert_eq!(
+            names_for(&[("LANG", "sr_RS.UTF-8@latin")]),
+            ["Full Full", "Country Country", "Language Language"]
+        );
+        assert_eq!(
+            names_for(&[("LANG", "sr_ME.UTF-8@latin")]),
+            [
+                "Modifier Full",
+                "Modifier Country",
+                "Language Language",
+                "Serbian Empty"
+            ]
+        );
+        // A later list entry only when no form of the earlier one is there.
+        assert_eq!(
+            names_for(&[("LANGUAGE", "zz:de_AT:sr"), ("LANG", "sr_RS@latin")]),
+            [
+                "Austria Full",
+                "Default Country",
+                "Language Language",
+                "Serbian Empty"
+            ]
+        );
+        assert_eq!(
+            names_for(&[]),
+            [
+                "Default Full",
+                "Default Country",
+                "Default Language",
+                "Default Empty"
+            ]
+        );
     }
 
     fn best<'a>(entries: &'a [DesktopEntry], query: &str) -> Option<&'a str> {

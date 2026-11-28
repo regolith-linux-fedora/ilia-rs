@@ -3,7 +3,9 @@
 //! that opens nothing, in the entry's Path, inside x-terminal-emulator for
 //! `Terminal=true`, and inside its own systemd scope when systemd-run is on
 //! PATH. An entry with `DBusActivatable=true` whose id is a well-known bus
-//! name is activated over the session bus instead.
+//! name is activated over the session bus instead. The entry's actions are
+//! started the same way, with the action's own Exec line, or its
+//! `ActivateAction` call on the bus.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,10 +13,12 @@ use std::time::Duration;
 
 use gio::prelude::*;
 
+use crate::entries::DesktopAction;
 use crate::runner::desktop_argv;
 
-/// How long the application has to answer `Activate`. Starting a service
-/// that is not running yet is the bus's business and comes before it.
+/// How long the application has to answer `Activate` or `ActivateAction`.
+/// Starting a service that is not running yet is the bus's business and
+/// comes before it.
 const ACTIVATE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Starts `desktop` and calls `done` with the outcome: at once for an entry
@@ -24,22 +28,57 @@ pub fn launch_desktop_app(
     desktop: &gio::DesktopAppInfo,
     done: impl FnOnce(Result<(), String>) + 'static,
 ) {
-    let name = desktop.name().to_string();
+    launch(desktop, None, done);
+}
+
+/// Starts the action `action` of `desktop` and calls `done` with the
+/// outcome, as [`launch_desktop_app`] starts the entry itself: the action's
+/// Exec line takes the place of the entry's, and a bus-activated entry is
+/// asked to `ActivateAction` instead of to `Activate`, its Exec line never
+/// run. Everything else (field values, Path, Terminal, the scope) is the
+/// entry's.
+pub fn launch_desktop_action(
+    desktop: &gio::DesktopAppInfo,
+    action: &DesktopAction,
+    done: impl FnOnce(Result<(), String>) + 'static,
+) {
+    launch(desktop, Some(action), done);
+}
+
+fn launch(
+    desktop: &gio::DesktopAppInfo,
+    action: Option<&DesktopAction>,
+    done: impl FnOnce(Result<(), String>) + 'static,
+) {
+    let name = crate::entries::app_name(desktop);
+    let label = match action {
+        Some(action) => format!("{name}: {}", action.name),
+        None => name,
+    };
     if let Some(bus_name) = bus_name(desktop) {
+        let action = action.map(|action| action.id.clone());
         glib::MainContext::default().spawn_local(async move {
-            let result = activate(&bus_name)
+            let result = activate(&bus_name, action.as_deref())
                 .await
-                .map_err(|error| format!("Failed to activate {name}: {}", error.message()));
+                .map_err(|error| format!("Failed to activate {label}: {}", error.message()));
             done(result);
         });
         return;
     }
-    done(spawn_desktop_app(desktop).map_err(|error| format!("Failed to launch {name}: {error}")));
+    let exec = match action {
+        Some(action) => action.exec.clone().unwrap_or_default(),
+        None => desktop.string("Exec").map(String::from).unwrap_or_default(),
+    };
+    done(
+        spawn_desktop_app(desktop, &exec)
+            .map_err(|error| format!("Failed to launch {label}: {error}")),
+    );
 }
 
-/// Runs the entry's Exec line directly, never through a shell.
-fn spawn_desktop_app(desktop: &gio::DesktopAppInfo) -> Result<(), String> {
-    let argv = command_line(desktop)?;
+/// Runs the Exec line `exec` of the entry or of one of its actions
+/// directly, never through a shell.
+fn spawn_desktop_app(desktop: &gio::DesktopAppInfo, exec: &str) -> Result<(), String> {
+    let argv = exec_command_line(desktop, exec)?;
     let working_dir = desktop
         .string("Path")
         .filter(|path| !path.is_empty())
@@ -68,10 +107,16 @@ fn spawn_desktop_app(desktop: &gio::DesktopAppInfo) -> Result<(), String> {
 
 /// The program and arguments the entry's Exec line runs, with its field
 /// codes filled in from the entry.
+#[cfg(test)]
 pub(crate) fn command_line(desktop: &gio::DesktopAppInfo) -> Result<Vec<String>, String> {
-    let exec = desktop.string("Exec").unwrap_or_default();
+    exec_command_line(desktop, &desktop.string("Exec").unwrap_or_default())
+}
+
+/// The program and arguments the Exec line `exec`, the entry's or one of
+/// its actions', runs, with its field codes filled in from the entry.
+fn exec_command_line(desktop: &gio::DesktopAppInfo, exec: &str) -> Result<Vec<String>, String> {
     let fields = FieldValues {
-        name: desktop.name().to_string(),
+        name: crate::entries::app_name(desktop),
         icon: desktop
             .locale_string("Icon")
             .map(|icon| icon.to_string())
@@ -80,7 +125,7 @@ pub(crate) fn command_line(desktop: &gio::DesktopAppInfo) -> Result<Vec<String>,
             .filename()
             .map(|path| path.to_string_lossy().into_owned()),
     };
-    exec_argv(&exec, &fields)
+    exec_argv(exec, &fields)
 }
 
 /// What the field codes of an Exec line stand for.
@@ -179,8 +224,9 @@ fn object_path(bus_name: &str) -> String {
 }
 
 /// Has the bus start the application if its name is unowned, then calls
-/// `org.freedesktop.Application.Activate` on it and waits for the answer.
-async fn activate(bus_name: &str) -> Result<(), glib::Error> {
+/// `org.freedesktop.Application.Activate` on it, or `ActivateAction` for
+/// the action `action`, and waits for the answer.
+async fn activate(bus_name: &str, action: Option<&str>) -> Result<(), glib::Error> {
     let connection = gio::bus_get_future(gio::BusType::Session).await?;
     let (owned,) = connection
         .call_future(
@@ -214,13 +260,21 @@ async fn activate(bus_name: &str) -> Result<(), glib::Error> {
             .await?;
     }
     let platform_data: HashMap<String, glib::Variant> = HashMap::new();
+    let (method, parameters) = match action {
+        // No parameter, the empty array.
+        Some(action) => (
+            "ActivateAction",
+            (action, Vec::<glib::Variant>::new(), platform_data).to_variant(),
+        ),
+        None => ("Activate", (platform_data,).to_variant()),
+    };
     connection
         .call_future(
             Some(bus_name),
             &object_path(bus_name),
             "org.freedesktop.Application",
-            "Activate",
-            Some(&(platform_data,).to_variant()),
+            method,
+            Some(&parameters),
             Some(glib::VariantTy::UNIT),
             gio::DBusCallFlags::NO_AUTO_START,
             ACTIVATE_TIMEOUT.as_millis() as i32,

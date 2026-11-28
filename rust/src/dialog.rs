@@ -563,6 +563,17 @@ pub fn build(
         ) && !(pages_for_key[active_for_key.get()].edits_with_arrow_keys()
             && arrow_moves_cursor(&entry_for_key, &key))
         {
+            // The page may act on its highlighted row (the Applications
+            // page shows and closes an app's actions); otherwise the keys
+            // move between the page tabs.
+            let modified = state.intersects(
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::MOD1_MASK,
+            );
+            if !modified && pages_for_key[active_for_key.get()].key_event(event) {
+                return glib::Propagation::Stop;
+            }
             notebook_for_key.grab_focus();
             return glib::Propagation::Proceed;
         }

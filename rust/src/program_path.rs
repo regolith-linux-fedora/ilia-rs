@@ -22,17 +22,41 @@ const DEFAULT_SEARCH_PATH: &str = "/bin:/usr/bin";
 /// command line runs (with the target of a link), or the program word and
 /// ` (not found)`. Empty when the entry names no program.
 pub fn describe_app(app: &gio::DesktopAppInfo) -> String {
-    if app.boolean("DBusActivatable") {
-        if let Some(name) = app.filename().as_deref().and_then(bus_name_of_file) {
-            return format!("{BUS_PREFIX}{name}");
-        }
+    if let Some(bus) = bus_description(app) {
+        return bus;
     }
     // GLib already undid the key file escapes (\s, \n, \t, \r, \\).
     let Some(commandline) = app.string("Exec") else {
         return String::new();
     };
+    describe_on_path(&commandline)
+}
+
+/// What the strip shows for an action of `app` whose Exec line is
+/// `commandline`: as for the app, with the action's line in place of the
+/// app's. An app started over the session bus starts its actions there too.
+pub fn describe_action(app: &gio::DesktopAppInfo, commandline: &str) -> String {
+    if let Some(bus) = bus_description(app) {
+        return bus;
+    }
+    if commandline.is_empty() {
+        return String::new();
+    }
+    describe_on_path(commandline)
+}
+
+/// The strip's text for an app started over the session bus.
+fn bus_description(app: &gio::DesktopAppInfo) -> Option<String> {
+    if !app.boolean("DBusActivatable") {
+        return None;
+    }
+    let name = app.filename().as_deref().and_then(bus_name_of_file)?;
+    Some(format!("{BUS_PREFIX}{name}"))
+}
+
+fn describe_on_path(commandline: &str) -> String {
     let search_path = std::env::var("PATH").unwrap_or_else(|_| DEFAULT_SEARCH_PATH.to_owned());
-    describe_commandline(&commandline, &search_path)
+    describe_commandline(commandline, &search_path)
 }
 
 /// The strip's text for an unescaped `Exec` value, with `search_path` as the

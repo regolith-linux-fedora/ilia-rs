@@ -3,7 +3,8 @@
 Run as a script: ``python3 -m parity.fakes.bus_app NAME TRANSCRIPT``. It owns
 the well-known name NAME, serves org.freedesktop.Application at the object
 path the Desktop Entry spec derives from it, and appends one line per call
-to TRANSCRIPT: the method and the object path it was called on. It prints
+to TRANSCRIPT: the method and the object path it was called on, and for
+``ActivateAction`` the action's name. It prints
 ``ready`` once the name is owned.
 """
 
@@ -38,8 +39,11 @@ def main(name, transcript):
     info = Gio.DBusNodeInfo.new_for_xml(INTERFACE).interfaces[0]
 
     def on_call(connection, sender, path, interface, method, parameters, invocation):
+        line = f"{method} {path}"
+        if method == "ActivateAction":
+            line += f" {parameters.unpack()[0]}"
         with open(transcript, "a") as stream:
-            stream.write(f"{method} {path}\n")
+            stream.write(line + "\n")
         invocation.return_value(None)
 
     def on_bus(connection, _name):
